@@ -6,6 +6,7 @@
 //!
 //! Author: Ricky Bryce
 
+mod aichat;
 mod config;
 mod telnet;
 mod xmodem;

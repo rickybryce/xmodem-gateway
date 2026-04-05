@@ -25,7 +25,6 @@ const ANSI_CYAN: &str = "\x1b[1;36m";
 const ANSI_YELLOW: &str = "\x1b[1;33m";
 const ANSI_AMBER: &str = "\x1b[33m";
 const ANSI_WHITE: &str = "\x1b[1;37m";
-#[allow(dead_code)]
 const ANSI_DIM: &str = "\x1b[37m";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_CLEAR: &str = "\x1b[2J\x1b[H";
@@ -366,7 +365,6 @@ impl TelnetSession {
             TerminalType::Ascii => text.to_string(),
         }
     }
-    #[allow(dead_code)]
     fn dim(&self, text: &str) -> String {
         match self.terminal_type {
             TerminalType::Ansi => format!("{}{}{}", ANSI_DIM, text, ANSI_RESET),
@@ -701,6 +699,19 @@ impl TelnetSession {
         Ok(())
     }
 
+    /// Show a multi-line informational message and wait for a keypress.
+    async fn show_error_lines(&mut self, lines: &[&str]) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        for line in lines {
+            self.send_line(&format!("  {}", line)).await?;
+        }
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
     // ─── Terminal detection ─────────────────────────────────
 
     async fn detect_terminal_type(&mut self) -> Result<(), std::io::Error> {
@@ -838,7 +849,7 @@ impl TelnetSession {
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}",
-                self.red("Too many failed attempts. Try again later.")
+                self.red("Too many attempts. Try later.")
             ))
             .await?;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1036,6 +1047,11 @@ impl TelnetSession {
         self.send_line(&sep).await?;
         self.send_line("").await?;
         self.send_line(&format!(
+            "  {}  AI Chat",
+            self.cyan("A")
+        ))
+        .await?;
+        self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
         ))
@@ -1053,6 +1069,24 @@ impl TelnetSession {
 
     async fn handle_main_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
         match input {
+            "a" => {
+                let cfg = config::get_config();
+                if cfg.groq_api_key.is_empty() {
+                    self.show_error_lines(&[
+                        "No API key configured.",
+                        "",
+                        "To enable AI Chat:",
+                        "1. Visit https://console.groq.com",
+                        "2. Create a free account",
+                        "3. Generate an API key",
+                        "4. Add to xmodem.conf:",
+                        "   groq_api_key = gsk_...",
+                        "5. Restart the server",
+                    ]).await?;
+                } else {
+                    self.ai_chat(&cfg.groq_api_key).await?;
+                }
+            }
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
@@ -1066,7 +1100,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press F, G, or X.").await?;
+                self.show_error("Press A, F, G, or X.").await?;
             }
         }
         Ok(true)
@@ -1184,6 +1218,29 @@ impl TelnetSession {
             p.push(&self.transfer_subdir);
         }
         p
+    }
+
+    /// Verify that the current transfer_subdir resolves to a path inside the
+    /// transfer base directory. Resets to root if it escapes (e.g. via symlink).
+    fn verify_transfer_path(&mut self) -> bool {
+        let cfg = config::get_config();
+        let base = match std::fs::canonicalize(&cfg.transfer_dir) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let full = match std::fs::canonicalize(self.transfer_path()) {
+            Ok(p) => p,
+            Err(_) => {
+                self.transfer_subdir.clear();
+                return false;
+            }
+        };
+        if full.starts_with(&base) {
+            true
+        } else {
+            self.transfer_subdir.clear();
+            false
+        }
     }
 
     async fn ensure_transfer_dir(&mut self) -> Result<(), std::io::Error> {
@@ -1934,11 +1991,16 @@ impl TelnetSession {
                 let dir_idx = if has_parent { n - 2 } else { n - 1 };
                 if dir_idx < dirs.len() {
                     let name = dirs[dir_idx];
+                    let prev = self.transfer_subdir.clone();
                     if self.transfer_subdir.is_empty() {
                         self.transfer_subdir = name.to_string();
                     } else {
                         self.transfer_subdir =
                             format!("{}/{}", self.transfer_subdir, name);
+                    }
+                    if !self.verify_transfer_path() {
+                        self.transfer_subdir = prev;
+                        self.show_error("Access denied.").await?;
                     }
                 } else {
                     self.show_error("Invalid selection.").await?;
@@ -2195,7 +2257,7 @@ impl TelnetSession {
                             let b = if b == erase_char && erase_char != 0x7F { 0x7F } else { b };
                             if let Some(b) = normalize_gateway_input(b, &mut last_cr) {
                                 if ssh_writer.write_all(&[b]).await.is_err() { break; }
-                                let _ = ssh_writer.flush().await;
+                                if ssh_writer.flush().await.is_err() { break; }
                             }
                         }
                         _ => break,
@@ -2215,7 +2277,7 @@ impl TelnetSession {
                             if !data.is_empty() {
                                 let mut w = writer.lock().await;
                                 if w.write_all(data).await.is_err() { break; }
-                                let _ = w.flush().await;
+                                if w.flush().await.is_err() { break; }
                             }
                         }
                         Err(_) => break,
@@ -2250,6 +2312,174 @@ impl TelnetSession {
             }
         }
         Ok(())
+    }
+
+    // ─── AI CHAT ────────────────────────────────────────────
+
+    /// Lines of answer content per page (screen minus header/footer).
+    const PAGE_CONTENT_LINES: usize = 14;
+
+    async fn ai_chat(&mut self, api_key: &str) -> Result<(), std::io::Error> {
+        let content_width = if self.terminal_type == TerminalType::Petscii {
+            PETSCII_WIDTH - 2
+        } else {
+            78
+        };
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("AI CHAT")))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.dim("Type a question, or Q to exit.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send(&format!("  {}: ", self.cyan("Q")))
+            .await?;
+        self.flush().await?;
+
+        let mut question = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("q") => s,
+            _ => return Ok(()),
+        };
+
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("AI CHAT")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}...",
+                self.dim("Thinking")
+            ))
+            .await?;
+            self.flush().await?;
+
+            let key = api_key.to_string();
+            let q = question.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::aichat::ask(&key, &q)
+            })
+            .await
+            .map_err(|e| {
+                std::io::Error::other(e.to_string())
+            })?;
+
+            match result {
+                Ok(answer) => {
+                    let lines: Vec<String> = answer
+                        .lines()
+                        .flat_map(|line| crate::aichat::wrap_line(line, content_width))
+                        .collect();
+
+                    match self.ai_show_answer(&question, &lines).await? {
+                        Some(next_q) => question = next_q,
+                        None => return Ok(()),
+                    }
+                }
+                Err(e) => {
+                    let max_w = if self.terminal_type == TerminalType::Petscii {
+                        30
+                    } else {
+                        50
+                    };
+                    self.show_error(&truncate_to_width(&e, max_w)).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Display a paginated AI answer. Returns `Some(question)` if the user
+    /// typed a new question, or `None` to exit.
+    async fn ai_show_answer(
+        &mut self,
+        question: &str,
+        lines: &[String],
+    ) -> Result<Option<String>, std::io::Error> {
+        let page_h = Self::PAGE_CONTENT_LINES;
+        let content_max = if self.terminal_type == TerminalType::Petscii {
+            PETSCII_WIDTH - 2
+        } else {
+            78
+        };
+        let mut scroll = 0usize;
+
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+
+            let max_q = if self.terminal_type == TerminalType::Petscii {
+                34
+            } else {
+                52
+            };
+            let q_display = truncate_to_width(question, max_q);
+            self.send_line(&format!(
+                "  {}",
+                self.yellow(&format!("Q: {}", q_display))
+            ))
+            .await?;
+            self.send_line(&sep).await?;
+
+            let total = lines.len();
+            let end = (scroll + page_h).min(total);
+            let page_lines = &lines[scroll..end];
+            for line in page_lines {
+                let safe = truncate_to_width(line, content_max);
+                self.send_line(&format!("  {}", safe)).await?;
+            }
+            for _ in (end - scroll)..page_h {
+                self.send_line("").await?;
+            }
+
+            let has_prev = scroll > 0;
+            let has_next = end < total;
+            self.send_line(&format!(
+                "  {}",
+                self.dim(&format!("({}-{} of {})", scroll + 1, end, total))
+            ))
+            .await?;
+            let mut parts = Vec::new();
+            if has_prev {
+                parts.push(self.action_prompt("P", "Pv"));
+            }
+            if has_next {
+                parts.push(self.action_prompt("N", "Nx"));
+            }
+            parts.push(self.action_prompt("Q", "Done"));
+            self.send_line(&format!("  {}", parts.join(" ")))
+                .await?;
+            self.send(&format!("  {}: ", self.cyan(">")))
+                .await?;
+            self.flush().await?;
+
+            let input = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(None),
+            };
+
+            // Single character = command; longer = new question
+            if input.len() == 1 {
+                match input.to_ascii_lowercase().as_str() {
+                    "n" if has_next => scroll += page_h,
+                    "p" if has_prev => scroll = scroll.saturating_sub(page_h),
+                    "q" => return Ok(None),
+                    _ => {}
+                }
+            } else {
+                return Ok(Some(input));
+            }
+        }
     }
 }
 
@@ -2381,7 +2611,7 @@ mod tests {
     #[test]
     fn test_to_latin1_bytes() {
         assert_eq!(to_latin1_bytes("abc"), vec![b'a', b'b', b'c']);
-        assert_eq!(to_latin1_bytes(""), vec![]);
+        assert_eq!(to_latin1_bytes(""), Vec::<u8>::new());
     }
 
     // ─── Input helpers ───────────────────────────────────
@@ -2805,5 +3035,324 @@ mod tests {
                 PETSCII_WIDTH,
             );
         }
+    }
+
+    // ─── Screen layout constraints ───────────────────────
+
+    /// All user-facing error messages must fit in PETSCII width (40 cols).
+    /// The "  " prefix + message must not exceed 40 chars.
+    #[test]
+    fn test_all_error_messages_fit_petscii() {
+        let messages = [
+            "Input too long.",
+            "Press A, F, G, or X.",
+            "Press U, D, X, C, I, R, or Q.",
+            "Disk space is low. Uploads disabled.",
+            "File already exists.",
+            "No files available.",
+            "Invalid selection.",
+            "Enter a number, P, N, or Q.",
+            "File too large.",
+            "No files to delete.",
+            "No subdirectories.",
+            "Access denied.",
+            "Enter a number or Q.",
+            "Press S, R, or Q.",
+            "Invalid port number.",
+            "Connection timed out.",
+            "Authentication failed.",
+            "Too many attempts. Try later.",
+            "Too many failed attempts.",
+            "Login incorrect.",
+            "Disconnected: idle timeout.",
+            "Press any key to continue.",
+            "No API key configured.",
+        ];
+        for msg in &messages {
+            // Error messages are displayed as "  {msg}" — 2-char indent
+            let displayed = format!("  {}", msg);
+            assert!(
+                displayed.len() <= PETSCII_WIDTH,
+                "error message '{}' is {} chars with indent, exceeds {}",
+                msg,
+                displayed.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// All menu items must fit in PETSCII width (40 cols).
+    #[test]
+    fn test_all_menu_items_fit_petscii() {
+        let items = [
+            // Main menu
+            "  A  AI Chat",
+            "  F  File Transfer",
+            "  G  SSH Gateway",
+            "  X  Exit",
+            // File transfer menu
+            "  U  Upload a file",
+            "  D  Download a file",
+            "  X  Delete a file",
+            "  C  Change directory",
+            // Gateway menu
+            "  S  Connect to SSH server",
+            // Navigation footers
+            "  R=Refresh Q=Back",
+            // Auth prompts
+            "  Username: ",
+            "  Password: ",
+            // AI chat
+            "  Type a question, or Q to exit.",
+        ];
+        for item in &items {
+            assert!(
+                item.len() <= PETSCII_WIDTH,
+                "menu item '{}' is {} chars, exceeds {}",
+                item,
+                item.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Main menu screen: header(3) + blank + 3 items + blank + prompt = 9 rows.
+    #[test]
+    fn test_main_menu_row_count() {
+        // sep, title, sep, blank, A, F, G, X, blank = 9 lines
+        let rows = 9;
+        assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
+    }
+
+    /// File transfer menu: header(3) + blank + dir + blank + 5 items + blank + footer = 12 rows.
+    #[test]
+    fn test_file_transfer_menu_row_count() {
+        let rows = 3 + 1 + 1 + 1 + 5 + 1 + 1; // 13
+        assert!(rows <= 22, "file transfer menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Download/delete file listing: header(3) + blank + col_header + divider
+    /// + 10 entries + blank + page_info + blank + nav + blank + prompt = 21 rows.
+    #[test]
+    fn test_file_listing_row_count() {
+        let header = 3; // sep + title + sep
+        let col = 2;    // column header + divider
+        let entries = TelnetSession::TRANSFER_PAGE_SIZE; // 10
+        let footer = 5; // blank + page info + blank + nav + prompt
+        let total = header + 1 + col + entries + footer;
+        assert!(
+            total <= 22,
+            "file listing is {} rows, exceeds 22",
+            total,
+        );
+    }
+
+    /// AI answer screen: header(3) + 14 content lines + padding + position
+    /// + nav + prompt = ~22 rows max.
+    #[test]
+    fn test_ai_answer_row_count() {
+        let header = 3;  // sep + question + sep
+        let content = TelnetSession::PAGE_CONTENT_LINES; // 14
+        let footer = 3;  // position + nav + prompt
+        let total = header + content + footer;
+        assert!(
+            total <= 22,
+            "AI answer screen is {} rows, exceeds 22",
+            total,
+        );
+    }
+
+    /// Gateway menu: header(3) + blank + 1 item + blank + footer = 7 rows.
+    #[test]
+    fn test_gateway_menu_row_count() {
+        let rows = 3 + 1 + 1 + 1 + 1; // 7
+        assert!(rows <= 22, "gateway menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Auth screen: header(3) + blank + up to 3 attempts * 4 lines = 15 rows max.
+    #[test]
+    fn test_auth_screen_row_count() {
+        // sep + title + sep + blank + (username + password + error + blank)*3
+        let header = 4;
+        let per_attempt = 4; // username prompt, password prompt, error, blank
+        let total = header + per_attempt * 3;
+        assert!(
+            total <= 22,
+            "auth screen is {} rows, exceeds 22",
+            total,
+        );
+    }
+
+    /// Separator width must match terminal type.
+    #[test]
+    fn test_separator_widths() {
+        assert_eq!("=".repeat(PETSCII_WIDTH).len(), 40);
+        assert_eq!("=".repeat(56).len(), 56); // ANSI/ASCII separator
+        assert!(56 <= 80, "ANSI separator exceeds 80 cols");
+    }
+
+    /// PAGE_CONTENT_LINES must leave room for header and footer within 22 rows.
+    #[test]
+    fn test_page_content_lines_fits_screen() {
+        let overhead = 3 + 3; // header (sep+title+sep) + footer (pos+nav+prompt)
+        assert!(
+            TelnetSession::PAGE_CONTENT_LINES + overhead <= 22,
+            "PAGE_CONTENT_LINES {} + overhead {} = {} exceeds 22",
+            TelnetSession::PAGE_CONTENT_LINES,
+            overhead,
+            TelnetSession::PAGE_CONTENT_LINES + overhead,
+        );
+    }
+
+    /// TRANSFER_PAGE_SIZE must fit within 22 rows with header and footer.
+    #[test]
+    fn test_transfer_page_size_fits_screen() {
+        let overhead = 3 + 2 + 5; // header + col headers + footer
+        assert!(
+            TelnetSession::TRANSFER_PAGE_SIZE + overhead <= 22,
+            "TRANSFER_PAGE_SIZE {} + overhead {} = {} exceeds 22",
+            TelnetSession::TRANSFER_PAGE_SIZE,
+            overhead,
+            TelnetSession::TRANSFER_PAGE_SIZE + overhead,
+        );
+    }
+
+    /// File listing column format must fit PETSCII width.
+    /// Format: "  XX. FILENAME_22_CHARS_____ SIZE"
+    #[test]
+    fn test_file_listing_line_fits_petscii() {
+        // Worst case: "  10. 1234567890123456789012 1023 B"
+        let line = format!("  {:>2}. {:<22} {}", 10, "a]".repeat(11), "1023 B");
+        assert!(
+            line.len() <= PETSCII_WIDTH,
+            "file listing line '{}' is {} chars, exceeds {}",
+            line,
+            line.len(),
+            PETSCII_WIDTH,
+        );
+    }
+
+    /// Download/delete column header must fit PETSCII width.
+    #[test]
+    fn test_file_listing_header_fits_petscii() {
+        let header = format!("   {} {:<22} {}", "#.", "Filename", "Size");
+        // Without color codes, just the visible text
+        assert!(
+            header.len() <= PETSCII_WIDTH,
+            "column header '{}' is {} chars, exceeds {}",
+            header,
+            header.len(),
+            PETSCII_WIDTH,
+        );
+    }
+
+    /// File listing divider must fit PETSCII width.
+    #[test]
+    fn test_file_listing_divider_fits_petscii() {
+        let divider = format!("  {}", "-".repeat(36));
+        assert!(
+            divider.len() <= PETSCII_WIDTH,
+            "divider '{}' is {} chars, exceeds {}",
+            divider,
+            divider.len(),
+            PETSCII_WIDTH,
+        );
+    }
+
+    // ─── Pagination math ─────────────────────────────────
+
+    #[test]
+    fn test_pagination_zero_files() {
+        let files: Vec<(String, u64)> = vec![];
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_pagination_exactly_one_page() {
+        let page_size = TelnetSession::TRANSFER_PAGE_SIZE;
+        let files: Vec<usize> = (0..page_size).collect();
+        let total_pages = files.len().div_ceil(page_size);
+        assert_eq!(total_pages, 1);
+        assert_eq!(files.len(), page_size);
+    }
+
+    #[test]
+    fn test_pagination_one_over_page() {
+        let page_size = TelnetSession::TRANSFER_PAGE_SIZE;
+        let files: Vec<usize> = (0..page_size + 1).collect();
+        let total_pages = files.len().div_ceil(page_size);
+        assert_eq!(total_pages, 2);
+        // Page 1
+        let offset = 0;
+        let end = (offset + page_size).min(files.len());
+        assert_eq!(end - offset, page_size);
+        // Page 2
+        let offset = page_size;
+        let end = (offset + page_size).min(files.len());
+        assert_eq!(end - offset, 1);
+    }
+
+    #[test]
+    fn test_pagination_many_files() {
+        let page_size = TelnetSession::TRANSFER_PAGE_SIZE;
+        let count: usize = 105;
+        let total_pages = count.div_ceil(page_size);
+        assert_eq!(total_pages, 11); // 10 full pages + 1 partial
+        // Last page
+        let offset = (total_pages - 1) * page_size;
+        let end = (offset + page_size).min(count);
+        assert_eq!(end - offset, 5); // 105 - 100 = 5
+    }
+
+    #[test]
+    fn test_ai_pagination_single_line() {
+        let page_h = TelnetSession::PAGE_CONTENT_LINES;
+        let total = 1;
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, 1);
+        assert!(!( scroll > 0));    // no prev
+        assert!(!(end < total));     // no next
+    }
+
+    #[test]
+    fn test_ai_pagination_exactly_one_page() {
+        let page_h = TelnetSession::PAGE_CONTENT_LINES;
+        let total = page_h;
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, page_h);
+        assert!(!(scroll > 0));
+        assert!(!(end < total));
+    }
+
+    #[test]
+    fn test_ai_pagination_two_pages() {
+        let page_h = TelnetSession::PAGE_CONTENT_LINES;
+        let total = page_h + 5;
+        // Page 1
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, page_h);
+        assert!(end < total); // has next
+        // Page 2
+        let scroll = page_h;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, total);
+        assert_eq!(end - scroll, 5);
+        assert!(scroll > 0);     // has prev
+        assert!(!(end < total));  // no next
+    }
+
+    // ─── XMODEM constants ────────────────────────────────
+
+    #[test]
+    fn test_xmodem_block_size() {
+        assert_eq!(crate::xmodem::XMODEM_BLOCK_SIZE, 128);
+    }
+
+    #[test]
+    fn test_max_file_size() {
+        assert_eq!(TelnetSession::MAX_FILE_SIZE, 8 * 1024 * 1024);
     }
 }

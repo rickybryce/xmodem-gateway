@@ -20,6 +20,7 @@ const DEFAULT_PASSWORD: &str = "changeme";
 const DEFAULT_TRANSFER_DIR: &str = "transfer";
 const DEFAULT_MAX_SESSIONS: usize = 50;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900; // 15 minutes
+const DEFAULT_GROQ_API_KEY: &str = "";
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone)]
@@ -31,6 +32,8 @@ pub struct Config {
     pub transfer_dir: String,
     pub max_sessions: usize,
     pub idle_timeout_secs: u64,
+    /// Groq API key. If empty, AI chat is disabled.
+    pub groq_api_key: String,
 }
 
 impl Default for Config {
@@ -43,6 +46,7 @@ impl Default for Config {
             transfer_dir: DEFAULT_TRANSFER_DIR.into(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            groq_api_key: DEFAULT_GROQ_API_KEY.into(),
         }
     }
 }
@@ -135,6 +139,10 @@ fn read_config_file(path: &str) -> Config {
             .get("idle_timeout_secs")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
+        groq_api_key: map
+            .get("groq_api_key")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_GROQ_API_KEY.into()),
     }
 }
 
@@ -142,7 +150,7 @@ fn read_config_file(path: &str) -> Config {
 fn write_config_file(path: &str, cfg: &Config) {
     let content = format!(
         "\
-# XMODEM File Server Configuration
+# XMODEM Gateway Configuration
 #
 # This file is auto-generated if it does not exist.
 # Edit values below to customise the server.
@@ -165,6 +173,10 @@ max_sessions = {}
 
 # Idle session timeout in seconds (0 = no timeout)
 idle_timeout_secs = {}
+
+# Groq API key for AI Chat (get one at https://console.groq.com/keys)
+# Leave empty to disable AI Chat.
+groq_api_key = {}
 ",
         cfg.telnet_port,
         cfg.security_enabled,
@@ -173,6 +185,7 @@ idle_timeout_secs = {}
         cfg.transfer_dir,
         cfg.max_sessions,
         cfg.idle_timeout_secs,
+        cfg.groq_api_key,
     );
 
     if let Err(e) = std::fs::write(path, content) {
@@ -197,6 +210,7 @@ mod tests {
         assert_eq!(cfg.transfer_dir, "transfer");
         assert_eq!(cfg.max_sessions, 50);
         assert_eq!(cfg.idle_timeout_secs, 900);
+        assert_eq!(cfg.groq_api_key, "");
     }
 
     #[test]
@@ -275,6 +289,7 @@ mod tests {
             transfer_dir: "myfiles".into(),
             max_sessions: 5,
             idle_timeout_secs: 60,
+            groq_api_key: "gsk_test123".into(),
         };
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());
@@ -286,6 +301,7 @@ mod tests {
         assert_eq!(loaded.transfer_dir, original.transfer_dir);
         assert_eq!(loaded.max_sessions, original.max_sessions);
         assert_eq!(loaded.idle_timeout_secs, original.idle_timeout_secs);
+        assert_eq!(loaded.groq_api_key, original.groq_api_key);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -123,6 +123,9 @@ max_sessions = 50
 
 # Idle session timeout in seconds (0 = no timeout)
 idle_timeout_secs = 900
+
+# Groq API key for AI Chat (leave empty to disable)
+groq_api_key =
 ```
 
 ### Setting Up Authentication
@@ -137,6 +140,19 @@ To require a username and password:
 When enabled, users must authenticate after terminal detection. Failed login
 attempts are tracked per IP address -- after 3 failures, the IP is locked out
 for 5 minutes.
+
+### Setting Up AI Chat
+
+The AI Chat feature uses the [Groq API](https://groq.com), which provides free
+access to fast LLM inference. To enable it:
+
+1. Go to https://console.groq.com and create a free account
+2. Navigate to **API Keys** and generate a new key (starts with `gsk_`)
+3. Open `xmodem.conf` and set: `groq_api_key = gsk_your_key_here`
+4. Restart the server
+
+If no API key is configured, selecting AI Chat from the menu will display
+instructions on how to obtain one.
 
 ## Terminal Support
 
@@ -205,9 +221,31 @@ This is useful for accessing SSH servers from terminals that only support telnet
 4. Once connected, you have a full interactive shell on the remote server
 5. Press **Ctrl+]** to disconnect from the SSH session
 
+The server acts as a proxy between your telnet client and the remote SSH server.
+All input is forwarded to the SSH session, and all output is sent back to your
+terminal. Telnet line-ending conventions (CR+LF, CR+NUL) are automatically
+normalized to bare CR for SSH compatibility.
+
 For PETSCII and ASCII terminals, ANSI escape sequences from the remote host are
 automatically stripped, and text is converted to the appropriate encoding. ANSI
-terminals receive the raw output unmodified.
+terminals receive the raw output unmodified. The PTY size is set to 40x25 for
+PETSCII and 80x24 for ANSI/ASCII terminals.
+
+## AI Chat
+
+AI Chat provides an interactive question-and-answer interface powered by the
+Groq API. Requires a Groq API key (see [Setting Up AI Chat](#setting-up-ai-chat)
+above).
+
+1. From the main menu, press **A** (AI Chat)
+2. Type a question and press Enter
+3. The server shows "Thinking..." while waiting for the response
+4. The answer is displayed with pagination (**N** next, **P** previous, **Q** done)
+5. From the answer screen, type a new question to continue the conversation,
+   or press **Q** to return to the main menu
+
+Responses are word-wrapped to fit the terminal width (38 columns for PETSCII,
+78 for ANSI/ASCII).
 
 ## Signals
 
@@ -216,6 +254,15 @@ The server handles POSIX signals for graceful shutdown:
 - **SIGINT** (Ctrl+C) -- Shut down, notify all connected sessions
 - **SIGTERM** -- Shut down (e.g., from `kill` or systemd)
 - **SIGHUP** -- Shut down
+
+## Disclaimer
+
+This software is provided on an "as is" basis, without warranties of any kind,
+express or implied. Use at your own risk. The author is not responsible for any
+data loss, security breaches, or damages resulting from the use of this
+software. The user is solely responsible for securing their own network,
+credentials, and data. Telnet is an inherently insecure protocol -- do not use
+this software on untrusted networks.
 
 ## License
 
