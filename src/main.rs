@@ -68,15 +68,20 @@ fn main() {
 
 /// Register handlers for SIGINT, SIGTERM, and SIGHUP using signal-hook.
 fn register_signal_handlers(shutdown: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) {
-    use signal_hook::consts::{SIGINT, SIGTERM, SIGHUP};
+    use signal_hook::consts::{SIGINT, SIGTERM};
 
     // signal-hook's flag::register sets the AtomicBool on signal delivery
     signal_hook::flag::register(SIGINT, shutdown.clone())
         .expect("Failed to register SIGINT handler");
     signal_hook::flag::register(SIGTERM, shutdown.clone())
         .expect("Failed to register SIGTERM handler");
-    signal_hook::flag::register(SIGHUP, shutdown.clone())
-        .expect("Failed to register SIGHUP handler");
+
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::SIGHUP;
+        signal_hook::flag::register(SIGHUP, shutdown.clone())
+            .expect("Failed to register SIGHUP handler");
+    }
 
     // Spawn a thread that watches the flag and fires the Notify
     let shutdown_watch = shutdown.clone();
