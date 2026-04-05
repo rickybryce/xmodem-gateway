@@ -21,6 +21,7 @@ const DEFAULT_TRANSFER_DIR: &str = "transfer";
 const DEFAULT_MAX_SESSIONS: usize = 50;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900; // 15 minutes
 const DEFAULT_GROQ_API_KEY: &str = "";
+const DEFAULT_VERBOSE: bool = false;
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone)]
@@ -34,6 +35,8 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     /// Groq API key. If empty, AI chat is disabled.
     pub groq_api_key: String,
+    /// Enable verbose XMODEM protocol logging to stderr.
+    pub verbose: bool,
 }
 
 impl Default for Config {
@@ -47,6 +50,7 @@ impl Default for Config {
             max_sessions: DEFAULT_MAX_SESSIONS,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             groq_api_key: DEFAULT_GROQ_API_KEY.into(),
+            verbose: DEFAULT_VERBOSE,
         }
     }
 }
@@ -143,6 +147,10 @@ fn read_config_file(path: &str) -> Config {
             .get("groq_api_key")
             .cloned()
             .unwrap_or_else(|| DEFAULT_GROQ_API_KEY.into()),
+        verbose: map
+            .get("verbose")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_VERBOSE),
     }
 }
 
@@ -177,6 +185,9 @@ idle_timeout_secs = {}
 # Groq API key for AI Chat (get one at https://console.groq.com/keys)
 # Leave empty to disable AI Chat.
 groq_api_key = {}
+
+# Verbose logging: set to true for detailed XMODEM protocol diagnostics
+verbose = {}
 ",
         cfg.telnet_port,
         cfg.security_enabled,
@@ -186,6 +197,7 @@ groq_api_key = {}
         cfg.max_sessions,
         cfg.idle_timeout_secs,
         cfg.groq_api_key,
+        cfg.verbose,
     );
 
     if let Err(e) = std::fs::write(path, content) {
@@ -290,6 +302,7 @@ mod tests {
             max_sessions: 5,
             idle_timeout_secs: 60,
             groq_api_key: "gsk_test123".into(),
+            verbose: true,
         };
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());

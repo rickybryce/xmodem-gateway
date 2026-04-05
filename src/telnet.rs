@@ -1407,16 +1407,18 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        eprintln!("XMODEM upload: IAC escaping={}", self.xmodem_iac);
+        if config::get_config().verbose { eprintln!("XMODEM upload: IAC escaping={}", self.xmodem_iac); }
         self.drain_input().await;
 
         let start = std::time::Instant::now();
         let mut writer_guard = self.writer.lock().await;
+        let verbose = config::get_config().verbose;
         let result = crate::xmodem::xmodem_receive(
             &mut self.reader,
             &mut *writer_guard,
             self.xmodem_iac,
             self.terminal_type == TerminalType::Petscii,
+            verbose,
         )
         .await;
         drop(writer_guard);
@@ -1662,17 +1664,19 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        eprintln!("XMODEM download: IAC escaping={}", self.xmodem_iac);
+        if config::get_config().verbose { eprintln!("XMODEM download: IAC escaping={}", self.xmodem_iac); }
         self.drain_input().await;
 
         let start = std::time::Instant::now();
         let mut writer_guard = self.writer.lock().await;
+        let verbose = config::get_config().verbose;
         let result = crate::xmodem::xmodem_send(
             &mut self.reader,
             &mut *writer_guard,
             &data,
             self.xmodem_iac,
             self.terminal_type == TerminalType::Petscii,
+            verbose,
         )
         .await;
         drop(writer_guard);
@@ -2553,7 +2557,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     lockouts: lo,
                                     peer_addr: Some(addr.ip()),
                                     transfer_subdir: String::new(),
-                                    xmodem_iac: true,
+                                    xmodem_iac: false,
                                 };
                                 if let Err(e) = session.run().await {
                                     eprintln!("Telnet: session error from {}: {}", addr, e);
