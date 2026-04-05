@@ -5,6 +5,7 @@ Supports PETSCII (Commodore 64), ANSI, and ASCII terminals. Designed for local
 network use with retro and modern terminal clients.
 
 Author: Ricky Bryce
+Co-Author: Claude (Anthropic)
 
 ## Warning
 
