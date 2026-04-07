@@ -59,6 +59,7 @@ enum Menu {
     Main,
     FileTransfer,
     Gateway,
+    Browser,
 }
 
 impl Menu {
@@ -67,6 +68,7 @@ impl Menu {
             Menu::Main => "xmodem",
             Menu::FileTransfer => "xmodem/xfer",
             Menu::Gateway => "xmodem/gw",
+            Menu::Browser => "xmodem/web",
         }
     }
 }
@@ -312,6 +314,13 @@ struct TelnetSession {
     peer_addr: Option<IpAddr>,
     transfer_subdir: String,
     xmodem_iac: bool,
+    web_lines: Vec<String>,
+    web_scroll: usize,
+    web_links: Vec<String>,
+    web_history: Vec<(String, usize)>,
+    web_url: Option<String>,
+    web_title: Option<String>,
+    web_forms: Vec<crate::webbrowser::WebForm>,
 }
 
 impl TelnetSession {
@@ -990,6 +999,7 @@ impl TelnetSession {
                 Menu::Main => self.render_main_menu().await?,
                 Menu::FileTransfer => self.render_file_transfer().await?,
                 Menu::Gateway => self.render_gateway().await?,
+                Menu::Browser => self.render_web_browser().await?,
             }
 
             let prompt = self.prompt_str();
@@ -1013,6 +1023,9 @@ impl TelnetSession {
                 Some(s) if !s.is_empty() => s,
                 _ => {
                     // ESC pressed — go to main menu or stay
+                    if self.current_menu == Menu::Browser {
+                        self.web_reset();
+                    }
                     self.current_menu = Menu::Main;
                     continue;
                 }
@@ -1029,6 +1042,9 @@ impl TelnetSession {
                 }
                 Menu::Gateway => {
                     self.handle_gateway_command(&input).await?;
+                }
+                Menu::Browser => {
+                    self.handle_web_browser_command(&input).await?;
                 }
             }
         }
@@ -1049,6 +1065,11 @@ impl TelnetSession {
         self.send_line(&format!(
             "  {}  AI Chat",
             self.cyan("A")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}  Simple Browser",
+            self.cyan("B")
         ))
         .await?;
         self.send_line(&format!(
@@ -1087,6 +1108,9 @@ impl TelnetSession {
                     self.ai_chat(&cfg.groq_api_key).await?;
                 }
             }
+            "b" => {
+                self.current_menu = Menu::Browser;
+            }
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
@@ -1100,7 +1124,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A, F, G, or X.").await?;
+                self.show_error("Press A, B, F, G, or X.").await?;
             }
         }
         Ok(true)
@@ -1984,6 +2008,10 @@ impl TelnetSession {
         }
 
         if let Ok(n) = input.parse::<usize>() {
+            if n == 0 {
+                self.show_error("Invalid selection.").await?;
+                return Ok(());
+            }
             let has_parent = !self.transfer_subdir.is_empty();
             if has_parent && n == 1 {
                 if let Some(pos) = self.transfer_subdir.rfind('/') {
@@ -2485,6 +2513,779 @@ impl TelnetSession {
             }
         }
     }
+
+    // ─── WEB BROWSER ────────────────────────────────────────
+
+    const WEB_MAX_HISTORY: usize = 50;
+
+    /// Number of content lines per page.
+    /// Total screen budget is 22 rows: header (sep + title + sep = 3) +
+    /// content + blank (1) + footer (position + url + nav1 + nav2 = 4) + prompt (1) = 9 overhead.
+    /// 22 - 9 = 13 content lines.
+    const WEB_PAGE_HEIGHT: usize = 13;
+
+    /// Content width for HTML rendering.
+    /// Slightly narrower than the display to leave room for link number suffixes
+    /// like `[12]` that are appended after html2text wraps.
+    fn web_content_width(&self) -> usize {
+        if self.terminal_type == TerminalType::Petscii {
+            33 // 40 - 2 indent - 5 for "[NNN]"
+        } else {
+            73 // 80 - 2 indent - 5 for "[NNN]"
+        }
+    }
+
+    async fn render_web_browser(&mut self) -> Result<(), std::io::Error> {
+        // Auto-load homepage on first visit if configured
+        if self.web_lines.is_empty() && self.web_url.is_none() {
+            let cfg = config::get_config();
+            if !cfg.browser_homepage.is_empty() {
+                let url = crate::webbrowser::normalize_url(&cfg.browser_homepage);
+                self.web_fetch_page(&url, false).await?;
+            }
+        }
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+
+        if self.web_lines.is_empty() {
+            // Home screen — no page loaded
+            self.send_line(&format!("  {}", self.yellow("WEB BROWSER"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}  {}  {}",
+                self.action_prompt("G", "Go/Search"),
+                self.action_prompt("K", "Bookmarks"),
+                self.action_prompt("H", "Help"),
+            )).await?;
+            self.send_line("").await?;
+            let footer = self.nav_footer();
+            self.send_line(&footer).await?;
+        } else {
+            // Page view — show title + paginated content
+            let title_display = match &self.web_title {
+                Some(t) => {
+                    let max_w = if self.terminal_type == TerminalType::Petscii { 34 } else { 52 };
+                    crate::webbrowser::truncate_to_width(t, max_w)
+                }
+                None => "Web Browser".to_string(),
+            };
+            self.send_line(&format!("  {}", self.yellow(&title_display))).await?;
+            self.send_line(&sep).await?;
+
+            let page_h = Self::WEB_PAGE_HEIGHT;
+            let total = self.web_lines.len();
+            let start = self.web_scroll;
+            let end = (start + page_h).min(total);
+
+            let content_max = if self.terminal_type == TerminalType::Petscii {
+                PETSCII_WIDTH - 2
+            } else {
+                78
+            };
+            let page_lines: Vec<String> = self.web_lines[start..end].to_vec();
+            for line in &page_lines {
+                let safe = crate::webbrowser::truncate_to_width(line, content_max);
+                self.send_line(&format!("  {}", safe)).await?;
+            }
+            self.send_line("").await?;
+
+            // Status line
+            let has_prev = start > 0;
+            let has_next = end < total;
+            let url_display = match &self.web_url {
+                Some(u) => {
+                    let max_w = if self.terminal_type == TerminalType::Petscii { 36 } else { 54 };
+                    crate::webbrowser::truncate_to_width(u, max_w)
+                }
+                None => String::new(),
+            };
+            self.send_line(&format!("  {}", self.dim(&format!("({}-{} of {})", start + 1, end, total)))).await?;
+            if !self.web_forms.is_empty() {
+                let form_count = self.web_forms.len();
+                let form_hint = if form_count == 1 {
+                    "1 form on this page (F to edit)".to_string()
+                } else {
+                    format!("{} forms on this page (F to edit)", form_count)
+                };
+                self.send_line(&format!("  {}", self.amber(&form_hint))).await?;
+            } else {
+                self.send_line(&format!("  {}", self.dim(&url_display))).await?;
+            }
+
+            // Navigation footer — two rows to fit all commands
+            let is_petscii = self.terminal_type == TerminalType::Petscii;
+            let has_forms = !self.web_forms.is_empty();
+            // Row 1: navigation
+            let mut nav = Vec::new();
+            if has_prev { nav.push(self.action_prompt("P", "Pv")); }
+            if has_next { nav.push(self.action_prompt("N", "Nx")); }
+            nav.push(self.action_prompt("T", "Top"));
+            nav.push(self.action_prompt("E", "End"));
+            nav.push(self.action_prompt("S", "Find"));
+            if !is_petscii {
+                nav.push(self.action_prompt("G", "Go"));
+            }
+            self.send_line(&format!("  {}", nav.join(" "))).await?;
+            // Row 2: actions
+            let mut act = Vec::new();
+            if is_petscii {
+                act.push(self.action_prompt("G", "Go"));
+            }
+            if !self.web_links.is_empty() {
+                act.push(self.action_prompt("L", "Lk"));
+            }
+            if has_forms {
+                act.push(self.action_prompt("F", "Fm"));
+            }
+            act.push(self.action_prompt("K", "Bm"));
+            act.push(self.action_prompt("H", "?"));
+            if !self.web_history.is_empty() {
+                act.push(self.action_prompt("B", "Bk"));
+            }
+            act.push(self.action_prompt("Q", "X"));
+            self.send_line(&format!("  {}", act.join(" "))).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_web_browser_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
+        if self.web_lines.is_empty() {
+            // Home screen commands
+            match input {
+                "g" => {
+                    self.web_prompt_url().await?;
+                }
+                "k" => {
+                    self.web_show_bookmarks().await?;
+                }
+                "h" => {
+                    self.web_show_help(false).await?;
+                }
+                "q" => {
+                    self.web_reset();
+                    self.current_menu = Menu::Main;
+                }
+                "r" => {} // just redraw
+                _ => {
+                    self.show_error("Press G, K, H, or Q.").await?;
+                }
+            }
+        } else {
+            // Page view commands
+            match input {
+                "q" => {
+                    // Close page, return to browser home
+                    self.web_lines.clear();
+                    self.web_scroll = 0;
+                }
+                "r" => {
+                    if let Some(url) = self.web_url.clone() {
+                        self.web_fetch_page(&url, false).await?;
+                    }
+                }
+                "n" => {
+                    let page_h = Self::WEB_PAGE_HEIGHT;
+                    let total = self.web_lines.len();
+                    if self.web_scroll + page_h < total {
+                        self.web_scroll += page_h;
+                    } else {
+                        self.show_error("End of page.").await?;
+                    }
+                }
+                "p" => {
+                    if self.web_scroll > 0 {
+                        let page_h = Self::WEB_PAGE_HEIGHT;
+                        self.web_scroll = self.web_scroll.saturating_sub(page_h);
+                    } else {
+                        self.show_error("Top of page.").await?;
+                    }
+                }
+                "t" => {
+                    self.web_scroll = 0;
+                }
+                "e" => {
+                    let page_h = Self::WEB_PAGE_HEIGHT;
+                    let total = self.web_lines.len();
+                    if total > page_h {
+                        self.web_scroll = total - page_h;
+                    } else {
+                        self.web_scroll = 0;
+                    }
+                }
+                "g" => {
+                    self.web_prompt_url().await?;
+                }
+                "l" => {
+                    self.web_prompt_link().await?;
+                }
+                "s" => {
+                    self.web_search_in_page().await?;
+                }
+                "k" => {
+                    self.web_save_bookmark().await?;
+                }
+                "f" => {
+                    self.web_show_forms().await?;
+                }
+                "h" => {
+                    self.web_show_help(true).await?;
+                }
+                "b" => {
+                    if let Some((prev_url, prev_scroll)) = self.web_history.last().cloned() {
+                        if self.web_fetch_page(&prev_url, false).await? {
+                            self.web_scroll = prev_scroll;
+                            self.web_history.pop();
+                        }
+                    } else {
+                        self.show_error("No history.").await?;
+                    }
+                }
+                _ => {
+                    if let Ok(num) = input.parse::<usize>() {
+                        self.web_follow_link(num).await?;
+                    } else {
+                        self.show_error("Unknown command.").await?;
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn web_prompt_url(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send(&format!("  {}: ", self.cyan("URL/Search"))).await?;
+        self.flush().await?;
+
+        let url_input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        let url = crate::webbrowser::normalize_url(&url_input);
+        self.web_fetch_page(&url, true).await?;
+        Ok(())
+    }
+
+    async fn web_prompt_link(&mut self) -> Result<(), std::io::Error> {
+        if self.web_links.is_empty() {
+            self.show_error("No links on this page.").await?;
+            return Ok(());
+        }
+
+        self.send_line("").await?;
+        self.send(&format!("  {} (1-{}): ", self.cyan("Link #"), self.web_links.len())).await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        // Drain any stray bytes (e.g. NUL from telnet CR+NUL) before following
+        self.drain_input().await;
+
+        if let Ok(num) = input.parse::<usize>() {
+            self.web_follow_link(num).await?;
+        } else {
+            self.show_error("Enter a number.").await?;
+        }
+        Ok(())
+    }
+
+    async fn web_follow_link(&mut self, num: usize) -> Result<(), std::io::Error> {
+        if num >= 1 && num <= self.web_links.len() {
+            let link = self.web_links[num - 1].clone();
+            let resolved = match &self.web_url {
+                Some(base) => crate::webbrowser::resolve_url(base, &link),
+                None => crate::webbrowser::normalize_url(&link),
+            };
+            self.web_fetch_page(&resolved, true).await?;
+        } else {
+            self.show_error(&format!("Link {} not found.", num)).await?;
+        }
+        Ok(())
+    }
+
+    async fn web_fetch_page(&mut self, url: &str, push_history: bool) -> Result<bool, std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!("  {}...", self.dim("Loading"))).await?;
+        self.flush().await?;
+
+        let width = self.web_content_width();
+        let url_owned = url.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::webbrowser::fetch_and_render(&url_owned, width)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        self.web_apply_result(result, push_history).await
+    }
+
+    async fn web_show_help(&mut self, page_view: bool) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("BROWSER HELP"))).await?;
+        self.send_line(&sep).await?;
+
+        if page_view {
+            let is_petscii = self.terminal_type == TerminalType::Petscii;
+            if is_petscii {
+                // Compact help for 40-col screens
+                self.send_line("  1-9  Follow link by number").await?;
+                self.send_line("  N/P  Next/Previous page").await?;
+                self.send_line("  T/E  Jump to Top/End").await?;
+                self.send_line("  S    Search text in page").await?;
+                self.send_line("  G    Go to URL or search").await?;
+                self.send_line("  L    Follow link (any #)").await?;
+                self.send_line("  F    Fill out forms").await?;
+                self.send_line("  K    Save bookmark").await?;
+                self.send_line("  B    Back to previous page").await?;
+                self.send_line("  R    Reload current page").await?;
+                self.send_line("  Q    Close page").await?;
+                self.send_line("  ESC  Exit browser").await?;
+            } else {
+                self.send_line("  1-9    Follow a link by its number").await?;
+                self.send_line("  N / P  Next page / Previous page").await?;
+                self.send_line("  T / E  Jump to Top / End of page").await?;
+                self.send_line("  S      Search for text in page").await?;
+                self.send_line("  G      Go to a URL or search query").await?;
+                self.send_line("  L      Follow a link (any number)").await?;
+                self.send_line("  F      Fill out and submit forms").await?;
+                self.send_line("  K      Save page as bookmark").await?;
+                self.send_line("  B      Back to previous page").await?;
+                self.send_line("  R      Reload current page").await?;
+                self.send_line("  Q      Close page (browser home)").await?;
+                self.send_line("  ESC    Exit browser to main menu").await?;
+            }
+        } else {
+            self.send_line("  G  Go to a URL or search query").await?;
+            self.send_line("  K  Open saved bookmarks").await?;
+            self.send_line("  Q  Exit browser to main menu").await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}",
+                self.dim("Type a URL like example.com")
+            )).await?;
+            self.send_line(&format!("  {}",
+                self.dim("or a search like: rust lang")
+            )).await?;
+        }
+
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    async fn web_save_bookmark(&mut self) -> Result<(), std::io::Error> {
+        if let Some(url) = &self.web_url {
+            let title = self.web_title.as_deref().unwrap_or("Untitled");
+            if crate::webbrowser::add_bookmark(url, title) {
+                self.send_line("").await?;
+                self.send_line(&format!("  {}", self.green("Bookmark saved."))).await?;
+                self.send_line("").await?;
+                self.send("  Press any key to continue.").await?;
+                self.flush().await?;
+                self.wait_for_key().await?;
+            } else {
+                self.show_error("Already bookmarked (or full).").await?;
+            }
+        } else {
+            self.show_error("No page to bookmark.").await?;
+        }
+        Ok(())
+    }
+
+    async fn web_show_bookmarks(&mut self) -> Result<(), std::io::Error> {
+        let bookmarks = crate::webbrowser::load_bookmarks();
+        if bookmarks.is_empty() {
+            self.show_error("No bookmarks saved.").await?;
+            return Ok(());
+        }
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("BOOKMARKS"))).await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+
+        let max_title = if self.terminal_type == TerminalType::Petscii { 30 } else { 60 };
+        let display_max = bookmarks.len().min(Self::WEB_PAGE_HEIGHT);
+        for (i, bm) in bookmarks.iter().take(display_max).enumerate() {
+            let title = crate::webbrowser::truncate_to_width(&bm.title, max_title);
+            self.send_line(&format!("  {:>2}. {}", i + 1, title)).await?;
+        }
+        if bookmarks.len() > display_max {
+            self.send_line(&format!("  {} more...", bookmarks.len() - display_max)).await?;
+        }
+
+        self.send_line("").await?;
+        self.send_line(&format!("  {} {}",
+            self.dim("#=Open"),
+            self.action_prompt("D", "Delete"),
+        )).await?;
+        self.send(&format!("  {}: ", self.cyan("Cmd"))).await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if input == "d" {
+            // Delete mode
+            self.send(&format!("  {} (1-{}): ", self.cyan("Delete #"), display_max)).await?;
+            self.flush().await?;
+            let del_input = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+            if let Ok(num) = del_input.parse::<usize>() {
+                if num >= 1 && num <= display_max {
+                    crate::webbrowser::remove_bookmark(num - 1);
+                    self.send_line(&format!("  {}", self.green("Deleted."))).await?;
+                    self.send_line("").await?;
+                    self.send("  Press any key to continue.").await?;
+                    self.flush().await?;
+                    self.wait_for_key().await?;
+                } else {
+                    self.show_error("Invalid number.").await?;
+                }
+            }
+        } else if let Ok(num) = input.parse::<usize>() {
+            if num >= 1 && num <= display_max {
+                let url = bookmarks[num - 1].url.clone();
+                self.web_fetch_page(&url, true).await?;
+            } else {
+                self.show_error("Invalid number.").await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn web_search_in_page(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send(&format!("  {}: ", self.cyan("Find"))).await?;
+        self.flush().await?;
+
+        let query = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s.to_ascii_lowercase(),
+            _ => return Ok(()),
+        };
+
+        // Search from line after current scroll position, then wrap around
+        let total = self.web_lines.len();
+        let start_line = self.web_scroll + 1;
+        for offset in 0..total {
+            let idx = (start_line + offset) % total;
+            if self.web_lines[idx].to_ascii_lowercase().contains(&query) {
+                // Scroll to put the match at the top of the page
+                self.web_scroll = idx;
+                return Ok(());
+            }
+        }
+
+        self.show_error("Not found.").await?;
+        Ok(())
+    }
+
+    async fn web_show_forms(&mut self) -> Result<(), std::io::Error> {
+        if self.web_forms.is_empty() {
+            self.show_error("No forms on this page.").await?;
+            return Ok(());
+        }
+
+        if self.web_forms.len() == 1 {
+            return self.web_edit_form(0).await;
+        }
+
+        self.send_line("").await?;
+        self.send_line(&format!("  {}", self.yellow("FORMS"))).await?;
+        let forms_snapshot: Vec<String> = self.web_forms.iter().enumerate().map(|(i, form)| {
+            let label = crate::webbrowser::truncate_to_width(&form.label, 30);
+            format!("  {}. {}", i + 1, label)
+        }).collect();
+        for line in &forms_snapshot {
+            self.send_line(line).await?;
+        }
+        self.send_line("").await?;
+        self.send(&format!("  {} (1-{}): ", self.cyan("Form #"), self.web_forms.len())).await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if let Ok(num) = input.parse::<usize>() {
+            if num >= 1 && num <= self.web_forms.len() {
+                self.web_edit_form(num - 1).await?;
+            } else {
+                self.show_error("Invalid form number.").await?;
+            }
+        } else {
+            self.show_error("Enter a number.").await?;
+        }
+        Ok(())
+    }
+
+    async fn web_edit_form(&mut self, form_idx: usize) -> Result<(), std::io::Error> {
+        let mut form = self.web_forms[form_idx].clone();
+
+        // If the form has no visible fields (only hidden), submit immediately
+        let has_visible = form.fields.iter().any(|f| !matches!(f, crate::webbrowser::FormField::Hidden { .. }));
+        if !has_visible {
+            self.web_forms[form_idx] = form;
+            return self.web_submit_form(form_idx).await;
+        }
+
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            let title = crate::webbrowser::truncate_to_width(&form.label, 34);
+            self.send_line(&format!("  {}", self.yellow(&title))).await?;
+            self.send_line(&sep).await?;
+
+            let mut field_num = 0usize;
+            let is_petscii = self.terminal_type == TerminalType::Petscii;
+            let max_label = if is_petscii { 12 } else { 20 };
+            let max_val = if is_petscii { 18 } else { 40 };
+
+            let display_lines: Vec<String> = form.fields.iter().filter_map(|field| {
+                match field {
+                    crate::webbrowser::FormField::Hidden { .. } => None,
+                    crate::webbrowser::FormField::Text { label, value, .. }
+                    | crate::webbrowser::FormField::TextArea { label, value, .. } => {
+                        field_num += 1;
+                        let display_val = if value.is_empty() { "(empty)" } else { value.as_str() };
+                        Some(format!("  {}.{}: {}",
+                            field_num,
+                            crate::webbrowser::truncate_to_width(label, max_label),
+                            crate::webbrowser::truncate_to_width(display_val, max_val),
+                        ))
+                    }
+                    crate::webbrowser::FormField::Select { label, options, selected, .. } => {
+                        field_num += 1;
+                        let chosen = options.get(*selected).map(|(_, t)| t.as_str()).unwrap_or("?");
+                        Some(format!("  {}.{}: {}",
+                            field_num,
+                            crate::webbrowser::truncate_to_width(label, max_label),
+                            crate::webbrowser::truncate_to_width(chosen, max_val),
+                        ))
+                    }
+                    crate::webbrowser::FormField::Checkbox { label, checked, .. } => {
+                        field_num += 1;
+                        let mark = if *checked { "[X]" } else { "[ ]" };
+                        Some(format!("  {}.{}: {}",
+                            field_num,
+                            crate::webbrowser::truncate_to_width(label, max_label),
+                            mark,
+                        ))
+                    }
+                    crate::webbrowser::FormField::Radio { label, checked, .. } => {
+                        field_num += 1;
+                        let mark = if *checked { "(X)" } else { "( )" };
+                        Some(format!("  {}.{}: {}",
+                            field_num,
+                            crate::webbrowser::truncate_to_width(label, max_label),
+                            mark,
+                        ))
+                    }
+                }
+            }).collect();
+
+            for line in &display_lines {
+                self.send_line(line).await?;
+            }
+
+            self.send_line("").await?;
+            self.send_line(&format!("  {} {} {}",
+                self.action_prompt("S", "Submit"),
+                self.dim("#=Edit"),
+                self.action_prompt("Q", "Cancel"),
+            )).await?;
+            self.send(&format!("  {}: ", self.cyan("Cmd"))).await?;
+            self.flush().await?;
+
+            let input = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "s" => {
+                    self.web_forms[form_idx] = form;
+                    return self.web_submit_form(form_idx).await;
+                }
+                "q" => return Ok(()),
+                other => {
+                    if let Ok(num) = other.parse::<usize>() {
+                        if let Some(real_idx) = crate::webbrowser::visible_field_index(&form.fields, num) {
+                            self.web_edit_field(&mut form, real_idx).await?;
+                        } else {
+                            self.show_error("Invalid field number.").await?;
+                        }
+                    } else {
+                        self.show_error("Enter S, Q, or a field #.").await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn web_edit_field(&mut self, form: &mut crate::webbrowser::WebForm, idx: usize) -> Result<(), std::io::Error> {
+        use crate::webbrowser::FormField;
+
+        let (is_text, is_password, is_select, is_checkbox, is_radio, label_str, opt_count) = {
+            let field = &form.fields[idx];
+            match field {
+                FormField::Text { label, input_type, .. } => {
+                    (true, input_type == "password", false, false, false, label.clone(), 0)
+                }
+                FormField::TextArea { label, .. } => {
+                    (true, false, false, false, false, label.clone(), 0)
+                }
+                FormField::Select { options, .. } => {
+                    (false, false, true, false, false, String::new(), options.len())
+                }
+                FormField::Checkbox { .. } => {
+                    (false, false, false, true, false, String::new(), 0)
+                }
+                FormField::Radio { name, .. } => {
+                    (false, false, false, false, true, name.clone(), 0)
+                }
+                FormField::Hidden { .. } => {
+                    return Ok(());
+                }
+            }
+        };
+
+        if is_text {
+            self.send_line("").await?;
+            self.send(&format!("  {}: ", self.cyan(&label_str))).await?;
+            self.flush().await?;
+            let input = if is_password {
+                self.get_password_input().await?
+            } else {
+                self.get_line_input().await?
+            };
+            if let Some(new_val) = input {
+                match &mut form.fields[idx] {
+                    FormField::Text { value, .. } | FormField::TextArea { value, .. } => {
+                        *value = new_val;
+                    }
+                    _ => {}
+                }
+            }
+        } else if is_select {
+            self.send_line("").await?;
+            let opts_snapshot: Vec<(String, bool)> = if let FormField::Select { options, selected, .. } = &form.fields[idx] {
+                options.iter().enumerate().map(|(i, (_, display))| {
+                    (display.clone(), i == *selected)
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            for (i, (display, is_sel)) in opts_snapshot.iter().enumerate() {
+                let marker = if *is_sel { ">" } else { " " };
+                self.send_line(&format!("  {}{}.{}",
+                    marker, i + 1,
+                    crate::webbrowser::truncate_to_width(display, 30),
+                )).await?;
+            }
+            self.send(&format!("  {} (1-{}): ", self.cyan("Pick"), opt_count)).await?;
+            self.flush().await?;
+            if let Some(input) = self.get_line_input().await?
+                && let Ok(n) = input.parse::<usize>()
+                    && n >= 1 && n <= opt_count
+                        && let FormField::Select { selected, .. } = &mut form.fields[idx] {
+                            *selected = n - 1;
+                        }
+        } else if is_checkbox {
+            if let FormField::Checkbox { checked, .. } = &mut form.fields[idx] {
+                *checked = !*checked;
+            }
+        } else if is_radio {
+            let radio_name = label_str;
+            for f in form.fields.iter_mut() {
+                if let FormField::Radio { name, checked, .. } = f
+                    && *name == radio_name {
+                        *checked = false;
+                    }
+            }
+            if let FormField::Radio { checked, .. } = &mut form.fields[idx] {
+                *checked = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn web_submit_form(&mut self, form_idx: usize) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!("  {}...", self.dim("Submitting"))).await?;
+        self.flush().await?;
+
+        let form = self.web_forms[form_idx].clone();
+        let base = self.web_url.clone().unwrap_or_default();
+        let width = self.web_content_width();
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::webbrowser::submit_form(&base, &form, width)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        self.web_apply_result(result, true).await?;
+        Ok(())
+    }
+
+    async fn web_apply_result(
+        &mut self,
+        result: Result<crate::webbrowser::WebPage, String>,
+        push_history: bool,
+    ) -> Result<bool, std::io::Error> {
+        match result {
+            Ok(page) => {
+                if push_history
+                    && let Some(old_url) = self.web_url.as_ref() {
+                        self.web_history.push((old_url.clone(), self.web_scroll));
+                        if self.web_history.len() > Self::WEB_MAX_HISTORY {
+                            self.web_history.remove(0);
+                        }
+                    }
+                self.web_url = Some(page.url);
+                self.web_title = page.title;
+                self.web_lines = page.lines;
+                self.web_links = page.links;
+                self.web_forms = page.forms;
+                self.web_scroll = 0;
+                Ok(true)
+            }
+            Err(e) => {
+                let max_w = if self.terminal_type == TerminalType::Petscii { 30 } else { 50 };
+                self.show_error(&crate::webbrowser::truncate_to_width(&e, max_w)).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn web_reset(&mut self) {
+        self.web_lines.clear();
+        self.web_scroll = 0;
+        self.web_links.clear();
+        self.web_forms.clear();
+        self.web_history.clear();
+        self.web_url = None;
+        self.web_title = None;
+    }
 }
 
 // ─── Server startup ─────────────────────────────────────────
@@ -2558,6 +3359,13 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     peer_addr: Some(addr.ip()),
                                     transfer_subdir: String::new(),
                                     xmodem_iac: false,
+                                    web_lines: Vec::new(),
+                                    web_scroll: 0,
+                                    web_links: Vec::new(),
+                                    web_history: Vec::new(),
+                                    web_url: None,
+                                    web_title: None,
+                                    web_forms: Vec::new(),
                                 };
                                 if let Err(e) = session.run().await {
                                     eprintln!("Telnet: session error from {}: {}", addr, e);
@@ -3050,7 +3858,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A, F, G, or X.",
+            "Press A, B, F, G, or X.",
             "Press U, D, X, C, I, R, or Q.",
             "Disk space is low. Uploads disabled.",
             "File already exists.",
@@ -3072,6 +3880,23 @@ mod tests {
             "Disconnected: idle timeout.",
             "Press any key to continue.",
             "No API key configured.",
+            // Web browser
+            "Press G, K, H, or Q.",
+            "End of page.",
+            "Top of page.",
+            "No links on this page.",
+            "No forms on this page.",
+            "No history.",
+            "Enter a number.",
+            "Invalid form number.",
+            "Invalid field number.",
+            "Enter S, Q, or a field #.",
+            "Already bookmarked (or full).",
+            "No page to bookmark.",
+            "No bookmarks saved.",
+            "Not found.",
+            "Invalid number.",
+            "Unknown command.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -3092,6 +3917,7 @@ mod tests {
         let items = [
             // Main menu
             "  A  AI Chat",
+            "  B  Simple Browser",
             "  F  File Transfer",
             "  G  SSH Gateway",
             "  X  Exit",
@@ -3109,6 +3935,8 @@ mod tests {
             "  Password: ",
             // AI chat
             "  Type a question, or Q to exit.",
+            // Web browser
+            "  G=Go/Search  K=Bookmarks  H=Help",
         ];
         for item in &items {
             assert!(
@@ -3121,11 +3949,11 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 3 items + blank + prompt = 9 rows.
+    /// Main menu screen: header(3) + blank + 5 items + blank + prompt = 10 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, F, G, X, blank = 9 lines
-        let rows = 9;
+        // sep, title, sep, blank, A, B, F, G, X, blank = 10 lines
+        let rows = 10;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
@@ -3359,5 +4187,335 @@ mod tests {
     #[test]
     fn test_max_file_size() {
         assert_eq!(TelnetSession::MAX_FILE_SIZE, 8 * 1024 * 1024);
+    }
+
+    // ─── Web browser ─────────────────────────────────────
+
+    #[test]
+    fn test_browser_menu_path() {
+        assert_eq!(Menu::Browser.path(), "xmodem/web");
+    }
+
+    #[test]
+    fn test_web_page_height_fits_screen() {
+        let overhead = 3 + 1 + 4 + 1; // header(3) + blank + footer(pos+url+nav1+nav2) + prompt
+        assert!(
+            TelnetSession::WEB_PAGE_HEIGHT + overhead <= 22,
+            "WEB_PAGE_HEIGHT {} + overhead {} = {} exceeds 22",
+            TelnetSession::WEB_PAGE_HEIGHT,
+            overhead,
+            TelnetSession::WEB_PAGE_HEIGHT + overhead,
+        );
+    }
+
+    #[test]
+    fn test_web_max_history_is_reasonable() {
+        assert!(TelnetSession::WEB_MAX_HISTORY >= 10, "too few history entries");
+        assert!(TelnetSession::WEB_MAX_HISTORY <= 200, "excessive history cap");
+    }
+
+    #[test]
+    fn test_web_browser_home_lines_fit_petscii() {
+        let lines = [
+            "  WEB BROWSER",
+            "  G=Go/Search  K=Bookmarks  H=Help",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "line '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    #[test]
+    fn test_web_browser_footer_fits_petscii() {
+        // Row 1 worst case (PETSCII): P=Pv N=Nx T=Top E=End S=Find
+        let row1 = "  P=Pv N=Nx T=Top E=End S=Find";
+        assert!(
+            row1.len() <= PETSCII_WIDTH,
+            "nav row1 '{}' is {} chars, exceeds {}",
+            row1, row1.len(), PETSCII_WIDTH,
+        );
+        // Row 2 worst case (PETSCII): G=Go L=Lk F=Fm K=Bm H=? B=Bk Q=X
+        let row2 = "  G=Go L=Lk F=Fm K=Bm H=? B=Bk Q=X";
+        assert!(
+            row2.len() <= PETSCII_WIDTH,
+            "nav row2 '{}' is {} chars, exceeds {}",
+            row2, row2.len(), PETSCII_WIDTH,
+        );
+    }
+
+    #[test]
+    fn test_web_browser_status_line_fits_petscii() {
+        let status = format!("  ({}-{} of {})", 4983, 5000, 5000);
+        assert!(
+            status.len() <= PETSCII_WIDTH,
+            "status '{}' is {} chars, exceeds {}",
+            status,
+            status.len(),
+            PETSCII_WIDTH,
+        );
+        // Form indicator line
+        let form_hint = "  1 form on this page (F to edit)";
+        assert!(
+            form_hint.len() <= PETSCII_WIDTH,
+            "form hint '{}' is {} chars, exceeds {}",
+            form_hint, form_hint.len(), PETSCII_WIDTH,
+        );
+        let form_hint_multi = "  99 forms on this page (F to edit)";
+        assert!(
+            form_hint_multi.len() <= PETSCII_WIDTH,
+            "form hint '{}' is {} chars, exceeds {}",
+            form_hint_multi, form_hint_multi.len(), PETSCII_WIDTH,
+        );
+    }
+
+    // ─── Web browser pagination ──────────────────────────
+
+    #[test]
+    fn test_web_pagination_single_line() {
+        let page_h = TelnetSession::WEB_PAGE_HEIGHT;
+        let total = 1;
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, 1);
+        assert!(scroll == 0);   // no prev
+        assert!(end >= total);   // no next
+    }
+
+    #[test]
+    fn test_web_pagination_exact_page() {
+        let page_h = TelnetSession::WEB_PAGE_HEIGHT;
+        let total = page_h;
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, page_h);
+        assert!(end >= total); // no next
+    }
+
+    #[test]
+    fn test_web_pagination_two_pages() {
+        let page_h = TelnetSession::WEB_PAGE_HEIGHT;
+        let total = page_h + 5;
+        // Page 1
+        let scroll = 0;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, page_h);
+        assert!(end < total); // has next
+        // Page 2
+        let scroll = page_h;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, total);
+        assert!(scroll > 0);    // has prev
+        assert!(end >= total);   // no next
+    }
+
+    // ─── Web browser top/end navigation ──────────────────
+
+    #[test]
+    fn test_web_end_scroll_calculation() {
+        let page_h = TelnetSession::WEB_PAGE_HEIGHT;
+        let total = 100;
+        // E command: scroll = total - page_h
+        let scroll = total - page_h;
+        let end = (scroll + page_h).min(total);
+        assert_eq!(end, total); // last line visible
+        assert_eq!(end - scroll, page_h); // full page
+    }
+
+    #[test]
+    fn test_web_end_scroll_short_page() {
+        let page_h = TelnetSession::WEB_PAGE_HEIGHT;
+        let total = 5;
+        // E command when total <= page_h: scroll stays 0
+        let scroll = if total > page_h { total - page_h } else { 0 };
+        assert_eq!(scroll, 0);
+    }
+
+    // ─── Web search ──────────────────────────────────────
+
+    #[test]
+    fn test_web_search_logic_finds_match() {
+        let lines: Vec<String> = vec![
+            "Hello world".to_string(),
+            "Foo bar".to_string(),
+            "Rust programming".to_string(),
+            "More text".to_string(),
+        ];
+        let query = "rust";
+        let total = lines.len();
+        let start_line = 0 + 1; // search from scroll+1
+        let mut found = None;
+        for offset in 0..total {
+            let idx = (start_line + offset) % total;
+            if lines[idx].to_ascii_lowercase().contains(query) {
+                found = Some(idx);
+                break;
+            }
+        }
+        assert_eq!(found, Some(2));
+    }
+
+    #[test]
+    fn test_web_search_wraps_around() {
+        let lines: Vec<String> = vec![
+            "Match here".to_string(),
+            "No match".to_string(),
+            "No match".to_string(),
+        ];
+        let query = "match here";
+        let total = lines.len();
+        let start_line = 1 + 1; // searching from scroll=1, so start at 2
+        let mut found = None;
+        for offset in 0..total {
+            let idx = (start_line + offset) % total;
+            if lines[idx].to_ascii_lowercase().contains(query) {
+                found = Some(idx);
+                break;
+            }
+        }
+        assert_eq!(found, Some(0)); // wraps around to line 0
+    }
+
+    #[test]
+    fn test_web_search_no_match() {
+        let lines: Vec<String> = vec![
+            "Hello".to_string(),
+            "World".to_string(),
+        ];
+        let query = "xyz";
+        let total = lines.len();
+        let start_line = 0 + 1;
+        let mut found = None;
+        for offset in 0..total {
+            let idx = (start_line + offset) % total;
+            if lines[idx].to_ascii_lowercase().contains(query) {
+                found = Some(idx);
+                break;
+            }
+        }
+        assert!(found.is_none());
+    }
+
+    // ─── Web history with scroll ─────────────────────────
+
+    #[test]
+    fn test_web_history_stores_scroll() {
+        let mut history: Vec<(String, usize)> = Vec::new();
+        history.push(("https://page1.com".to_string(), 42));
+        history.push(("https://page2.com".to_string(), 0));
+        assert_eq!(history.last().unwrap().1, 0);
+        history.pop();
+        assert_eq!(history.last().unwrap().1, 42);
+    }
+
+    #[test]
+    fn test_web_history_cap_with_scroll() {
+        let max = TelnetSession::WEB_MAX_HISTORY;
+        let mut history: Vec<(String, usize)> = Vec::new();
+        for i in 0..max {
+            history.push((format!("https://page{}.com", i), i * 10));
+        }
+        assert_eq!(history.len(), max);
+        // Push one more — evict oldest
+        history.push(("https://new.com".to_string(), 99));
+        if history.len() > max {
+            history.remove(0);
+        }
+        assert_eq!(history.len(), max);
+        assert_eq!(history[0].0, "https://page1.com");
+        assert_eq!(history.last().unwrap().1, 99);
+    }
+
+    // ─── Bookmarks UI layout ─────────────────────────────
+
+    #[test]
+    fn test_bookmarks_screen_lines_fit_petscii() {
+        let lines = [
+            "  BOOKMARKS",
+            "  #=Open D=Delete",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "line '{}' is {} chars, exceeds {}",
+                line, line.len(), PETSCII_WIDTH,
+            );
+        }
+    }
+
+    #[test]
+    fn test_bookmark_entry_fits_petscii() {
+        // Worst case: "  99. " + 30 chars title
+        let line = format!("  {:>2}. {}", 99, "a".repeat(30));
+        assert!(
+            line.len() <= PETSCII_WIDTH,
+            "bookmark entry '{}' is {} chars, exceeds {}",
+            line, line.len(), PETSCII_WIDTH,
+        );
+    }
+
+    // ─── Help screen ──────────────────────────────────────
+
+    #[test]
+    fn test_web_help_lines_fit_petscii() {
+        let lines = [
+            "  BROWSER HELP",
+            "  1-9  Follow link by number",
+            "  N/P  Next/Previous page",
+            "  T/E  Jump to Top/End",
+            "  S    Search text in page",
+            "  G    Go to URL or search",
+            "  L    Follow link (any #)",
+            "  F    Fill out forms",
+            "  K    Save bookmark",
+            "  B    Back to previous page",
+            "  R    Reload current page",
+            "  Q    Close page",
+            "  ESC  Exit browser",
+            "  G  Go to a URL or search query",
+            "  K  Open saved bookmarks",
+            "  Q  Exit browser to main menu",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "help line '{}' is {} chars, exceeds {}",
+                line, line.len(), PETSCII_WIDTH,
+            );
+        }
+    }
+
+    #[test]
+    fn test_web_help_page_view_row_count() {
+        // header(3) + 12 help lines + blank + "press any key" = 17 rows max
+        let rows = 3 + 12 + 1 + 1;
+        assert!(rows <= 22, "help screen is {} rows, exceeds 22", rows);
+    }
+
+    // ─── URL/Search prompt ───────────────────────────────
+
+    #[test]
+    fn test_url_search_prompt_fits_petscii() {
+        let prompt = "  URL/Search: ";
+        assert!(
+            prompt.len() <= PETSCII_WIDTH,
+            "prompt '{}' is {} chars, exceeds {}",
+            prompt, prompt.len(), PETSCII_WIDTH,
+        );
+    }
+
+    #[test]
+    fn test_find_prompt_fits_petscii() {
+        let prompt = "  Find: ";
+        assert!(
+            prompt.len() <= PETSCII_WIDTH,
+            "prompt '{}' is {} chars, exceeds {}",
+            prompt, prompt.len(), PETSCII_WIDTH,
+        );
     }
 }

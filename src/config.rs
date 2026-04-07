@@ -21,6 +21,7 @@ const DEFAULT_TRANSFER_DIR: &str = "transfer";
 const DEFAULT_MAX_SESSIONS: usize = 50;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900; // 15 minutes
 const DEFAULT_GROQ_API_KEY: &str = "";
+const DEFAULT_BROWSER_HOMEPAGE: &str = "";
 const DEFAULT_VERBOSE: bool = false;
 
 /// Runtime configuration loaded from `xmodem.conf`.
@@ -35,6 +36,8 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     /// Groq API key. If empty, AI chat is disabled.
     pub groq_api_key: String,
+    /// Browser homepage URL. If empty, browser opens to a blank prompt.
+    pub browser_homepage: String,
     /// Enable verbose XMODEM protocol logging to stderr.
     pub verbose: bool,
 }
@@ -50,6 +53,7 @@ impl Default for Config {
             max_sessions: DEFAULT_MAX_SESSIONS,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             groq_api_key: DEFAULT_GROQ_API_KEY.into(),
+            browser_homepage: DEFAULT_BROWSER_HOMEPAGE.into(),
             verbose: DEFAULT_VERBOSE,
         }
     }
@@ -147,6 +151,10 @@ fn read_config_file(path: &str) -> Config {
             .get("groq_api_key")
             .cloned()
             .unwrap_or_else(|| DEFAULT_GROQ_API_KEY.into()),
+        browser_homepage: map
+            .get("browser_homepage")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_BROWSER_HOMEPAGE.into()),
         verbose: map
             .get("verbose")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -186,6 +194,10 @@ idle_timeout_secs = {}
 # Leave empty to disable AI Chat.
 groq_api_key = {}
 
+# Browser homepage URL (loaded automatically when entering the browser)
+# Leave empty to start with a blank prompt.
+browser_homepage = {}
+
 # Verbose logging: set to true for detailed XMODEM protocol diagnostics
 verbose = {}
 ",
@@ -197,6 +209,7 @@ verbose = {}
         cfg.max_sessions,
         cfg.idle_timeout_secs,
         cfg.groq_api_key,
+        cfg.browser_homepage,
         cfg.verbose,
     );
 
@@ -223,6 +236,7 @@ mod tests {
         assert_eq!(cfg.max_sessions, 50);
         assert_eq!(cfg.idle_timeout_secs, 900);
         assert_eq!(cfg.groq_api_key, "");
+        assert_eq!(cfg.browser_homepage, "");
     }
 
     #[test]
@@ -302,6 +316,7 @@ mod tests {
             max_sessions: 5,
             idle_timeout_secs: 60,
             groq_api_key: "gsk_test123".into(),
+            browser_homepage: "https://example.com".into(),
             verbose: true,
         };
         write_config_file(path.to_str().unwrap(), &original);
@@ -315,6 +330,7 @@ mod tests {
         assert_eq!(loaded.max_sessions, original.max_sessions);
         assert_eq!(loaded.idle_timeout_secs, original.idle_timeout_secs);
         assert_eq!(loaded.groq_api_key, original.groq_api_key);
+        assert_eq!(loaded.browser_homepage, original.browser_homepage);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

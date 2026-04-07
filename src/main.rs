@@ -9,6 +9,7 @@
 mod aichat;
 mod config;
 mod telnet;
+mod webbrowser;
 mod xmodem;
 
 use std::sync::atomic::{AtomicBool, Ordering};
