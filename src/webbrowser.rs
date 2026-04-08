@@ -398,25 +398,17 @@ pub(crate) fn normalize_url(input: &str) -> String {
     format!("https://{}", trimmed)
 }
 
-/// Truncate a string to fit within `max_width` columns, appending "..." if truncated.
+/// Truncate a string to fit within `max_width` visible characters, appending "..." if truncated.
 /// Safe for multi-byte UTF-8: always truncates on a char boundary.
 pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
-        return s.to_string();
+    if s.chars().count() <= max_width {
+        s.to_string()
+    } else if max_width <= 3 {
+        ".".repeat(max_width)
+    } else {
+        let truncated: String = s.chars().take(max_width - 3).collect();
+        format!("{}...", truncated)
     }
-    if max_width <= 3 {
-        return ".".repeat(max_width);
-    }
-    let target = max_width - 3;
-    let mut trunc = 0;
-    for (i, c) in s.char_indices() {
-        let end = i + c.len_utf8();
-        if end > target {
-            break;
-        }
-        trunc = end;
-    }
-    format!("{}...", &s[..trunc])
 }
 
 /// Extract the `<title>` text by walking the parsed DOM tree.
@@ -682,18 +674,23 @@ pub(crate) fn load_bookmarks() -> Vec<Bookmark> {
     bookmarks
 }
 
-/// Save bookmarks to the bookmarks file.
-fn save_bookmarks(bookmarks: &[Bookmark]) {
+/// Save bookmarks to the bookmarks file. Returns true on success.
+fn save_bookmarks(bookmarks: &[Bookmark]) -> bool {
     let content: String = bookmarks
         .iter()
         .map(|b| {
-            // Sanitize title: collapse whitespace, strip newlines
+            // Sanitize: collapse whitespace in title, strip newlines from URL
+            let safe_url: String = b.url.chars().filter(|&c| c != '\n' && c != '\r').collect();
             let safe_title: String = b.title.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!("{} {}", b.url, safe_title)
+            format!("{} {}", safe_url, safe_title)
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = std::fs::write(BOOKMARKS_FILE, content);
+    if let Err(e) = std::fs::write(BOOKMARKS_FILE, content) {
+        eprintln!("Warning: could not save bookmarks: {}", e);
+        return false;
+    }
+    true
 }
 
 /// Add a bookmark. Returns true if added, false if duplicate or at capacity.
@@ -709,8 +706,7 @@ pub(crate) fn add_bookmark(url: &str, title: &str) -> bool {
         url: url.to_string(),
         title: title.to_string(),
     });
-    save_bookmarks(&bookmarks);
-    true
+    save_bookmarks(&bookmarks)
 }
 
 /// Remove a bookmark by index (0-based). Returns true if removed.
@@ -720,8 +716,7 @@ pub(crate) fn remove_bookmark(index: usize) -> bool {
         return false;
     }
     bookmarks.remove(index);
-    save_bookmarks(&bookmarks);
-    true
+    save_bookmarks(&bookmarks)
 }
 
 /// Word-wrap a single line to a given width.
@@ -730,21 +725,20 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
     }
-    if line.len() <= width {
+    if line.chars().count() <= width {
         return vec![line.to_string()];
     }
     let mut result = Vec::new();
     let mut remaining = line;
     while !remaining.is_empty() {
-        if remaining.len() <= width {
+        if remaining.chars().count() <= width {
             result.push(remaining.to_string());
             break;
         }
         let boundary = remaining
             .char_indices()
-            .take_while(|&(i, _)| i <= width)
-            .last()
-            .map_or(width.min(remaining.len()), |(i, _)| i);
+            .nth(width)
+            .map_or(remaining.len(), |(i, _)| i);
         let boundary = if boundary == 0 {
             remaining.char_indices().nth(1).map_or(remaining.len(), |(i, _)| i)
         } else {
@@ -888,7 +882,7 @@ mod tests {
     fn test_truncate_to_width_multibyte() {
         let s = "caf\u{e9} latt\u{e9}";
         let result = truncate_to_width(s, 6);
-        assert!(result.len() <= 9);
+        assert!(result.chars().count() <= 6);
         assert!(result.ends_with("..."));
     }
 

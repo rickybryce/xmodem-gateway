@@ -315,20 +315,15 @@ pub(crate) async fn xmodem_send(
 
     // Drain any trailing negotiation bytes (e.g. IMP8 sends 'C' then 'K' for
     // XMODEM-1K; we accepted 'C' but 'K' is still in the buffer).
+    // Uses raw_read_byte to properly handle any IAC sequences on TCP.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let mut drain_buf = [0u8; 64];
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            reader.read(&mut drain_buf),
-        )
-        .await
-        {
-            Ok(Ok(n)) if n > 0 => {
-                if verbose { eprintln!("XMODEM send: drained {} negotiation bytes", n); }
-            }
-            _ => break,
-        }
+    while let Ok(Ok(b)) = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        raw_read_byte(reader, is_tcp),
+    )
+    .await
+    {
+        if verbose { eprintln!("XMODEM send: drained negotiation byte 0x{:02X}", b); }
     }
 
     // Pad data to block boundary
@@ -433,11 +428,18 @@ pub(crate) async fn xmodem_send(
         {
             Ok(Ok(ACK)) => return Ok(()),
             Ok(Ok(NAK)) => continue,
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(_)) => return Ok(()),
+            Ok(Ok(b)) => {
+                if verbose { eprintln!("XMODEM send: unexpected EOT response 0x{:02X}, treating as ACK", b); }
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                if verbose { eprintln!("XMODEM send: read error during EOT: {}", e); }
+                return Err(format!("Read error during EOT: {}", e));
+            }
             Err(_) => continue,
         }
     }
+    if verbose { eprintln!("XMODEM send: EOT not ACKed after {} retries, assuming success", MAX_RETRIES); }
     Ok(())
 }
 

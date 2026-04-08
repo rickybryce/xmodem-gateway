@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Name of the configuration file (lives next to the binary).
 pub const CONFIG_FILE: &str = "xmodem.conf";
@@ -60,14 +60,12 @@ impl Default for Config {
 }
 
 /// Global config singleton, loaded once at startup.
-static CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
 
 /// Get a clone of the current configuration.
 pub fn get_config() -> Config {
     CONFIG
-        .get_or_init(|| Mutex::new(Config::default()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .get_or_init(Config::default)
         .clone()
 }
 
@@ -85,11 +83,8 @@ pub fn load_or_create_config() -> Config {
         cfg
     };
 
-    CONFIG
-        .get_or_init(|| Mutex::new(cfg.clone()));
-    // If already initialised (shouldn't happen), update it.
-    if let Some(m) = CONFIG.get() {
-        *m.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+    if CONFIG.set(cfg.clone()).is_err() {
+        eprintln!("Warning: config already initialised, ignoring duplicate load");
     }
     cfg
 }
@@ -162,6 +157,11 @@ fn read_config_file(path: &str) -> Config {
     }
 }
 
+/// Sanitize a config value by stripping newlines and carriage returns.
+fn sanitize_value(s: &str) -> String {
+    s.chars().filter(|&c| c != '\n' && c != '\r').collect()
+}
+
 /// Write the config file with comments.
 fn write_config_file(path: &str, cfg: &Config) {
     let content = format!(
@@ -203,13 +203,13 @@ verbose = {}
 ",
         cfg.telnet_port,
         cfg.security_enabled,
-        cfg.username,
-        cfg.password,
-        cfg.transfer_dir,
+        sanitize_value(&cfg.username),
+        sanitize_value(&cfg.password),
+        sanitize_value(&cfg.transfer_dir),
         cfg.max_sessions,
         cfg.idle_timeout_secs,
-        cfg.groq_api_key,
-        cfg.browser_homepage,
+        sanitize_value(&cfg.groq_api_key),
+        sanitize_value(&cfg.browser_homepage),
         cfg.verbose,
     );
 
@@ -331,6 +331,7 @@ mod tests {
         assert_eq!(loaded.idle_timeout_secs, original.idle_timeout_secs);
         assert_eq!(loaded.groq_api_key, original.groq_api_key);
         assert_eq!(loaded.browser_homepage, original.browser_homepage);
+        assert_eq!(loaded.verbose, original.verbose);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

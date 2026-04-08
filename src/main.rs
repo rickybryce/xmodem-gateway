@@ -24,6 +24,9 @@ fn main() {
     let cfg = config::load_or_create_config();
     eprintln!("Config: port={}, security={}, transfer_dir={}",
         cfg.telnet_port, cfg.security_enabled, cfg.transfer_dir);
+    if cfg.security_enabled && cfg.password == "changeme" {
+        eprintln!("WARNING: Security is enabled with the default password. Change it in {}.", config::CONFIG_FILE);
+    }
 
     // Create transfer directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&cfg.transfer_dir) {

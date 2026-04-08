@@ -30,7 +30,7 @@ pub(crate) fn ask(api_key: &str, question: &str) -> Result<String, String> {
         .post(url)
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {}", api_key))
-        .send(serde_json::to_string(&request_body).unwrap().as_bytes())
+        .send(serde_json::to_string(&request_body).map_err(|e| format!("JSON serialize error: {}", e))?.as_bytes())
         .map_err(|e| format!("API error: {}", e))?;
 
     let mut body_bytes = Vec::new();
@@ -68,21 +68,20 @@ pub(crate) fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
     }
-    if line.len() <= width {
+    if line.chars().count() <= width {
         return vec![line.to_string()];
     }
     let mut result = Vec::new();
     let mut remaining = line;
     while !remaining.is_empty() {
-        if remaining.len() <= width {
+        if remaining.chars().count() <= width {
             result.push(remaining.to_string());
             break;
         }
         let boundary = remaining
             .char_indices()
-            .take_while(|&(i, _)| i <= width)
-            .last()
-            .map_or(width.min(remaining.len()), |(i, _)| i);
+            .nth(width)
+            .map_or(remaining.len(), |(i, _)| i);
         let boundary = if boundary == 0 {
             remaining
                 .char_indices()

@@ -41,8 +41,7 @@ const PETSCII_DEFAULT: u8 = PETSCII_LIGHT_GRAY;
 
 const PETSCII_WIDTH: usize = 40;
 const MAX_INPUT_LENGTH: usize = 1024;
-const MAX_LOGIN_ATTEMPTS: u32 = 3;
-const MAX_AUTH_FAILURES: u32 = 3;
+const MAX_AUTH_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 // ─── Terminal Type ──────────────────────────────────────────
@@ -79,7 +78,7 @@ type LockoutMap = Arc<Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>>;
 fn is_locked_out(lockouts: &LockoutMap, ip: IpAddr) -> bool {
     let map = lockouts.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((count, when)) = map.get(&ip) {
-        *count >= MAX_AUTH_FAILURES && when.elapsed() < LOCKOUT_DURATION
+        *count >= MAX_AUTH_ATTEMPTS && when.elapsed() < LOCKOUT_DURATION
     } else {
         false
     }
@@ -102,6 +101,51 @@ fn record_auth_failure(lockouts: &LockoutMap, ip: IpAddr) -> u32 {
 fn clear_lockout(lockouts: &LockoutMap, ip: IpAddr) {
     let mut map = lockouts.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&ip);
+}
+
+/// Check an IPv4 address against private/loopback/link-local ranges and the
+/// gateway (.1) restriction. Returns the rejection reason, or None if allowed.
+fn reject_insecure_ipv4(octets: [u8; 4]) -> Option<&'static str> {
+    let is_private = octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || octets[0] == 127
+        || (octets[0] == 169 && octets[1] == 254); // link-local
+    if !is_private {
+        return Some("Connection refused: security is disabled, only private IP addresses are allowed.");
+    }
+    if octets[3] == 1 {
+        return Some("Connection refused: gateway addresses (*.*.*.1) are not allowed when security is disabled.");
+    }
+    None
+}
+
+/// When security is disabled, only allow connections from private/loopback IPs,
+/// and reject any address ending in .1 (typically a gateway). Returns the
+/// rejection reason, or None if the address is allowed.
+fn reject_insecure_ip(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => reject_insecure_ipv4(v4.octets()),
+        IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x) — apply IPv4 rules
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return reject_insecure_ipv4(mapped.octets());
+            }
+            if v6.is_loopback() {
+                return None;
+            }
+            let segments = v6.segments();
+            // Link-local (fe80::/10)
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return None;
+            }
+            // Unique local (fd00::/8)
+            if segments[0] & 0xff00 == 0xfd00 {
+                return None;
+            }
+            Some("Connection refused: security is disabled, only private IP addresses are allowed.")
+        }
+    }
 }
 
 // ─── PETSCII encoding helpers ───────────────────────────────
@@ -141,17 +185,7 @@ pub(crate) fn is_esc_key(byte: u8, petscii: bool) -> bool {
     byte == 0x1B || (petscii && byte == 0x5F)
 }
 
-/// Truncate a string to at most `max_width` visible characters, appending "..." if needed.
-fn truncate_to_width(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
-        s.to_string()
-    } else if max_width <= 3 {
-        ".".repeat(max_width)
-    } else {
-        let truncated: String = s.chars().take(max_width - 3).collect();
-        format!("{}...", truncated)
-    }
-}
+use crate::webbrowser::truncate_to_width;
 
 /// Read a single byte, filtering out telnet IAC protocol sequences.
 async fn read_byte_iac_filtered(
@@ -195,7 +229,11 @@ async fn read_byte_iac_filtered(
                             }
                             // WILL/WONT/DO/DONT — consume the option byte
                             if (0xFB..=0xFE).contains(&cmd) {
-                                let _ = reader.read(&mut buf).await;
+                                match reader.read(&mut buf).await {
+                                    Ok(0) => return Ok(None),
+                                    Err(e) => return Err(e),
+                                    _ => {}
+                                }
                             }
                             continue;
                         }
@@ -283,18 +321,107 @@ fn normalize_gateway_input(b: u8, last_cr: &mut bool) -> Option<u8> {
     Some(b)
 }
 
-/// Minimal SSH client handler for the gateway feature. Accepts all server
-/// host keys (the telnet leg is already cleartext).
-struct GatewayHandler;
+/// SSH client handler for the gateway feature. Captures the server's host key
+/// so it can be verified against the known-hosts file after connection.
+struct GatewayHandler {
+    server_key: Arc<std::sync::Mutex<Option<russh::keys::PublicKey>>>,
+}
 
 impl russh::client::Handler for GatewayHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
+        if let Ok(mut key) = self.server_key.lock() {
+            *key = Some(server_public_key.clone());
+        }
         Ok(true)
+    }
+}
+
+// ─── Known-hosts management ────────────────────────────────
+
+const GATEWAY_HOSTS_FILE: &str = "gateway_hosts";
+
+/// Result of checking a host key against the known-hosts file.
+enum HostKeyStatus {
+    /// Key matches a stored entry.
+    Known,
+    /// No entry for this host:port.
+    Unknown,
+    /// Stored key does not match the presented key.
+    Changed,
+}
+
+/// Format the key as "algorithm base64" for storage.
+fn format_host_key(key: &russh::keys::PublicKey) -> String {
+    // key.to_string() produces "algorithm base64 comment" in OpenSSH format;
+    // we only want "algorithm base64".
+    let s = key.to_string();
+    let parts: Vec<&str> = s.splitn(3, ' ').collect();
+    if parts.len() >= 2 {
+        format!("{} {}", parts[0], parts[1])
+    } else {
+        s
+    }
+}
+
+/// Look up a host:port in the known-hosts file and compare the key.
+fn check_known_host(
+    host: &str,
+    port: u16,
+    key: &russh::keys::PublicKey,
+) -> HostKeyStatus {
+    let lookup = format!("{}:{}", host, port);
+    let key_str = format_host_key(key);
+
+    let content = match std::fs::read_to_string(GATEWAY_HOSTS_FILE) {
+        Ok(c) => c,
+        Err(_) => return HostKeyStatus::Unknown,
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(&lookup)
+            && let Some(stored_key) = rest.strip_prefix(' ')
+        {
+            if stored_key == key_str {
+                return HostKeyStatus::Known;
+            }
+            return HostKeyStatus::Changed;
+        }
+    }
+    HostKeyStatus::Unknown
+}
+
+/// Save a host key to the known-hosts file.
+fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
+    let entry = format!("{}:{} {}\n", host, port, format_host_key(key));
+
+    let mut content = std::fs::read_to_string(GATEWAY_HOSTS_FILE).unwrap_or_default();
+    // Remove any existing entry for this host:port
+    let lookup = format!("{}:{} ", host, port);
+    let filtered: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || !trimmed.starts_with(&lookup)
+        })
+        .collect();
+    content = filtered.join("\n");
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&entry);
+    if let Err(e) = std::fs::write(GATEWAY_HOSTS_FILE, &content) {
+        eprintln!("Warning: could not save gateway host key: {}", e);
     }
 }
 
@@ -875,26 +1002,40 @@ impl TelnetSession {
         self.send_line(&sep).await?;
         self.send_line("").await?;
 
-        for attempt in 1..=MAX_LOGIN_ATTEMPTS {
+        for attempt in 1..=MAX_AUTH_ATTEMPTS {
             self.send(&format!("  {} ", self.cyan("Username:")))
                 .await?;
             self.flush().await?;
-            let username = match tokio::time::timeout(idle_timeout, self.get_line_input()).await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => return Ok(false),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    let _ = self
-                        .send_line("\r\nDisconnected: idle timeout.")
-                        .await;
-                    return Ok(false);
+            let username = if idle_timeout.is_zero() {
+                match self.get_line_input().await {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Ok(false),
+                    Err(e) => return Err(e),
+                }
+            } else {
+                match tokio::time::timeout(idle_timeout, self.get_line_input()).await {
+                    Ok(Ok(Some(s))) => s,
+                    Ok(Ok(None)) => return Ok(false),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        let _ = self
+                            .send_line("\r\nDisconnected: idle timeout.")
+                            .await;
+                        return Ok(false);
+                    }
                 }
             };
 
             self.send(&format!("  {} ", self.cyan("Password:")))
                 .await?;
             self.flush().await?;
-            let password =
+            let password = if idle_timeout.is_zero() {
+                match self.get_password_input().await {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Ok(false),
+                    Err(e) => return Err(e),
+                }
+            } else {
                 match tokio::time::timeout(idle_timeout, self.get_password_input()).await {
                     Ok(Ok(Some(s))) => s,
                     Ok(Ok(None)) => return Ok(false),
@@ -905,7 +1046,8 @@ impl TelnetSession {
                             .await;
                         return Ok(false);
                     }
-                };
+                }
+            };
 
             if username == cfg.username && password == cfg.password {
                 if let Some(ip) = self.peer_addr {
@@ -916,7 +1058,7 @@ impl TelnetSession {
 
             if let Some(ip) = self.peer_addr {
                 let count = record_auth_failure(&self.lockouts, ip);
-                if count >= MAX_LOGIN_ATTEMPTS {
+                if count >= MAX_AUTH_ATTEMPTS {
                     eprintln!("Telnet: {} locked out after {} failures", ip, count);
                     self.send_line(&format!(
                         "  {}",
@@ -928,7 +1070,7 @@ impl TelnetSession {
                 }
             }
 
-            let remaining = MAX_LOGIN_ATTEMPTS - attempt;
+            let remaining = MAX_AUTH_ATTEMPTS - attempt;
             if remaining > 0 {
                 self.send_line(&format!(
                     "  {} ({} {} remaining)",
@@ -1356,8 +1498,8 @@ impl TelnetSession {
             let stat = unsafe { stat.assume_init() };
             let total = stat.f_blocks * stat.f_frsize;
             let avail = stat.f_bavail * stat.f_frsize;
-            if total == 0 {
-                return true;
+            if total == 0 || avail >= total {
+                return total == 0;
             }
             let used_pct = 100 - (avail * 100 / total);
             used_pct > 90
@@ -1465,7 +1607,6 @@ impl TelnetSession {
             .await
         {
             Ok(mut file) => {
-                use tokio::io::AsyncWriteExt;
                 if let Err(e) = file.write_all(&data).await {
                     self.drain_input().await;
                     self.show_error(&format!("Failed to save: {}", e))
@@ -1562,7 +1703,7 @@ impl TelnetSession {
 
             for (i, (name, size)) in page_files.iter().enumerate() {
                 let num = i + 1;
-                let display_name = if name.len() > 22 {
+                let display_name = if name.chars().count() > 22 {
                     let truncated: String = name.chars().take(19).collect();
                     format!("{}...", truncated)
                 } else {
@@ -1791,7 +1932,7 @@ impl TelnetSession {
 
             for (i, (name, size)) in page_files.iter().enumerate() {
                 let num = i + 1;
-                let display_name = if name.len() > 22 {
+                let display_name = if name.chars().count() > 22 {
                     let truncated: String = name.chars().take(19).collect();
                     format!("{}...", truncated)
                 } else {
@@ -1974,7 +2115,7 @@ impl TelnetSession {
 
         for name in &dirs {
             num += 1;
-            let display = if name.len() > 30 {
+            let display = if name.chars().count() > 30 {
                 let t: String = name.chars().take(27).collect();
                 format!("{}...", t)
             } else {
@@ -2156,23 +2297,31 @@ impl TelnetSession {
         .await?;
         self.send_line("").await?;
 
-        let (host, port, username, password) = match tokio::time::timeout(
-            idle_timeout,
-            self.gateway_prompts(),
-        )
-        .await
-        {
-            Ok(Ok(Some(creds))) => creds,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let _ = self
-                    .send_line("\r\nDisconnected: idle timeout.")
-                    .await;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "idle timeout in gateway prompts",
-                ));
+        let (host, port, username, password) = if idle_timeout.is_zero() {
+            match self.gateway_prompts().await {
+                Ok(Some(creds)) => creds,
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        } else {
+            match tokio::time::timeout(
+                idle_timeout,
+                self.gateway_prompts(),
+            )
+            .await
+            {
+                Ok(Ok(Some(creds))) => creds,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let _ = self
+                        .send_line("\r\nDisconnected: idle timeout.")
+                        .await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout in gateway prompts",
+                    ));
+                }
             }
         };
 
@@ -2190,7 +2339,11 @@ impl TelnetSession {
             inactivity_timeout: Some(std::time::Duration::from_secs(600)),
             ..Default::default()
         });
-        let handler = GatewayHandler;
+        let server_key_slot: Arc<std::sync::Mutex<Option<russh::keys::PublicKey>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let handler = GatewayHandler {
+            server_key: server_key_slot.clone(),
+        };
 
         let mut session = match tokio::time::timeout(
             Self::GATEWAY_CONNECT_TIMEOUT,
@@ -2210,14 +2363,141 @@ impl TelnetSession {
             }
         };
 
+        // Verify server host key against known-hosts file
+        let server_key = server_key_slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some(ref key) = server_key else {
+            self.show_error("Could not verify server host key.").await?;
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "no host key", "")
+                .await;
+            return Ok(());
+        };
+        {
+            match check_known_host(&host, port, key) {
+                HostKeyStatus::Known => {}
+                HostKeyStatus::Unknown => {
+                    let fingerprint = key.fingerprint(russh::keys::HashAlg::Sha256);
+                    let algo = key.algorithm();
+                    self.send_line("").await?;
+                    self.send_line(&format!(
+                        "  {}",
+                        self.yellow("Host key not recognized.")
+                    ))
+                    .await?;
+                    let algo_str = algo.to_string();
+                    let fp_str = fingerprint.to_string();
+                    self.send_line(&format!("  Type: {}", self.cyan(&algo_str)))
+                        .await?;
+                    self.send_line(&format!(
+                        "  Fingerprint: {}",
+                        self.cyan(&fp_str)
+                    ))
+                    .await?;
+                    self.send_line("").await?;
+                    self.send(&format!(
+                        "  {} ",
+                        self.cyan("Trust this host? (Y/N):")
+                    ))
+                    .await?;
+                    self.flush().await?;
+                    let answer = match self.read_byte_filtered().await? {
+                        Some(b) => b,
+                        None => return Ok(()),
+                    };
+                    self.send_line("").await?;
+                    if answer != b'y' && answer != b'Y' {
+                        self.send_line(&format!(
+                            "  {}",
+                            self.red("Connection aborted.")
+                        ))
+                        .await?;
+                        self.send_line("").await?;
+                        let _ = session
+                            .disconnect(russh::Disconnect::ByApplication, "host key rejected", "")
+                            .await;
+                        return Ok(());
+                    }
+                    save_known_host(&host, port, key);
+                    self.send_line(&format!(
+                        "  {}",
+                        self.green("Host key saved.")
+                    ))
+                    .await?;
+                }
+                HostKeyStatus::Changed => {
+                    let fingerprint = key.fingerprint(russh::keys::HashAlg::Sha256);
+                    let algo_str = key.algorithm().to_string();
+                    let fp_str = fingerprint.to_string();
+                    self.send_line("").await?;
+                    self.send_line(&format!(
+                        "  {}",
+                        self.red("WARNING: HOST KEY HAS CHANGED!")
+                    ))
+                    .await?;
+                    self.send_line(&format!(
+                        "  {}",
+                        self.red("This could indicate a security threat.")
+                    ))
+                    .await?;
+                    self.send_line(&format!("  New type: {}", self.cyan(&algo_str)))
+                        .await?;
+                    self.send_line(&format!(
+                        "  New fingerprint: {}",
+                        self.cyan(&fp_str)
+                    ))
+                    .await?;
+                    self.send_line("").await?;
+                    self.send(&format!(
+                        "  {} ",
+                        self.cyan("Update key? (Y/N):")
+                    ))
+                    .await?;
+                    self.flush().await?;
+                    let answer = match self.read_byte_filtered().await? {
+                        Some(b) => b,
+                        None => return Ok(()),
+                    };
+                    self.send_line("").await?;
+                    if answer == b'y' || answer == b'Y' {
+                        save_known_host(&host, port, key);
+                        self.send_line(&format!(
+                            "  {}",
+                            self.green("Host key updated.")
+                        ))
+                        .await?;
+                    } else {
+                        let _ = session
+                            .disconnect(russh::Disconnect::ByApplication, "host key rejected", "")
+                            .await;
+                        self.send_line(&format!(
+                            "  {}",
+                            self.red("Connection aborted.")
+                        ))
+                        .await?;
+                        self.send_line("").await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // Authenticate
         match session.authenticate_password(&username, &password).await {
             Ok(russh::client::AuthResult::Success) => {}
             Ok(russh::client::AuthResult::Failure { .. }) => {
+                let _ = session
+                    .disconnect(russh::Disconnect::ByApplication, "auth failed", "")
+                    .await;
                 self.show_error("Authentication failed.").await?;
                 return Ok(());
             }
             Err(e) => {
+                let _ = session
+                    .disconnect(russh::Disconnect::ByApplication, "auth error", "")
+                    .await;
                 self.show_error(&format!("Auth error: {}", e)).await?;
                 return Ok(());
             }
@@ -2335,12 +2615,16 @@ impl TelnetSession {
         self.send_line("").await?;
         self.send("  Press any key to continue.").await?;
         self.flush().await?;
-        match tokio::time::timeout(idle_timeout, self.wait_for_key()).await {
-            Ok(result) => result?,
-            Err(_) => {
-                let _ = self
-                    .send_line("\r\nDisconnected: idle timeout.")
-                    .await;
+        if idle_timeout.is_zero() {
+            self.wait_for_key().await?;
+        } else {
+            match tokio::time::timeout(idle_timeout, self.wait_for_key()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = self
+                        .send_line("\r\nDisconnected: idle timeout.")
+                        .await;
+                }
             }
         }
         Ok(())
@@ -3309,6 +3593,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
     let cfg = config::get_config();
     let port = cfg.telnet_port;
     let max_sessions = cfg.max_sessions;
+    let security_enabled = cfg.security_enabled;
 
     tokio::spawn(async move {
         let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
@@ -3347,6 +3632,15 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                             if current >= max_sessions {
                                 eprintln!("Telnet: rejected {} (max {} sessions)", addr, max_sessions);
                                 let _ = stream.try_write(b"Too many connections. Try again later.\r\n");
+                                drop(stream);
+                                continue;
+                            }
+                            if !security_enabled
+                                && let Some(reason) = reject_insecure_ip(addr.ip())
+                            {
+                                eprintln!("Telnet: rejected {} ({})", addr, reason);
+                                let msg = format!("{}\r\n", reason);
+                                let _ = stream.try_write(msg.as_bytes());
                                 drop(stream);
                                 continue;
                             }
@@ -3550,6 +3844,162 @@ mod tests {
         }
         assert!(is_locked_out(&lockouts, ip1));
         assert!(!is_locked_out(&lockouts, ip2));
+    }
+
+    // ─── Known hosts ─────────────────────────────────────
+
+    fn make_test_key() -> russh::keys::PublicKey {
+        // A valid Ed25519 public key for testing (OpenSSH format)
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ test"
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_check_known_host_unknown_no_file() {
+        let key = make_test_key();
+        match check_known_host("nonexistent-test-host.example", 22, &key) {
+            HostKeyStatus::Unknown => {}
+            _ => panic!("expected Unknown for host not in file"),
+        }
+    }
+
+    #[test]
+    fn test_format_host_key_roundtrip() {
+        let key = make_test_key();
+        let formatted = format_host_key(&key);
+        assert!(formatted.starts_with("ssh-ed25519 "));
+        // Should be "algo base64" with no comment
+        assert_eq!(formatted.split(' ').count(), 2);
+    }
+
+    #[test]
+    fn test_known_host_fingerprint_is_stable() {
+        let key = make_test_key();
+        let fp1 = key.fingerprint(russh::keys::HashAlg::Sha256);
+        let fp2 = key.fingerprint(russh::keys::HashAlg::Sha256);
+        assert_eq!(fp1.to_string(), fp2.to_string());
+        assert!(fp1.to_string().starts_with("SHA256:"));
+    }
+
+    // ─── IP filtering ────────────────────────────────────
+
+    #[test]
+    fn test_reject_insecure_ip_private_allowed() {
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_loopback_allowed() {
+        let ip: IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ten_network_allowed() {
+        let ip: IpAddr = "10.0.5.42".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_172_private_allowed() {
+        let ip: IpAddr = "172.16.0.50".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+        let ip2: IpAddr = "172.31.255.254".parse().unwrap();
+        assert!(reject_insecure_ip(ip2).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_public_rejected() {
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_172_public_rejected() {
+        // 172.32.x.x is NOT private (private is 172.16-31.x.x)
+        let ip: IpAddr = "172.32.0.5".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_gateway_rejected() {
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let reason = reject_insecure_ip(ip);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("gateway"));
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_gateway_ten_rejected() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_loopback_dot_one_rejected() {
+        // 127.0.0.1 ends in .1, should be rejected
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv6_loopback_allowed() {
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv6_public_rejected() {
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv4_mapped_ipv6_private_allowed() {
+        // ::ffff:192.168.1.100 is IPv4-mapped, should apply IPv4 rules
+        let ip: IpAddr = "::ffff:192.168.1.100".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv4_mapped_ipv6_public_rejected() {
+        let ip: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv4_mapped_ipv6_gateway_rejected() {
+        // ::ffff:10.0.0.1 ends in .1, should be rejected
+        let ip: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        let reason = reject_insecure_ip(ip);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("gateway"));
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv6_link_local_allowed() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_ipv6_unique_local_allowed() {
+        let ip: IpAddr = "fd12:3456:789a::1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_link_local_ipv4_allowed() {
+        let ip: IpAddr = "169.254.1.100".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_none());
+    }
+
+    #[test]
+    fn test_reject_insecure_ip_link_local_ipv4_gateway_rejected() {
+        let ip: IpAddr = "169.254.0.1".parse().unwrap();
+        assert!(reject_insecure_ip(ip).is_some());
     }
 
     // ─── Menu ────────────────────────────────────────────
