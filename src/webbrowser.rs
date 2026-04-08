@@ -316,7 +316,7 @@ fn render_html_body(body_bytes: &[u8], final_url: String, width: usize) -> Resul
                             links.push(href.clone());
                             links.len()
                         };
-                        line_text.push_str(&format!("[{}]", link_num));
+                        line_text.push_str(&format!("\x02{}\x03", link_num));
                     }
                 }
             }
@@ -340,7 +340,7 @@ fn render_html_body(body_bytes: &[u8], final_url: String, width: usize) -> Resul
 /// Also unwraps DuckDuckGo redirect URLs (`/l/?uddg=<actual_url>`) so that
 /// search-result links navigate directly to the target site.
 pub(crate) fn resolve_url(base: &str, relative: &str) -> String {
-    let resolved = if relative.starts_with("http://") || relative.starts_with("https://") {
+    let resolved = if relative.starts_with("http://") || relative.starts_with("https://") || relative.starts_with("gopher://") {
         relative.to_string()
     } else {
         match url::Url::parse(base) {
@@ -376,7 +376,7 @@ fn unwrap_ddg_redirect(url: &str) -> String {
 /// If the input has no dots and no scheme, treat it as a search query.
 pub(crate) fn normalize_url(input: &str) -> String {
     let trimmed = input.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("gopher://") {
         return trimmed.to_string();
     }
     // If no dots, treat as a search query (DuckDuckGo Lite for text browsers)
@@ -719,39 +719,292 @@ pub(crate) fn remove_bookmark(index: usize) -> bool {
     save_bookmarks(&bookmarks)
 }
 
-/// Word-wrap a single line to a given width.
-/// Safe for multi-byte UTF-8: always breaks on a char boundary.
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
+use crate::aichat::wrap_line;
+
+// ─── Gopher protocol ───────────────────────────────────────
+
+/// Default Gopher port.
+const GOPHER_PORT: u16 = 70;
+/// Timeout for Gopher TCP connections.
+const GOPHER_TIMEOUT_SECS: u64 = 15;
+/// Maximum Gopher response size (512 KB).
+const GOPHER_MAX_BODY: usize = 512 * 1024;
+
+/// Parse a gopher:// URL into (host, port, item_type, selector).
+///
+/// Format: `gopher://host[:port][/[type][selector]]`
+/// Default port is 70, default type is '1' (directory), default selector is empty.
+fn parse_gopher_url(url: &str) -> Result<(String, u16, char, String), String> {
+    let rest = url.strip_prefix("gopher://").ok_or("Not a gopher URL")?;
+
+    // Split host[:port] from /path
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+
+    // Parse host and optional port
+    let (host, port) = if let Some(colon) = host_port.rfind(':') {
+        let port_str = &host_port[colon + 1..];
+        if let Ok(p) = port_str.parse::<u16>() {
+            (host_port[..colon].to_string(), p)
+        } else {
+            (host_port.to_string(), GOPHER_PORT)
+        }
+    } else {
+        (host_port.to_string(), GOPHER_PORT)
+    };
+
+    if host.is_empty() {
+        return Err("Empty host".into());
     }
-    if line.chars().count() <= width {
-        return vec![line.to_string()];
+
+    // Parse item type and selector from path
+    let (item_type, selector) = if path.is_empty() {
+        ('1', String::new()) // root directory
+    } else {
+        let first = path.chars().next().unwrap();
+        if first.is_ascii_alphanumeric() || first == 'i' || first == '+' {
+            (first, path[1..].to_string())
+        } else {
+            ('1', path.to_string())
+        }
+    };
+
+    Ok((host, port, item_type, selector))
+}
+
+/// Build a gopher:// URL from components.
+fn build_gopher_url(host: &str, port: u16, item_type: char, selector: &str) -> String {
+    if port == GOPHER_PORT {
+        format!("gopher://{}/{}{}", host, item_type, selector)
+    } else {
+        format!("gopher://{}:{}/{}{}", host, port, item_type, selector)
     }
-    let mut result = Vec::new();
-    let mut remaining = line;
-    while !remaining.is_empty() {
-        if remaining.chars().count() <= width {
-            result.push(remaining.to_string());
+}
+
+/// Fetch a Gopher resource and render it as a `WebPage`.
+///
+/// Blocking call — run via `spawn_blocking`.
+pub(crate) fn fetch_gopher(url: &str, width: usize) -> Result<WebPage, String> {
+    let (host, port, item_type, selector) = parse_gopher_url(url)?;
+
+    // Connect and send selector
+    let addr = format!("{}:{}", host, port);
+    let sock_addr = {
+        use std::net::ToSocketAddrs;
+        addr.to_socket_addrs()
+            .map_err(|e| format!("DNS error: {}", e))?
+            .next()
+            .ok_or_else(|| "Could not resolve host".to_string())?
+    };
+    let stream = std::net::TcpStream::connect_timeout(
+        &sock_addr,
+        std::time::Duration::from_secs(GOPHER_TIMEOUT_SECS),
+    )
+    .map_err(|e| format!("Connection failed: {}", e))?;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(GOPHER_TIMEOUT_SECS)))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(GOPHER_TIMEOUT_SECS)))
+        .ok();
+
+    let mut stream = std::io::BufWriter::new(stream);
+    use std::io::Write;
+    stream
+        .write_all(format!("{}\r\n", selector).as_bytes())
+        .map_err(|e| format!("Write error: {}", e))?;
+    stream.flush().map_err(|e| format!("Flush error: {}", e))?;
+
+    // Read response
+    let mut body = Vec::new();
+    stream
+        .get_mut()
+        .take(GOPHER_MAX_BODY as u64)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let text = String::from_utf8_lossy(&body);
+    let final_url = build_gopher_url(&host, port, item_type, &selector);
+
+    match item_type {
+        '0' => {
+            // Plain text file — just wrap and display
+            let lines: Vec<String> = text
+                .lines()
+                .flat_map(|line| {
+                    let clean = line.trim_end_matches('\r');
+                    wrap_line(clean, width)
+                })
+                .take(MAX_RENDERED_LINES)
+                .collect();
+            Ok(WebPage {
+                title: Some(selector.rsplit('/').next().unwrap_or("Text").to_string()),
+                lines,
+                links: Vec::new(),
+                url: final_url,
+                forms: Vec::new(),
+            })
+        }
+        '1' | '7' => {
+            // Directory listing or search results — parse Gopher menu
+            render_gopher_directory(&text, &host, port, width, final_url)
+        }
+        _ => {
+            // Unsupported type — show as plain text
+            let lines: Vec<String> = text
+                .lines()
+                .flat_map(|line| wrap_line(line.trim_end_matches('\r'), width))
+                .take(MAX_RENDERED_LINES)
+                .collect();
+            Ok(WebPage {
+                title: Some(format!("Gopher (type {})", item_type)),
+                lines,
+                links: Vec::new(),
+                url: final_url,
+                forms: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Parse a Gopher directory listing into a WebPage with numbered links.
+fn render_gopher_directory(
+    text: &str,
+    current_host: &str,
+    current_port: u16,
+    width: usize,
+    final_url: String,
+) -> Result<WebPage, String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+
+        // End of listing
+        if line == "." {
             break;
         }
-        let boundary = remaining
-            .char_indices()
-            .nth(width)
-            .map_or(remaining.len(), |(i, _)| i);
-        let boundary = if boundary == 0 {
-            remaining.char_indices().nth(1).map_or(remaining.len(), |(i, _)| i)
-        } else {
-            boundary
-        };
-        let break_at = remaining[..boundary]
-            .rfind(' ')
-            .unwrap_or(boundary);
-        let break_at = if break_at == 0 { boundary } else { break_at };
-        result.push(remaining[..break_at].to_string());
-        remaining = remaining[break_at..].trim_start();
+        if line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let item_type = line.chars().next().unwrap_or('i');
+        let rest = &line[1..];
+        let fields: Vec<&str> = rest.split('\t').collect();
+
+        let display = fields.first().unwrap_or(&"");
+        let selector = fields.get(1).unwrap_or(&"");
+        let host = fields.get(2).unwrap_or(&current_host);
+        let port: u16 = fields
+            .get(3)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(current_port);
+
+        match item_type {
+            'i' | '3' => {
+                // Informational text or error — display as-is, wrapped
+                let prefix = if item_type == '3' { "ERR: " } else { "" };
+                let full = format!("{}{}", prefix, display);
+                for wrapped in wrap_line(&full, width) {
+                    lines.push(wrapped);
+                }
+            }
+            '0' | '1' | '7' => {
+                // Text file, directory, or search — create a link
+                let link_url = if item_type == '7' {
+                    // Search items: mark with ?search so the browser knows to prompt
+                    format!("{}?search", build_gopher_url(host, port, item_type, selector))
+                } else {
+                    build_gopher_url(host, port, item_type, selector)
+                };
+                links.push(link_url);
+                let link_num = links.len();
+                let type_marker = match item_type {
+                    '1' => "/",
+                    '7' => "?",
+                    _ => "",
+                };
+                let label = format!("{}{}", display, type_marker);
+                for (i, wrapped) in wrap_line(&label, width.saturating_sub(5)).iter().enumerate() {
+                    if i == 0 {
+                        lines.push(format!("{}\x02{}\x03", wrapped, link_num));
+                    } else {
+                        lines.push(format!("  {}", wrapped));
+                    }
+                }
+            }
+            'h' => {
+                // HTML link — extract URL if selector starts with "URL:"
+                let url = selector.strip_prefix("URL:").unwrap_or(selector);
+                links.push(url.to_string());
+                let link_num = links.len();
+                for (i, wrapped) in wrap_line(display, width.saturating_sub(5)).iter().enumerate() {
+                    if i == 0 {
+                        lines.push(format!("{}\x02{}\x03", wrapped, link_num));
+                    } else {
+                        lines.push(format!("  {}", wrapped));
+                    }
+                }
+            }
+            _ => {
+                // Binary, image, etc. — show label but no link
+                let type_label = match item_type {
+                    '9' => "[BIN]",
+                    'g' | 'I' | 'p' => "[IMG]",
+                    's' => "[SND]",
+                    _ => "[???]",
+                };
+                for wrapped in wrap_line(&format!("{} {}", type_label, display), width) {
+                    lines.push(wrapped);
+                }
+            }
+        }
+
+        if lines.len() >= MAX_RENDERED_LINES {
+            break;
+        }
     }
-    result
+
+    // Extract a title from the URL selector
+    let title = {
+        let (_, _, _, sel) = parse_gopher_url(&final_url).unwrap_or_default();
+        if sel.is_empty() {
+            Some(format!("Gopher: {}", current_host))
+        } else {
+            Some(format!("Gopher: {}", sel.rsplit('/').next().unwrap_or(&sel)))
+        }
+    };
+
+    Ok(WebPage {
+        title,
+        lines,
+        links,
+        url: final_url,
+        forms: Vec::new(),
+    })
+}
+
+/// Returns true if the URL is a Gopher search that needs a query term.
+pub(crate) fn is_gopher_search(url: &str) -> bool {
+    url.starts_with("gopher://") && url.ends_with("?search")
+}
+
+/// Strip the `?search` sentinel and append a tab + query to form the search URL.
+pub(crate) fn build_gopher_search_url(url: &str, query: &str) -> String {
+    let base = url.strip_suffix("?search").unwrap_or(url);
+    // For Gopher search, the query is appended to the selector after a tab.
+    // Re-parse, append query to selector, rebuild.
+    if let Ok((host, port, item_type, selector)) = parse_gopher_url(base) {
+        let search_selector = format!("{}\t{}", selector, query);
+        build_gopher_url(&host, port, item_type, &search_selector)
+    } else {
+        base.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1130,5 +1383,114 @@ mod tests {
     fn test_bookmark_constants() {
         assert!(MAX_BOOKMARKS >= 10);
         assert!(MAX_BOOKMARKS <= 500);
+    }
+
+    // ─── Gopher ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_gopher_url_basic() {
+        let (host, port, item_type, selector) =
+            parse_gopher_url("gopher://gopher.floodgap.com").unwrap();
+        assert_eq!(host, "gopher.floodgap.com");
+        assert_eq!(port, 70);
+        assert_eq!(item_type, '1');
+        assert_eq!(selector, "");
+    }
+
+    #[test]
+    fn test_parse_gopher_url_with_selector() {
+        let (host, port, item_type, selector) =
+            parse_gopher_url("gopher://gopher.floodgap.com/1/overbite").unwrap();
+        assert_eq!(host, "gopher.floodgap.com");
+        assert_eq!(port, 70);
+        assert_eq!(item_type, '1');
+        assert_eq!(selector, "/overbite");
+    }
+
+    #[test]
+    fn test_parse_gopher_url_text_file() {
+        let (_, _, item_type, selector) =
+            parse_gopher_url("gopher://example.com/0/docs/readme.txt").unwrap();
+        assert_eq!(item_type, '0');
+        assert_eq!(selector, "/docs/readme.txt");
+    }
+
+    #[test]
+    fn test_parse_gopher_url_custom_port() {
+        let (host, port, _, _) =
+            parse_gopher_url("gopher://example.com:7070/1/test").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 7070);
+    }
+
+    #[test]
+    fn test_parse_gopher_url_root_with_slash() {
+        let (_, _, item_type, selector) =
+            parse_gopher_url("gopher://example.com/").unwrap();
+        assert_eq!(item_type, '1');
+        assert_eq!(selector, "");
+    }
+
+    #[test]
+    fn test_build_gopher_url_default_port() {
+        assert_eq!(
+            build_gopher_url("example.com", 70, '1', "/test"),
+            "gopher://example.com/1/test"
+        );
+    }
+
+    #[test]
+    fn test_build_gopher_url_custom_port() {
+        assert_eq!(
+            build_gopher_url("example.com", 7070, '0', "/file.txt"),
+            "gopher://example.com:7070/0/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_gopher_search_detection() {
+        assert!(is_gopher_search("gopher://example.com/7/search?search"));
+        assert!(!is_gopher_search("gopher://example.com/1/dir"));
+        assert!(!is_gopher_search("https://example.com?search"));
+    }
+
+    #[test]
+    fn test_build_gopher_search_url() {
+        let url = build_gopher_search_url(
+            "gopher://example.com/7/v2/vs?search",
+            "hello world",
+        );
+        assert!(url.starts_with("gopher://example.com/7/v2/vs"));
+        assert!(url.contains("hello world"));
+    }
+
+    #[test]
+    fn test_render_gopher_directory() {
+        let menu = "iWelcome to Gopher!\tfake\t(null)\t0\r\n\
+                     1Floodgap\t/\tgopher.floodgap.com\t70\r\n\
+                     0About\t/about.txt\tgopher.floodgap.com\t70\r\n\
+                     iBlank line\tfake\t(null)\t0\r\n\
+                     .\r\n";
+        let page = render_gopher_directory(menu, "localhost", 70, 40, "gopher://localhost/1".into()).unwrap();
+        assert!(!page.lines.is_empty());
+        assert_eq!(page.links.len(), 2);
+        assert!(page.links[0].starts_with("gopher://gopher.floodgap.com"));
+        // First line should be the info text
+        assert!(page.lines[0].contains("Welcome to Gopher"));
+    }
+
+    #[test]
+    fn test_normalize_url_gopher() {
+        assert_eq!(
+            normalize_url("gopher://gopher.floodgap.com"),
+            "gopher://gopher.floodgap.com"
+        );
+    }
+
+    #[test]
+    fn test_gopher_constants() {
+        assert_eq!(GOPHER_PORT, 70);
+        assert!(GOPHER_TIMEOUT_SECS > 0);
+        assert!(GOPHER_MAX_BODY > 0);
     }
 }

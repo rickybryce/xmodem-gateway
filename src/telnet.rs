@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -24,6 +25,7 @@ const ANSI_RED: &str = "\x1b[1;31m";
 const ANSI_CYAN: &str = "\x1b[1;36m";
 const ANSI_YELLOW: &str = "\x1b[1;33m";
 const ANSI_AMBER: &str = "\x1b[33m";
+const ANSI_BLUE: &str = "\x1b[1;34m";
 const ANSI_WHITE: &str = "\x1b[1;37m";
 const ANSI_DIM: &str = "\x1b[37m";
 const ANSI_RESET: &str = "\x1b[0m";
@@ -34,6 +36,7 @@ const PETSCII_GREEN: u8 = 0x1E;
 const PETSCII_RED: u8 = 0x96;
 const PETSCII_CYAN: u8 = 0x9F;
 const PETSCII_YELLOW: u8 = 0x9E;
+const PETSCII_LIGHT_BLUE: u8 = 0x9A;
 const PETSCII_WHITE: u8 = 0x05;
 const PETSCII_LIGHT_GRAY: u8 = 0x9B;
 const PETSCII_CLEAR: u8 = 0x93;
@@ -114,15 +117,16 @@ fn reject_insecure_ipv4(octets: [u8; 4]) -> Option<&'static str> {
     if !is_private {
         return Some("Connection refused: security is disabled, only private IP addresses are allowed.");
     }
-    if octets[3] == 1 {
+    if octets[3] == 1 && octets[0] != 127 {
         return Some("Connection refused: gateway addresses (*.*.*.1) are not allowed when security is disabled.");
     }
     None
 }
 
 /// When security is disabled, only allow connections from private/loopback IPs,
-/// and reject any address ending in .1 (typically a gateway). Returns the
-/// rejection reason, or None if the address is allowed.
+/// and reject any address ending in .1 (typically a gateway), except for
+/// loopback addresses (127.x.x.x). Returns the rejection reason, or None
+/// if the address is allowed.
 fn reject_insecure_ip(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => reject_insecure_ipv4(v4.octets()),
@@ -425,6 +429,27 @@ fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
     }
 }
 
+// ─── Weather data ──────────────────────────────────────────
+
+struct ForecastDay {
+    date: String,
+    high: String,
+    low: String,
+    desc: String,
+}
+
+struct WeatherData {
+    city: String,
+    region: String,
+    temp_f: String,
+    feels_like: String,
+    humidity: String,
+    wind_mph: String,
+    wind_dir: String,
+    desc: String,
+    forecast: Vec<ForecastDay>,
+}
+
 // ─── SharedWriter ───────────────────────────────────────────
 type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>;
 
@@ -448,6 +473,7 @@ struct TelnetSession {
     web_url: Option<String>,
     web_title: Option<String>,
     web_forms: Vec<crate::webbrowser::WebForm>,
+    weather_zip: String,
 }
 
 impl TelnetSession {
@@ -508,12 +534,46 @@ impl TelnetSession {
             TerminalType::Ascii => text.to_string(),
         }
     }
+    fn blue(&self, text: &str) -> String {
+        match self.terminal_type {
+            TerminalType::Ansi => format!("{}{}{}", ANSI_BLUE, text, ANSI_RESET),
+            TerminalType::Petscii => Self::petscii_color(PETSCII_LIGHT_BLUE, text),
+            TerminalType::Ascii => text.to_string(),
+        }
+    }
     fn white(&self, text: &str) -> String {
         match self.terminal_type {
             TerminalType::Ansi => format!("{}{}{}", ANSI_WHITE, text, ANSI_RESET),
             TerminalType::Petscii => Self::petscii_color(PETSCII_WHITE, text),
             TerminalType::Ascii => text.to_string(),
         }
+    }
+
+    /// Convert link-marker sentinels (\x02N\x03) to visible `[N]`, colorized
+    /// in blue for ANSI/PETSCII terminals. Applied after truncation so that
+    /// invisible escape bytes don't affect width calculations.
+    fn colorize_link_markers(&self, text: &str) -> String {
+        let mut result = String::with_capacity(text.len() + 64);
+        let mut rest = text;
+        while let Some(open) = rest.find('\x02') {
+            result.push_str(&rest[..open]);
+            let after_open = &rest[open + 1..];
+            if let Some(close) = after_open.find('\x03') {
+                let inner = &after_open[..close];
+                let marker = format!("[{}]", inner);
+                if self.terminal_type == TerminalType::Ascii {
+                    result.push_str(&marker);
+                } else {
+                    result.push_str(&self.blue(&marker));
+                }
+                rest = &after_open[close + 1..];
+            } else {
+                // Malformed sentinel (e.g. truncated) — silently drop it
+                rest = after_open;
+            }
+        }
+        result.push_str(rest);
+        result
     }
 
     fn separator(&self) -> String {
@@ -531,9 +591,10 @@ impl TelnetSession {
 
     fn nav_footer(&self) -> String {
         format!(
-            "  {} {}",
+            "  {} {} {}",
             self.action_prompt("R", "Refresh"),
             self.action_prompt("Q", "Back"),
+            self.action_prompt("H", "Help"),
         )
     }
 
@@ -592,6 +653,62 @@ impl TelnetSession {
 
     async fn get_line_input(&mut self) -> Result<Option<String>, std::io::Error> {
         let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let byte = match self.read_byte_filtered().await? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+
+            if byte == b'\r' || byte == b'\n' {
+                self.send_raw(b"\r\n").await?;
+                self.flush().await?;
+                let result: String = if self.terminal_type == TerminalType::Petscii {
+                    buf.iter()
+                        .map(|&b| petscii_to_ascii_byte(b) as char)
+                        .collect()
+                } else {
+                    buf.iter().map(|&b| b as char).collect()
+                };
+                return Ok(Some(result.trim().to_string()));
+            }
+
+            if is_esc_key(byte, self.terminal_type == TerminalType::Petscii) {
+                self.drain_input().await;
+                return Ok(None);
+            }
+
+            if is_backspace_key(byte, self.erase_char) {
+                if !buf.is_empty() {
+                    buf.pop();
+                    self.echo_backspace().await?;
+                    self.flush().await?;
+                }
+                continue;
+            }
+
+            if byte < 0x20 {
+                continue;
+            }
+
+            if buf.len() >= MAX_INPUT_LENGTH {
+                self.send_raw(b"\r\n").await?;
+                self.show_error("Input too long.").await?;
+                return Ok(None);
+            }
+
+            self.send_raw(&[byte]).await?;
+            self.flush().await?;
+            buf.push(byte);
+        }
+    }
+
+    /// Continue collecting line input with bytes already in `buf` (which have
+    /// already been echoed). Used when the caller consumed the first byte to
+    /// decide between instant-action and line-input modes.
+    async fn get_line_input_continuing(
+        &mut self,
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<String>, std::io::Error> {
         loop {
             let byte = match self.read_byte_filtered().await? {
                 Some(b) => b,
@@ -904,58 +1021,64 @@ impl TelnetSession {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         self.drain_input().await;
 
-        // Color preference
-        let (color_label, default_yes) = match self.terminal_type {
-            TerminalType::Petscii => ("PETSCII", true),
-            TerminalType::Ansi => ("ANSI", false),
-            TerminalType::Ascii => ("ANSI", false),
+        // Color preference — user must explicitly choose Y or N
+        let color_label = match self.terminal_type {
+            TerminalType::Petscii => "PETSCII",
+            _ => "ANSI",
         };
-        let default_char = if default_yes { 'Y' } else { 'N' };
         self.send(&format!(
-            "Use {} color? (Y/N) [{}]: ",
-            color_label, default_char
+            "Use {} color? (Y/N): ",
+            color_label
         ))
         .await?;
         self.flush().await?;
 
-        let color_byte = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self.read_byte_filtered(),
-        )
-        .await
-        {
-            Ok(result) => match result? {
-                Some(b) => b,
-                None => return Ok(()),
-            },
-            Err(_) => {
-                if default_yes {
-                    b'Y'
-                } else {
-                    b'N'
+        let accepted = loop {
+            let color_byte = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.read_byte_filtered(),
+            )
+            .await
+            {
+                Ok(result) => match result? {
+                    Some(b) => b,
+                    None => return Ok(()),
+                },
+                Err(_) => {
+                    self.send_raw(b"\r\n\r\n  Disconnected: idle timeout.\r\n\r\n")
+                        .await?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout during color selection",
+                    ));
                 }
+            };
+
+            let choice = if self.terminal_type == TerminalType::Petscii {
+                petscii_to_ascii_byte(color_byte)
+            } else {
+                color_byte
+            };
+
+            match choice {
+                b'y' | b'Y' => {
+                    self.send_raw(&[color_byte]).await?;
+                    self.send_raw(b"\r\n").await?;
+                    self.flush().await?;
+                    break true;
+                }
+                b'n' | b'N' => {
+                    self.send_raw(&[color_byte]).await?;
+                    self.send_raw(b"\r\n").await?;
+                    self.flush().await?;
+                    break false;
+                }
+                _ => continue, // ignore other keys
             }
         };
 
-        self.send_raw(&[color_byte]).await?;
-        self.send_raw(b"\r\n").await?;
-        self.flush().await?;
-
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         self.drain_input().await;
-
-        let choice = if self.terminal_type == TerminalType::Petscii {
-            petscii_to_ascii_byte(color_byte)
-        } else {
-            color_byte
-        };
-
-        let accepted = match choice {
-            b'y' | b'Y' => true,
-            b'n' | b'N' => false,
-            b'\r' | b'\n' => default_yes,
-            _ => default_yes,
-        };
 
         if accepted {
             if self.terminal_type == TerminalType::Ascii {
@@ -1224,14 +1347,46 @@ impl TelnetSession {
             self.cyan("G")
         ))
         .await?;
+        self.send_line(&format!(
+            "  {}  Troubleshooting",
+            self.cyan("T")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}  Weather",
+            self.cyan("W")
+        ))
+        .await?;
         self.send_line(&format!("  {}  Exit", self.cyan("X")))
             .await?;
         self.send_line("").await?;
+        self.send_line(&format!("  {}", self.action_prompt("H", "Help")))
+            .await?;
         Ok(())
     }
 
     async fn handle_main_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
         match input {
+            "h" => {
+                self.show_error_lines(&[
+                    "A = AI Chat: ask questions to an AI",
+                    "B = Browser: browse the web",
+                    "F = File Transfer: upload/download",
+                    "    files using the XMODEM protocol",
+                    "G = SSH Gateway: connect to a remote",
+                    "    server via SSH",
+                    "T = Troubleshooting: diagnose",
+                    "    terminal input issues",
+                    "W = Weather: check weather by zip",
+                    "X = Exit: disconnect from the server",
+                ]).await?;
+            }
+            "t" => {
+                self.troubleshooting().await?;
+            }
+            "w" => {
+                self.weather().await?;
+            }
             "a" => {
                 let cfg = config::get_config();
                 if cfg.groq_api_key.is_empty() {
@@ -1266,7 +1421,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A, B, F, G, or X.").await?;
+                self.show_error("Press A,B,F,G,T,W,X, or H.").await?;
             }
         }
         Ok(true)
@@ -1359,9 +1514,21 @@ impl TelnetSession {
             "q" => {
                 self.current_menu = Menu::Main;
             }
+            "h" => {
+                self.show_error_lines(&[
+                    "U = Upload a file to the server",
+                    "D = Download a file from the server",
+                    "X = Delete a file on the server",
+                    "C = Change to a subdirectory",
+                    "I = Toggle IAC escaping for binary",
+                    "    file transfers over telnet",
+                    "R = Refresh the screen",
+                    "Q = Back to the main menu",
+                ]).await?;
+            }
             "r" => {} // Refresh — just re-render
             _ => {
-                self.show_error("Press U, D, X, C, I, R, or Q.")
+                self.show_error("Press U, D, X, C, I, R, Q, or H.")
                     .await?;
             }
         }
@@ -1734,6 +1901,7 @@ impl TelnetSession {
                 nav.push(self.action_prompt("N", "Next"));
             }
             nav.push(self.action_prompt("Q", "Back"));
+            nav.push(self.action_prompt("H", "Help"));
             let esc_label = match self.terminal_type {
                 TerminalType::Petscii => "<-",
                 _ => "ESC",
@@ -1761,6 +1929,15 @@ impl TelnetSession {
                     }
                 }
                 "q" => return Ok(()),
+                "h" => {
+                    self.show_error_lines(&[
+                        "#  = Enter file number to download",
+                        "P  = Previous page of files",
+                        "N  = Next page of files",
+                        "Q  = Back to file transfer menu",
+                        "ESC= Return to main menu",
+                    ]).await?;
+                }
                 other => {
                     if let Ok(num) = other.parse::<usize>() {
                         if num >= 1 && num <= page_files.len() {
@@ -1770,7 +1947,7 @@ impl TelnetSession {
                             self.show_error("Invalid selection.").await?;
                         }
                     } else {
-                        self.show_error("Enter a number, P, N, or Q.")
+                        self.show_error("Enter a number, P, N, Q, or H.")
                             .await?;
                     }
                 }
@@ -1963,6 +2140,7 @@ impl TelnetSession {
                 nav.push(self.action_prompt("N", "Next"));
             }
             nav.push(self.action_prompt("Q", "Back"));
+            nav.push(self.action_prompt("H", "Help"));
             let esc_label = match self.terminal_type {
                 TerminalType::Petscii => "<-",
                 _ => "ESC",
@@ -1990,6 +2168,15 @@ impl TelnetSession {
                     }
                 }
                 "q" => return Ok(()),
+                "h" => {
+                    self.show_error_lines(&[
+                        "#  = Enter file number to delete",
+                        "P  = Previous page of files",
+                        "N  = Next page of files",
+                        "Q  = Back to file transfer menu",
+                        "ESC= Return to main menu",
+                    ]).await?;
+                }
                 other => {
                     if let Ok(num) = other.parse::<usize>() {
                         if num >= 1 && num <= page_files.len() {
@@ -2056,7 +2243,7 @@ impl TelnetSession {
                             self.show_error("Invalid selection.").await?;
                         }
                     } else {
-                        self.show_error("Enter a number, P, N, or Q.")
+                        self.show_error("Enter a number, P, N, Q, or H.")
                             .await?;
                     }
                 }
@@ -2217,9 +2404,20 @@ impl TelnetSession {
             "q" => {
                 self.current_menu = Menu::Main;
             }
+            "h" => {
+                self.show_error_lines(&[
+                    "S = Connect to a remote SSH server",
+                    "R = Refresh the screen",
+                    "Q = Back to the main menu",
+                    "",
+                    "The SSH Gateway lets you connect",
+                    "to SSH servers through this telnet",
+                    "session. Press Ctrl+] to disconnect.",
+                ]).await?;
+            }
             "r" => {} // Refresh
             _ => {
-                self.show_error("Press S, R, or Q.").await?;
+                self.show_error("Press S, R, Q, or H.").await?;
             }
         }
         Ok(true)
@@ -2403,21 +2601,23 @@ impl TelnetSession {
                     ))
                     .await?;
                     self.flush().await?;
+                    self.drain_input().await;
                     let answer = match self.read_byte_filtered().await? {
-                        Some(b) => b,
+                        Some(b) => {
+                            if self.terminal_type == TerminalType::Petscii {
+                                petscii_to_ascii_byte(b)
+                            } else {
+                                b
+                            }
+                        }
                         None => return Ok(()),
                     };
                     self.send_line("").await?;
                     if answer != b'y' && answer != b'Y' {
-                        self.send_line(&format!(
-                            "  {}",
-                            self.red("Connection aborted.")
-                        ))
-                        .await?;
-                        self.send_line("").await?;
                         let _ = session
                             .disconnect(russh::Disconnect::ByApplication, "host key rejected", "")
                             .await;
+                        self.show_error("Connection aborted.").await?;
                         return Ok(());
                     }
                     save_known_host(&host, port, key);
@@ -2456,8 +2656,15 @@ impl TelnetSession {
                     ))
                     .await?;
                     self.flush().await?;
+                    self.drain_input().await;
                     let answer = match self.read_byte_filtered().await? {
-                        Some(b) => b,
+                        Some(b) => {
+                            if self.terminal_type == TerminalType::Petscii {
+                                petscii_to_ascii_byte(b)
+                            } else {
+                                b
+                            }
+                        }
                         None => return Ok(()),
                     };
                     self.send_line("").await?;
@@ -2472,12 +2679,7 @@ impl TelnetSession {
                         let _ = session
                             .disconnect(russh::Disconnect::ByApplication, "host key rejected", "")
                             .await;
-                        self.send_line(&format!(
-                            "  {}",
-                            self.red("Connection aborted.")
-                        ))
-                        .await?;
-                        self.send_line("").await?;
+                        self.show_error("Connection aborted.").await?;
                         return Ok(());
                     }
                 }
@@ -2773,27 +2975,483 @@ impl TelnetSession {
                 parts.push(self.action_prompt("N", "Nx"));
             }
             parts.push(self.action_prompt("Q", "Done"));
+            parts.push(self.action_prompt("H", "Help"));
             self.send_line(&format!("  {}", parts.join(" ")))
                 .await?;
             self.send(&format!("  {}: ", self.cyan(">")))
                 .await?;
             self.flush().await?;
 
-            let input = match self.get_line_input().await? {
-                Some(s) if !s.is_empty() => s,
-                _ => return Ok(None),
+            // P/N/Q act instantly; any other printable key starts
+            // line-input mode so the user can type a new question.
+            let first = match self.read_byte_filtered().await? {
+                Some(b) => b,
+                None => return Ok(None),
             };
 
-            // Single character = command; longer = new question
-            if input.len() == 1 {
-                match input.to_ascii_lowercase().as_str() {
-                    "n" if has_next => scroll += page_h,
-                    "p" if has_prev => scroll = scroll.saturating_sub(page_h),
-                    "q" => return Ok(None),
-                    _ => {}
-                }
+            if is_esc_key(first, self.terminal_type == TerminalType::Petscii) {
+                self.drain_input().await;
+                return Ok(None);
+            }
+            if first == b'\r' || first == b'\n' || first < 0x20 {
+                continue;
+            }
+
+            let ch = if self.terminal_type == TerminalType::Petscii {
+                (petscii_to_ascii_byte(first) as char).to_ascii_lowercase()
             } else {
-                return Ok(Some(input));
+                (first as char).to_ascii_lowercase()
+            };
+
+            match ch {
+                'n' if has_next => { scroll += page_h; }
+                'p' if has_prev => { scroll = scroll.saturating_sub(page_h); }
+                'q' => { return Ok(None); }
+                'h' => {
+                    self.show_error_lines(&[
+                        "P  = Previous page of answer",
+                        "N  = Next page of answer",
+                        "Q  = Done, return to main menu",
+                        "",
+                        "Or type a new question and",
+                        "press Enter to ask again.",
+                    ]).await?;
+                }
+                _ => {
+                    // Start of a new question — echo the first byte
+                    // and collect the rest via line input.
+                    self.send_raw(&[first]).await?;
+                    self.flush().await?;
+                    let mut buf: Vec<u8> = vec![first];
+                    let rest = match self.get_line_input_continuing(&mut buf).await? {
+                        Some(s) if !s.is_empty() => s,
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(rest));
+                }
+            }
+        }
+    }
+
+    // ─── WEATHER ────────────────────────────────────────────
+
+    async fn weather(&mut self) -> Result<(), std::io::Error> {
+        let saved_zip = self.weather_zip.clone();
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("WEATHER")))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+
+        // Prompt for zip code with default
+        if saved_zip.is_empty() {
+            self.send(&format!("  {}: ", self.cyan("Zip code")))
+                .await?;
+        } else {
+            self.send(&format!(
+                "  {} [{}]: ",
+                self.cyan("Zip code"),
+                self.amber(&saved_zip)
+            ))
+            .await?;
+        }
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let zip = if input.is_empty() {
+            if saved_zip.is_empty() {
+                return Ok(());
+            }
+            saved_zip
+        } else {
+            // Validate: digits only, 5 chars
+            if !input.chars().all(|c| c.is_ascii_digit()) || input.len() != 5 {
+                self.show_error("Enter a 5-digit US zip code.").await?;
+                return Ok(());
+            }
+            input
+        };
+
+        self.send_line("").await?;
+        self.send_line(&format!("  {}...", self.dim("Loading")))
+            .await?;
+        self.flush().await?;
+
+        // Save the zip code for next time (session + config file)
+        self.weather_zip = zip.clone();
+        let zip_for_save = zip.clone();
+        tokio::task::spawn_blocking(move || {
+            config::update_config_value("weather_zip", &zip_for_save);
+        })
+        .await
+        .ok();
+
+        // Fetch weather from Open-Meteo (free, no API key)
+        let zip_owned = zip.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Self::fetch_weather(&zip_owned)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        match result {
+            Ok(weather) => {
+                self.display_weather(&zip, &weather).await?;
+            }
+            Err(e) => {
+                let max_w = if self.terminal_type == TerminalType::Petscii { 30 } else { 50 };
+                self.show_error(&truncate_to_width(&e, max_w)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch_weather(zip: &str) -> Result<WeatherData, String> {
+        let agent = ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(std::time::Duration::from_secs(15)))
+                .build(),
+        );
+
+        // Step 1: Geocode zip code via Open-Meteo
+        let geo_url = format!(
+            "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+            zip
+        );
+        let geo_resp = agent
+            .get(&geo_url)
+            .call()
+            .map_err(|e| format!("Geocoding failed: {}", e))?;
+        let mut geo_bytes = Vec::new();
+        geo_resp
+            .into_body()
+            .as_reader()
+            .take(64 * 1024)
+            .read_to_end(&mut geo_bytes)
+            .map_err(|e| format!("Read error: {}", e))?;
+        let geo: serde_json::Value =
+            serde_json::from_slice(&geo_bytes).map_err(|e| format!("Parse error: {}", e))?;
+
+        let result = geo
+            .get("results")
+            .and_then(|r| r.get(0))
+            .ok_or("Zip code not found.")?;
+        let lat = result.get("latitude").and_then(|v| v.as_f64()).ok_or("No coordinates")?;
+        let lon = result.get("longitude").and_then(|v| v.as_f64()).ok_or("No coordinates")?;
+        let city = result.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+        let region = result.get("admin1").and_then(|v| v.as_str()).unwrap_or("");
+        let timezone = result.get("timezone").and_then(|v| v.as_str()).unwrap_or("auto");
+
+        // Step 2: Fetch weather from Open-Meteo
+        let wx_url = format!(
+            "https://api.open-meteo.com/v1/forecast?\
+             latitude={}&longitude={}\
+             &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m\
+             &daily=weather_code,temperature_2m_max,temperature_2m_min\
+             &temperature_unit=fahrenheit&wind_speed_unit=mph\
+             &timezone={}&forecast_days=3",
+            lat, lon, timezone
+        );
+        let wx_resp = agent
+            .get(&wx_url)
+            .call()
+            .map_err(|e| format!("Weather fetch failed: {}", e))?;
+        let mut wx_bytes = Vec::new();
+        wx_resp
+            .into_body()
+            .as_reader()
+            .take(128 * 1024)
+            .read_to_end(&mut wx_bytes)
+            .map_err(|e| format!("Read error: {}", e))?;
+        let wx: serde_json::Value =
+            serde_json::from_slice(&wx_bytes).map_err(|e| format!("Parse error: {}", e))?;
+
+        let current = wx.get("current").ok_or("No current weather")?;
+        let temp_f = current.get("temperature_2m").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let feels_like = current.get("apparent_temperature").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let humidity = current.get("relative_humidity_2m").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wind_mph = current.get("wind_speed_10m").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let wind_deg = current.get("wind_direction_10m").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let weather_code = current.get("weather_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+
+        let wind_dir = Self::degrees_to_compass(wind_deg);
+        let desc = Self::wmo_weather_description(weather_code);
+
+        // Extract 3-day forecast
+        let mut forecast = Vec::new();
+        if let Some(daily) = wx.get("daily") {
+            let dates = daily.get("time").and_then(|v| v.as_array());
+            let highs = daily.get("temperature_2m_max").and_then(|v| v.as_array());
+            let lows = daily.get("temperature_2m_min").and_then(|v| v.as_array());
+            let codes = daily.get("weather_code").and_then(|v| v.as_array());
+            if let (Some(dates), Some(highs), Some(lows), Some(codes)) = (dates, highs, lows, codes) {
+                for i in 0..dates.len().min(3) {
+                    let date = dates[i].as_str().unwrap_or("?").to_string();
+                    let high = highs[i].as_f64().map(|v| format!("{:.0}", v)).unwrap_or("?".into());
+                    let low = lows[i].as_f64().map(|v| format!("{:.0}", v)).unwrap_or("?".into());
+                    let code = codes[i].as_i64().unwrap_or(-1);
+                    forecast.push(ForecastDay {
+                        date,
+                        high,
+                        low,
+                        desc: Self::wmo_weather_description(code).to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(WeatherData {
+            city: city.to_string(),
+            region: region.to_string(),
+            temp_f: format!("{:.0}", temp_f),
+            feels_like: format!("{:.0}", feels_like),
+            humidity: format!("{}", humidity),
+            wind_mph: format!("{:.0}", wind_mph),
+            wind_dir: wind_dir.to_string(),
+            desc: desc.to_string(),
+            forecast,
+        })
+    }
+
+    fn degrees_to_compass(deg: f64) -> &'static str {
+        const DIRS: [&str; 16] = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+        ];
+        let idx = ((deg + 11.25) / 22.5) as usize % 16;
+        DIRS[idx]
+    }
+
+    fn wmo_weather_description(code: i64) -> &'static str {
+        match code {
+            0 => "Clear sky",
+            1 => "Mainly clear",
+            2 => "Partly cloudy",
+            3 => "Overcast",
+            45 => "Fog",
+            48 => "Depositing rime fog",
+            51 => "Light drizzle",
+            53 => "Moderate drizzle",
+            55 => "Dense drizzle",
+            56 => "Light freezing drizzle",
+            57 => "Dense freezing drizzle",
+            61 => "Slight rain",
+            63 => "Moderate rain",
+            65 => "Heavy rain",
+            66 => "Light freezing rain",
+            67 => "Heavy freezing rain",
+            71 => "Slight snow",
+            73 => "Moderate snow",
+            75 => "Heavy snow",
+            77 => "Snow grains",
+            80 => "Slight rain showers",
+            81 => "Moderate rain showers",
+            82 => "Violent rain showers",
+            85 => "Slight snow showers",
+            86 => "Heavy snow showers",
+            95 => "Thunderstorm",
+            96 => "Thunderstorm, slight hail",
+            99 => "Thunderstorm, heavy hail",
+            _ => "Unknown",
+        }
+    }
+
+    async fn display_weather(
+        &mut self,
+        zip: &str,
+        w: &WeatherData,
+    ) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+        let max_loc = if is_petscii { 30 } else { 48 };
+        let location = if w.region.is_empty() {
+            w.city.clone()
+        } else {
+            format!("{}, {}", w.city, w.region)
+        };
+        let loc_display = truncate_to_width(&location, max_loc);
+        self.send_line(&format!("  {}", self.yellow(&loc_display)))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+
+        // Current conditions
+        let max_desc = if is_petscii { 26 } else { 40 };
+        self.send_line(&format!(
+            "  Current: {}",
+            self.white(&truncate_to_width(&w.desc, max_desc))
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Temp: {}F (Feels like {}F)",
+            self.white(&w.temp_f),
+            self.white(&w.feels_like)
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Humidity: {}%",
+            self.white(&w.humidity)
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Wind: {} {} mph",
+            self.white(&w.wind_dir),
+            self.white(&w.wind_mph)
+        ))
+        .await?;
+        self.send_line("").await?;
+
+        // Forecast
+        if !w.forecast.is_empty() {
+            self.send_line(&format!("  {}", self.yellow("Forecast:")))
+                .await?;
+            for (i, day) in w.forecast.iter().enumerate() {
+                let label = match i {
+                    0 => "Today",
+                    1 => "Tomorrow",
+                    _ => &day.date,
+                };
+                let max_fd = if is_petscii { 12 } else { 20 };
+                let desc_part = if day.desc.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", truncate_to_width(&day.desc, max_fd))
+                };
+                self.send_line(&format!(
+                    "  {}: {}F / {}F{}",
+                    self.cyan(label),
+                    day.high,
+                    day.low,
+                    desc_part,
+                ))
+                .await?;
+            }
+        }
+
+        self.send_line("").await?;
+        self.send_line(&format!("  {}", self.dim(&format!("Zip: {}", zip))))
+            .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    // ─── TROUBLESHOOTING ────────────────────────────────────
+
+    async fn troubleshooting(&mut self) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("CHARACTER TROUBLESHOOTING")
+        ))
+        .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line("  Press any key to see its hex value.")
+            .await?;
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
+        self.send_line(&format!(
+            "  Press {} twice to return to menu.",
+            self.cyan(esc_label)
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send_line(&self.yellow(&"-".repeat(
+            if self.terminal_type == TerminalType::Petscii { PETSCII_WIDTH } else { 56 }
+        )))
+        .await?;
+        self.send_line("").await?;
+        self.flush().await?;
+
+        let mut last_was_esc = false;
+
+        loop {
+            let byte = match self.read_byte_filtered().await? {
+                Some(b) => b,
+                None => return Ok(()),
+            };
+
+            let name = match byte {
+                0x00 => "NUL",
+                0x01 => "SOH",
+                0x02 => "STX",
+                0x03 => "ETX",
+                0x04 => "EOT",
+                0x05 => "ENQ",
+                0x06 => "ACK",
+                0x07 => "BEL",
+                0x08 => "BS",
+                0x09 => "TAB",
+                0x0A => "LF",
+                0x0B => "VT",
+                0x0C => "FF",
+                0x0D => "CR",
+                0x0E => "SO",
+                0x0F => "SI",
+                0x10 => "DLE",
+                0x11 => "DC1",
+                0x12 => "DC2",
+                0x13 => "DC3",
+                0x14 => "DC4/C64-DEL",
+                0x15 => "NAK",
+                0x16 => "SYN",
+                0x17 => "ETB",
+                0x18 => "CAN",
+                0x19 => "EM",
+                0x1A => "SUB",
+                0x1B => "ESC",
+                0x1C => "FS",
+                0x1D => "GS/C64-RIGHT",
+                0x1E => "RS",
+                0x1F => "US",
+                0x7F => "DEL",
+                0x91 => "C64-UP",
+                0x93 => "C64-CLR",
+                0x9D => "C64-LEFT",
+                _ => "",
+            };
+
+            let display = if !name.is_empty() {
+                format!("  Key: {} ({:3}) = {}",
+                    self.cyan(&format!("0x{:02X}", byte)), byte, name)
+            } else if (0x20..=0x7E).contains(&byte) {
+                format!("  Key: {} ({:3}) = '{}'",
+                    self.cyan(&format!("0x{:02X}", byte)), byte, byte as char)
+            } else {
+                format!("  Key: {} ({:3})",
+                    self.cyan(&format!("0x{:02X}", byte)), byte)
+            };
+            self.send_line(&display).await?;
+            self.flush().await?;
+
+            if is_esc_key(byte, self.terminal_type == TerminalType::Petscii) {
+                if last_was_esc {
+                    self.send_line("").await?;
+                    self.send_line("  Returning to main menu...").await?;
+                    self.flush().await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    return Ok(());
+                }
+                last_was_esc = true;
+            } else {
+                last_was_esc = false;
             }
         }
     }
@@ -2844,6 +3502,14 @@ impl TelnetSession {
                 self.action_prompt("H", "Help"),
             )).await?;
             self.send_line("").await?;
+            self.send_line(&format!("  {}", self.dim("Try:"))).await?;
+            self.send_line(&format!("  {}",
+                self.dim("  http://telnetbible.com")
+            )).await?;
+            self.send_line(&format!("  {}",
+                self.dim("  gopher://gopher.floodgap.com")
+            )).await?;
+            self.send_line("").await?;
             let footer = self.nav_footer();
             self.send_line(&footer).await?;
         } else {
@@ -2871,7 +3537,8 @@ impl TelnetSession {
             let page_lines: Vec<String> = self.web_lines[start..end].to_vec();
             for line in &page_lines {
                 let safe = crate::webbrowser::truncate_to_width(line, content_max);
-                self.send_line(&format!("  {}", safe)).await?;
+                let colored = self.colorize_link_markers(&safe);
+                self.send_line(&format!("  {}", colored)).await?;
             }
             self.send_line("").await?;
 
@@ -3027,11 +3694,7 @@ impl TelnetSession {
                     }
                 }
                 _ => {
-                    if let Ok(num) = input.parse::<usize>() {
-                        self.web_follow_link(num).await?;
-                    } else {
-                        self.show_error("Unknown command.").await?;
-                    }
+                    self.show_error("Unknown command.").await?;
                 }
             }
         }
@@ -3094,15 +3757,34 @@ impl TelnetSession {
     }
 
     async fn web_fetch_page(&mut self, url: &str, push_history: bool) -> Result<bool, std::io::Error> {
+        // Gopher search URLs need a query term before fetching
+        let url = if crate::webbrowser::is_gopher_search(url) {
+            self.send_line("").await?;
+            self.send(&format!("  {}: ", self.cyan("Search"))).await?;
+            self.flush().await?;
+            let query = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(false),
+            };
+            crate::webbrowser::build_gopher_search_url(url, &query)
+        } else {
+            url.to_string()
+        };
+
         self.send_line("").await?;
         self.send_line(&format!("  {}...", self.dim("Loading"))).await?;
         self.flush().await?;
 
         let width = self.web_content_width();
-        let url_owned = url.to_string();
+        let url_owned = url.clone();
+        let is_gopher = url.starts_with("gopher://");
 
         let result = tokio::task::spawn_blocking(move || {
-            crate::webbrowser::fetch_and_render(&url_owned, width)
+            if is_gopher {
+                crate::webbrowser::fetch_gopher(&url_owned, width)
+            } else {
+                crate::webbrowser::fetch_and_render(&url_owned, width)
+            }
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -3128,7 +3810,6 @@ impl TelnetSession {
                     self.dim("are links to other pages.")
                 )).await?;
                 self.send_line("").await?;
-                self.send_line("  1-9  Follow link by number").await?;
                 self.send_line("  N/P  Next/Previous page").await?;
                 self.send_line("  T/E  Jump to Top/End").await?;
                 self.send_line("  S    Search text in page").await?;
@@ -3148,7 +3829,6 @@ impl TelnetSession {
                     self.dim("to other pages.")
                 )).await?;
                 self.send_line("").await?;
-                self.send_line("  1-9    Follow a link by its number").await?;
                 self.send_line("  N / P  Next page / Previous page").await?;
                 self.send_line("  T / E  Jump to Top / End of page").await?;
                 self.send_line("  S      Search for text in page").await?;
@@ -3167,10 +3847,16 @@ impl TelnetSession {
             self.send_line("  Q  Exit browser to main menu").await?;
             self.send_line("").await?;
             self.send_line(&format!("  {}",
-                self.dim("Type a URL like example.com")
+                self.dim("Examples:")
             )).await?;
             self.send_line(&format!("  {}",
-                self.dim("or a search like: rust lang")
+                self.dim("  http://telnetbible.com")
+            )).await?;
+            self.send_line(&format!("  {}",
+                self.dim("  gopher://gopher.floodgap.com")
+            )).await?;
+            self.send_line(&format!("  {}",
+                self.dim("  rust programming (search)")
             )).await?;
         }
 
@@ -3225,11 +3911,12 @@ impl TelnetSession {
         }
 
         self.send_line("").await?;
-        self.send_line(&format!("  {} {}",
+        self.send_line(&format!("  {} {} {}",
             self.dim("#=Open"),
             self.action_prompt("D", "Delete"),
+            self.action_prompt("H", "Help"),
         )).await?;
-        self.send(&format!("  {}: ", self.cyan("Cmd"))).await?;
+        self.send(&format!("  {}: ", self.cyan("#/D"))).await?;
         self.flush().await?;
 
         let input = match self.get_line_input().await? {
@@ -3237,7 +3924,13 @@ impl TelnetSession {
             _ => return Ok(()),
         };
 
-        if input == "d" {
+        if input == "h" {
+            self.show_error_lines(&[
+                "#  = Enter bookmark number to open",
+                "D  = Delete a bookmark by number",
+                "ESC= Cancel and go back",
+            ]).await?;
+        } else if input == "d" {
             // Delete mode
             self.send(&format!("  {} (1-{}): ", self.cyan("Delete #"), display_max)).await?;
             self.flush().await?;
@@ -3405,12 +4098,13 @@ impl TelnetSession {
             }
 
             self.send_line("").await?;
-            self.send_line(&format!("  {} {} {}",
+            self.send_line(&format!("  {} {} {} {}",
                 self.action_prompt("S", "Submit"),
                 self.dim("#=Edit"),
                 self.action_prompt("Q", "Cancel"),
+                self.action_prompt("H", "Help"),
             )).await?;
-            self.send(&format!("  {}: ", self.cyan("Cmd"))).await?;
+            self.send(&format!("  {}: ", self.cyan("#/S/Q"))).await?;
             self.flush().await?;
 
             let input = match self.get_line_input().await? {
@@ -3424,6 +4118,14 @@ impl TelnetSession {
                     return self.web_submit_form(form_idx).await;
                 }
                 "q" => return Ok(()),
+                "h" => {
+                    self.show_error_lines(&[
+                        "#  = Enter a field number to edit",
+                        "     its value",
+                        "S  = Submit the form",
+                        "Q  = Cancel and go back",
+                    ]).await?;
+                }
                 other => {
                     if let Ok(num) = other.parse::<usize>() {
                         if let Some(real_idx) = crate::webbrowser::visible_field_index(&form.fields, num) {
@@ -3432,7 +4134,7 @@ impl TelnetSession {
                             self.show_error("Invalid field number.").await?;
                         }
                     } else {
-                        self.show_error("Enter S, Q, or a field #.").await?;
+                        self.show_error("Enter S, Q, H, or a field #.").await?;
                     }
                 }
             }
@@ -3674,6 +4376,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     web_url: None,
                                     web_title: None,
                                     web_forms: Vec::new(),
+                                    weather_zip: config::get_config().weather_zip,
                                 };
                                 if let Err(e) = session.run().await {
                                     eprintln!("Telnet: session error from {}: {}", addr, e);
@@ -3938,10 +4641,10 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_insecure_ip_loopback_dot_one_rejected() {
-        // 127.0.0.1 ends in .1, should be rejected
+    fn test_reject_insecure_ip_loopback_dot_one_allowed() {
+        // 127.0.0.1 is loopback — exempt from the .1 gateway filter
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(reject_insecure_ip(ip).is_some());
+        assert!(reject_insecure_ip(ip).is_none());
     }
 
     #[test]
@@ -4301,7 +5004,7 @@ mod tests {
     fn test_gateway_menu_items_fit_petscii() {
         let items = [
             "  S=Connect to SSH server",
-            "  Press S, R, or Q.",
+            "  Press S, R, Q, or H.",
         ];
         for item in &items {
             assert!(
@@ -4322,19 +5025,19 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A, B, F, G, or X.",
-            "Press U, D, X, C, I, R, or Q.",
+            "Press A,B,F,G,T,W,X, or H.",
+            "Press U, D, X, C, I, R, Q, or H.",
             "Disk space is low. Uploads disabled.",
             "File already exists.",
             "No files available.",
             "Invalid selection.",
-            "Enter a number, P, N, or Q.",
+            "Enter a number, P, N, Q, or H.",
             "File too large.",
             "No files to delete.",
             "No subdirectories.",
             "Access denied.",
             "Enter a number or Q.",
-            "Press S, R, or Q.",
+            "Press S, R, Q, or H.",
             "Invalid port number.",
             "Connection timed out.",
             "Authentication failed.",
@@ -4344,6 +5047,8 @@ mod tests {
             "Disconnected: idle timeout.",
             "Press any key to continue.",
             "No API key configured.",
+            // Weather
+            "Enter a 5-digit US zip code.",
             // Web browser
             "Press G, K, H, or Q.",
             "End of page.",
@@ -4354,7 +5059,7 @@ mod tests {
             "Enter a number.",
             "Invalid form number.",
             "Invalid field number.",
-            "Enter S, Q, or a field #.",
+            "Enter S, Q, H, or a field #.",
             "Already bookmarked (or full).",
             "No page to bookmark.",
             "No bookmarks saved.",
@@ -4384,6 +5089,8 @@ mod tests {
             "  B  Simple Browser",
             "  F  File Transfer",
             "  G  SSH Gateway",
+            "  T  Troubleshooting",
+            "  W  Weather",
             "  X  Exit",
             // File transfer menu
             "  U  Upload a file",
@@ -4393,7 +5100,7 @@ mod tests {
             // Gateway menu
             "  S  Connect to SSH server",
             // Navigation footers
-            "  R=Refresh Q=Back",
+            "  R=Refresh Q=Back H=Help",
             // Auth prompts
             "  Username: ",
             "  Password: ",
@@ -4413,11 +5120,11 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 5 items + blank + prompt = 10 rows.
+    /// Main menu screen: header(3) + blank + 7 items + blank + help + prompt = 13 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, G, X, blank = 10 lines
-        let rows = 10;
+        // sep, title, sep, blank, A, B, F, G, T, W, X, blank, H=Help = 13 lines
+        let rows = 13;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
@@ -4923,6 +5630,29 @@ mod tests {
         );
     }
 
+    // ─── Troubleshooting ─────────────────────────────────
+
+    #[test]
+    fn test_troubleshooting_lines_fit_petscii() {
+        let lines = [
+            "  CHARACTER TROUBLESHOOTING",
+            "  Press any key to see its hex value.",
+            "  Press <- twice to return to menu.",
+            "  Key: 0x1B ( 27) = ESC",
+            "  Key: 0x41 ( 65) = 'A'",
+            "  Key: 0x14 ( 20) = DC4/C64-DEL",
+            "  Key: 0x9D (157) = C64-LEFT",
+            "  Returning to main menu...",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "troubleshooting line '{}' is {} chars, exceeds {}",
+                line, line.len(), PETSCII_WIDTH,
+            );
+        }
+    }
+
     // ─── Help screen ──────────────────────────────────────
 
     #[test]
@@ -4931,7 +5661,6 @@ mod tests {
             "  BROWSER HELP",
             "  [1] [2] etc. next to text",
             "  are links to other pages.",
-            "  1-9  Follow link by number",
             "  N/P  Next/Previous page",
             "  T/E  Jump to Top/End",
             "  S    Search text in page",

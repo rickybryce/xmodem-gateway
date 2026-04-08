@@ -22,6 +22,7 @@ const DEFAULT_MAX_SESSIONS: usize = 50;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900; // 15 minutes
 const DEFAULT_GROQ_API_KEY: &str = "";
 const DEFAULT_BROWSER_HOMEPAGE: &str = "";
+const DEFAULT_WEATHER_ZIP: &str = "";
 const DEFAULT_VERBOSE: bool = false;
 
 /// Runtime configuration loaded from `xmodem.conf`.
@@ -38,6 +39,8 @@ pub struct Config {
     pub groq_api_key: String,
     /// Browser homepage URL. If empty, browser opens to a blank prompt.
     pub browser_homepage: String,
+    /// Last-used weather zip code. If empty, user is prompted without a default.
+    pub weather_zip: String,
     /// Enable verbose XMODEM protocol logging to stderr.
     pub verbose: bool,
 }
@@ -54,6 +57,7 @@ impl Default for Config {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             groq_api_key: DEFAULT_GROQ_API_KEY.into(),
             browser_homepage: DEFAULT_BROWSER_HOMEPAGE.into(),
+            weather_zip: DEFAULT_WEATHER_ZIP.into(),
             verbose: DEFAULT_VERBOSE,
         }
     }
@@ -150,6 +154,10 @@ fn read_config_file(path: &str) -> Config {
             .get("browser_homepage")
             .cloned()
             .unwrap_or_else(|| DEFAULT_BROWSER_HOMEPAGE.into()),
+        weather_zip: map
+            .get("weather_zip")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_WEATHER_ZIP.into()),
         verbose: map
             .get("verbose")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -198,6 +206,9 @@ groq_api_key = {}
 # Leave empty to start with a blank prompt.
 browser_homepage = {}
 
+# Last-used weather zip code (updated automatically when you check weather)
+weather_zip = {}
+
 # Verbose logging: set to true for detailed XMODEM protocol diagnostics
 verbose = {}
 ",
@@ -210,12 +221,28 @@ verbose = {}
         cfg.idle_timeout_secs,
         sanitize_value(&cfg.groq_api_key),
         sanitize_value(&cfg.browser_homepage),
+        sanitize_value(&cfg.weather_zip),
         cfg.verbose,
     );
 
     if let Err(e) = std::fs::write(path, content) {
         eprintln!("Warning: could not write {}: {}", path, e);
     }
+}
+
+/// Update a single key in the config file without disturbing other values.
+/// Reads the current file, updates the key, and writes it back.
+pub fn update_config_value(key: &str, value: &str) {
+    let mut cfg = if Path::new(CONFIG_FILE).exists() {
+        read_config_file(CONFIG_FILE)
+    } else {
+        Config::default()
+    };
+    match key {
+        "weather_zip" => cfg.weather_zip = value.to_string(),
+        _ => return,
+    }
+    write_config_file(CONFIG_FILE, &cfg);
 }
 
 // ─── Tests ─────────────────────────────────────────────────
@@ -237,6 +264,7 @@ mod tests {
         assert_eq!(cfg.idle_timeout_secs, 900);
         assert_eq!(cfg.groq_api_key, "");
         assert_eq!(cfg.browser_homepage, "");
+        assert_eq!(cfg.weather_zip, "");
     }
 
     #[test]
@@ -317,6 +345,7 @@ mod tests {
             idle_timeout_secs: 60,
             groq_api_key: "gsk_test123".into(),
             browser_homepage: "https://example.com".into(),
+            weather_zip: "90210".into(),
             verbose: true,
         };
         write_config_file(path.to_str().unwrap(), &original);
@@ -331,6 +360,7 @@ mod tests {
         assert_eq!(loaded.idle_timeout_secs, original.idle_timeout_secs);
         assert_eq!(loaded.groq_api_key, original.groq_api_key);
         assert_eq!(loaded.browser_homepage, original.browser_homepage);
+        assert_eq!(loaded.weather_zip, original.weather_zip);
         assert_eq!(loaded.verbose, original.verbose);
 
         let _ = std::fs::remove_dir_all(&dir);

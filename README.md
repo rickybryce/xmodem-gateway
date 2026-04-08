@@ -112,6 +112,8 @@ enabled), the main menu offers:
   B  Simple Browser
   F  File Transfer
   G  SSH Gateway
+  T  Troubleshooting
+  W  Weather
   X  Exit
 ```
 
@@ -161,6 +163,12 @@ To require a username and password:
 When enabled, users must authenticate after terminal detection. Failed login
 attempts are tracked per IP address -- after 3 failures, the IP is locked out
 for 5 minutes.
+
+**Note:** Credentials are stored in plaintext in `xmodem.conf`. This is
+consistent with the telnet protocol itself, which transmits all data
+(including passwords) in cleartext. Do not reuse sensitive passwords here.
+This authentication is intended as a lightweight access control for private
+networks, not as a security boundary.
 
 ### Setting Up AI Chat
 
@@ -280,8 +288,8 @@ PETSCII screens.
 ### Understanding Links
 
 When a page is displayed, clickable links are marked with numbered tags like
-**[1]**, **[2]**, **[3]** next to the linked text. To follow a link, type its
-number. For link numbers 10 and above, press **L** and enter the number.
+**[1]**, **[2]**, **[3]** next to the linked text. To follow a link, press
+**L** and enter the link number.
 
 ### Page Navigation Commands
 
@@ -289,8 +297,7 @@ number. For link numbers 10 and above, press **L** and enter the number.
 |-------|-------------------------------------|
 | N / P | Next page / Previous page           |
 | T / E | Jump to Top / End of page           |
-| 1-9   | Follow a link by its number         |
-| L     | Follow a link (enter any number)    |
+| L     | Follow a link by number             |
 | G     | Go to a new URL or search query     |
 | S     | Search for text within the page     |
 | F     | Fill out and submit forms           |
@@ -329,6 +336,24 @@ detected, the status line shows the form count. Press **F** to interact:
 - Page history depth: 50 pages
 - HTTPS connections that fail due to TLS errors automatically retry over HTTP
 
+### Gopher Protocol
+
+The browser supports the Gopher protocol alongside HTTP/HTTPS. Gopher is a
+text-native protocol that predates the web and renders beautifully on retro
+terminals, including 40-column PETSCII screens.
+
+To browse a Gopher server, press **G** and enter a `gopher://` URL:
+
+```
+gopher://gopher.floodgap.com
+gopher://gopher.quux.org
+```
+
+Gopher directory listings are displayed with numbered links, just like web
+pages. Text files are displayed as plain text. Gopher search items (type 7)
+automatically prompt for a search query before fetching results. All browser
+features (pagination, history, back, bookmarks) work with Gopher URLs.
+
 ## AI Chat
 
 AI Chat provides an interactive question-and-answer interface powered by the
@@ -344,6 +369,19 @@ above).
 
 Responses are word-wrapped to fit the terminal width (38 columns for PETSCII,
 78 for ANSI/ASCII).
+
+## Weather
+
+The Weather feature displays current conditions and a 3-day forecast for any
+US zip code, powered by [Open-Meteo](https://open-meteo.com) (free, no API
+key required).
+
+1. From the main menu, press **W** (Weather)
+2. Enter a 5-digit US zip code, or press Enter to use the last one
+3. Current temperature, humidity, wind, and a 3-day forecast are displayed
+
+The last-used zip code is saved to `xmodem.conf` so it becomes the default
+for all future sessions.
 
 ## Signals
 
