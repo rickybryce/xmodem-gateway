@@ -1,8 +1,9 @@
 # XMODEM Gateway
 
-A telnet-based XMODEM file transfer server and SSH gateway written in Rust.
-Supports PETSCII (Commodore 64), ANSI, and ASCII terminals. Designed for local
-network use with retro and modern terminal clients.
+A telnet-based XMODEM file transfer server, SSH gateway, text-mode web browser,
+and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI, and
+ASCII terminals. Designed for local network use with retro and modern terminal
+clients.
 
 Author: Ricky Bryce
 Co-Author: Claude (Anthropic)
@@ -101,6 +102,19 @@ Connect with any telnet client:
 telnet <server-ip> 2323
 ```
 
+## Main Menu
+
+After connecting and completing terminal detection (and login, if security is
+enabled), the main menu offers:
+
+```
+  A  AI Chat
+  B  Simple Browser
+  F  File Transfer
+  G  SSH Gateway
+  X  Exit
+```
+
 ## Configuration
 
 Edit `xmodem.conf` in the same directory as the binary. All options:
@@ -127,6 +141,12 @@ idle_timeout_secs = 900
 
 # Groq API key for AI Chat (leave empty to disable)
 groq_api_key =
+
+# URL to load automatically when entering the browser (leave empty for none)
+browser_homepage =
+
+# Enable verbose XMODEM protocol logging to stderr
+verbose = false
 ```
 
 ### Setting Up Authentication
@@ -155,6 +175,14 @@ access to fast LLM inference. To enable it:
 If no API key is configured, selecting AI Chat from the menu will display
 instructions on how to obtain one.
 
+### Setting Up the Browser Homepage
+
+To have the browser automatically load a page when opened:
+
+1. Open `xmodem.conf`
+2. Set `browser_homepage` to a URL, e.g.: `browser_homepage = example.com`
+3. Restart the server
+
 ## Terminal Support
 
 On connect, the server asks the user to press **Backspace** to detect the
@@ -166,8 +194,8 @@ terminal type:
 | 0x08 or 0x7F  | ANSI          | Modern terminal with escape sequence color |
 | Other         | ASCII         | Plain text, no color |
 
-After detection, the server asks whether to enable color. ASCII terminals can
-opt in to ANSI color; PETSCII/ANSI terminals can opt out.
+After detection, the server asks whether to enable color. PETSCII defaults to
+color on; ANSI and ASCII default to color off but can opt in.
 
 ## Transferring Files
 
@@ -175,7 +203,8 @@ opt in to ANSI color; PETSCII/ANSI terminals can opt out.
 
 1. Connect via telnet and navigate to **F** (File Transfer)
 2. Press **U** (Upload)
-3. Enter a filename (letters, numbers, dots, hyphens, underscores only)
+3. Enter a filename (letters, numbers, dots, hyphens, underscores only; max 64
+   characters)
 4. The server displays "Begin XMODEM send now" and waits up to 90 seconds
 5. In your terminal client, start an XMODEM send of the local file
    - Most terminal programs have a "Send File" or "Upload" option under a
@@ -188,7 +217,8 @@ opt in to ANSI color; PETSCII/ANSI terminals can opt out.
 ### Downloading a File from the Server
 
 1. Navigate to **F** (File Transfer), then press **D** (Download)
-2. The server lists files in the current transfer directory (paginated)
+2. The server lists files in the current transfer directory (paginated, 10 per
+   page)
 3. Enter the number of the file to download
 4. The server displays "Start XMODEM receive now" and waits up to 90 seconds
 5. In your terminal client, start an XMODEM receive
@@ -232,6 +262,72 @@ For PETSCII and ASCII terminals, ANSI escape sequences from the remote host are
 automatically stripped, and text is converted to the appropriate encoding. ANSI
 terminals receive the raw output unmodified. The PTY size is set to 40x25 for
 PETSCII and 80x24 for ANSI/ASCII terminals.
+
+## Web Browser
+
+The built-in text-mode web browser renders HTML pages as plain text with
+numbered link references. It works on all terminal types, including 40-column
+PETSCII screens.
+
+### Browsing a Page
+
+1. From the main menu, press **B** (Simple Browser)
+2. Enter a URL (e.g. `example.com`) or a search query (e.g. `rust programming`)
+   - URLs without a scheme automatically get `https://` prepended
+   - Text without dots is treated as a search query and sent to DuckDuckGo
+3. The page is fetched, converted to plain text, and displayed with pagination
+
+### Understanding Links
+
+When a page is displayed, clickable links are marked with numbered tags like
+**[1]**, **[2]**, **[3]** next to the linked text. To follow a link, type its
+number. For link numbers 10 and above, press **L** and enter the number.
+
+### Page Navigation Commands
+
+| Key   | Action                              |
+|-------|-------------------------------------|
+| N / P | Next page / Previous page           |
+| T / E | Jump to Top / End of page           |
+| 1-9   | Follow a link by its number         |
+| L     | Follow a link (enter any number)    |
+| G     | Go to a new URL or search query     |
+| S     | Search for text within the page     |
+| F     | Fill out and submit forms           |
+| K     | Save current page as a bookmark     |
+| B     | Go back to the previous page        |
+| R     | Reload the current page             |
+| H     | Show help                           |
+| Q     | Close page (return to browser home) |
+| ESC   | Exit browser to main menu           |
+
+### Bookmarks
+
+- Press **K** while viewing a page to save it as a bookmark
+- Press **K** on the browser home screen to open your saved bookmarks
+- Select a bookmark by number to navigate to it
+- Press **D** in the bookmarks list, then enter a number to delete one
+- Up to 100 bookmarks are stored in `bookmarks.txt` next to the binary
+
+### Forms
+
+Many web pages contain forms (search boxes, login fields, etc.). When forms are
+detected, the status line shows the form count. Press **F** to interact:
+
+1. If multiple forms exist, select one by number
+2. Edit fields by entering the field number
+   - Text fields: type a new value
+   - Select dropdowns: choose an option by number
+   - Checkboxes and radio buttons: toggle or select
+3. Press **S** to submit the form, or **Q** to cancel
+
+### Browser Limits
+
+- Maximum page size: 1 MB
+- Maximum rendered lines: 5,000
+- HTTP request timeout: 15 seconds
+- Page history depth: 50 pages
+- HTTPS connections that fail due to TLS errors automatically retry over HTTP
 
 ## AI Chat
 

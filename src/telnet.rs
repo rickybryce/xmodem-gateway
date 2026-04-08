@@ -2837,6 +2837,13 @@ impl TelnetSession {
             let is_petscii = self.terminal_type == TerminalType::Petscii;
             if is_petscii {
                 // Compact help for 40-col screens
+                self.send_line(&format!("  {}",
+                    self.dim("[1] [2] etc. next to text")
+                )).await?;
+                self.send_line(&format!("  {}",
+                    self.dim("are links to other pages.")
+                )).await?;
+                self.send_line("").await?;
                 self.send_line("  1-9  Follow link by number").await?;
                 self.send_line("  N/P  Next/Previous page").await?;
                 self.send_line("  T/E  Jump to Top/End").await?;
@@ -2850,6 +2857,13 @@ impl TelnetSession {
                 self.send_line("  Q    Close page").await?;
                 self.send_line("  ESC  Exit browser").await?;
             } else {
+                self.send_line(&format!("  {}",
+                    self.dim("[1], [2], etc. next to text are links")
+                )).await?;
+                self.send_line(&format!("  {}",
+                    self.dim("to other pages.")
+                )).await?;
+                self.send_line("").await?;
                 self.send_line("  1-9    Follow a link by its number").await?;
                 self.send_line("  N / P  Next page / Previous page").await?;
                 self.send_line("  T / E  Jump to Top / End of page").await?;
@@ -4465,6 +4479,8 @@ mod tests {
     fn test_web_help_lines_fit_petscii() {
         let lines = [
             "  BROWSER HELP",
+            "  [1] [2] etc. next to text",
+            "  are links to other pages.",
             "  1-9  Follow link by number",
             "  N/P  Next/Previous page",
             "  T/E  Jump to Top/End",
@@ -4492,8 +4508,8 @@ mod tests {
 
     #[test]
     fn test_web_help_page_view_row_count() {
-        // header(3) + 12 help lines + blank + "press any key" = 17 rows max
-        let rows = 3 + 12 + 1 + 1;
+        // header(3) + 2 link explanation + blank + 12 help lines + blank + "press any key" = 20 rows max
+        let rows = 3 + 2 + 1 + 12 + 1 + 1;
         assert!(rows <= 22, "help screen is {} rows, exceeds 22", rows);
     }
 
