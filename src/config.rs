@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 /// Name of the configuration file (lives next to the binary).
 pub const CONFIG_FILE: &str = "xmodem.conf";
@@ -63,14 +63,14 @@ impl Default for Config {
     }
 }
 
-/// Global config singleton, loaded once at startup.
-static CONFIG: OnceLock<Config> = OnceLock::new();
+/// Global config singleton. Protected by a Mutex so it can be updated at
+/// runtime (e.g. when `update_config_value` persists a changed setting).
+static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 
 /// Get a clone of the current configuration.
 pub fn get_config() -> Config {
-    CONFIG
-        .get_or_init(Config::default)
-        .clone()
+    let guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    guard.clone().unwrap_or_default()
 }
 
 /// Load (or create) the configuration file and store it in the global singleton.
@@ -87,9 +87,8 @@ pub fn load_or_create_config() -> Config {
         cfg
     };
 
-    if CONFIG.set(cfg.clone()).is_err() {
-        eprintln!("Warning: config already initialised, ignoring duplicate load");
-    }
+    let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(cfg.clone());
     cfg
 }
 
@@ -225,13 +224,19 @@ verbose = {}
         cfg.verbose,
     );
 
-    if let Err(e) = std::fs::write(path, content) {
+    // Write to a temporary file and rename into place to prevent partial
+    // writes if the process is interrupted or multiple sessions write concurrently.
+    let tmp = format!("{}.tmp", path);
+    if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, path)) {
         eprintln!("Warning: could not write {}: {}", path, e);
+        // Clean up the temp file if rename failed
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
-/// Update a single key in the config file without disturbing other values.
-/// Reads the current file, updates the key, and writes it back.
+/// Update a single key in the config file and the in-memory singleton.
+/// Reads the current file, updates the key, writes it back, and refreshes
+/// the global config so that subsequent `get_config()` calls see the change.
 pub fn update_config_value(key: &str, value: &str) {
     let mut cfg = if Path::new(CONFIG_FILE).exists() {
         read_config_file(CONFIG_FILE)
@@ -243,6 +248,10 @@ pub fn update_config_value(key: &str, value: &str) {
         _ => return,
     }
     write_config_file(CONFIG_FILE, &cfg);
+
+    // Update the in-memory singleton so get_config() returns the new value.
+    let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(cfg);
 }
 
 // ─── Tests ─────────────────────────────────────────────────

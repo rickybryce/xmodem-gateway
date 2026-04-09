@@ -55,12 +55,20 @@ enum TerminalType {
     Petscii,
 }
 
+// ─── Input mode ────────────────────────────────────────────
+#[derive(Clone, Copy)]
+enum InputMode {
+    /// Normal line input: echo typed characters, trim result.
+    Normal,
+    /// Password input: echo `*` for each character, no trim.
+    Password,
+}
+
 // ─── Menu ───────────────────────────────────────────────────
 #[derive(Clone, Debug, PartialEq)]
 enum Menu {
     Main,
     FileTransfer,
-    Gateway,
     Browser,
 }
 
@@ -69,7 +77,6 @@ impl Menu {
         match self {
             Menu::Main => "xmodem",
             Menu::FileTransfer => "xmodem/xfer",
-            Menu::Gateway => "xmodem/gw",
             Menu::Browser => "xmodem/web",
         }
     }
@@ -99,6 +106,16 @@ fn record_auth_failure(lockouts: &LockoutMap, ip: IpAddr) -> u32 {
     entry.0 += 1;
     entry.1 = std::time::Instant::now();
     entry.0
+}
+
+/// Constant-time byte slice comparison to prevent timing attacks on credentials.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Still iterate to avoid leaking length difference through timing.
+        let _ = a.iter().fold(0u8, |acc, &x| acc | x);
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (&x, &y)| acc | (x ^ y)) == 0
 }
 
 fn clear_lockout(lockouts: &LockoutMap, ip: IpAddr) {
@@ -404,6 +421,9 @@ fn check_known_host(
 }
 
 /// Save a host key to the known-hosts file.
+///
+/// Uses write-to-temp-then-rename so concurrent sessions cannot corrupt the
+/// file by racing on read-modify-write.
 fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
     let entry = format!("{}:{} {}\n", host, port, format_host_key(key));
 
@@ -424,9 +444,18 @@ fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
         content.push('\n');
     }
     content.push_str(&entry);
-    if let Err(e) = std::fs::write(GATEWAY_HOSTS_FILE, &content) {
+    if let Err(e) = atomic_write(GATEWAY_HOSTS_FILE, &content) {
         eprintln!("Warning: could not save gateway host key: {}", e);
     }
+}
+
+/// Write `content` to `path` atomically by writing to a temporary file in the
+/// same directory and then renaming it into place. This prevents partial writes
+/// and corruption from concurrent operations.
+fn atomic_write(path: &str, content: &str) -> Result<(), std::io::Error> {
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
 }
 
 // ─── Weather data ──────────────────────────────────────────
@@ -652,54 +681,7 @@ impl TelnetSession {
     }
 
     async fn get_line_input(&mut self) -> Result<Option<String>, std::io::Error> {
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            let byte = match self.read_byte_filtered().await? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            if byte == b'\r' || byte == b'\n' {
-                self.send_raw(b"\r\n").await?;
-                self.flush().await?;
-                let result: String = if self.terminal_type == TerminalType::Petscii {
-                    buf.iter()
-                        .map(|&b| petscii_to_ascii_byte(b) as char)
-                        .collect()
-                } else {
-                    buf.iter().map(|&b| b as char).collect()
-                };
-                return Ok(Some(result.trim().to_string()));
-            }
-
-            if is_esc_key(byte, self.terminal_type == TerminalType::Petscii) {
-                self.drain_input().await;
-                return Ok(None);
-            }
-
-            if is_backspace_key(byte, self.erase_char) {
-                if !buf.is_empty() {
-                    buf.pop();
-                    self.echo_backspace().await?;
-                    self.flush().await?;
-                }
-                continue;
-            }
-
-            if byte < 0x20 {
-                continue;
-            }
-
-            if buf.len() >= MAX_INPUT_LENGTH {
-                self.send_raw(b"\r\n").await?;
-                self.show_error("Input too long.").await?;
-                return Ok(None);
-            }
-
-            self.send_raw(&[byte]).await?;
-            self.flush().await?;
-            buf.push(byte);
-        }
+        self.read_input_loop(&mut Vec::new(), InputMode::Normal).await
     }
 
     /// Continue collecting line input with bytes already in `buf` (which have
@@ -709,62 +691,29 @@ impl TelnetSession {
         &mut self,
         buf: &mut Vec<u8>,
     ) -> Result<Option<String>, std::io::Error> {
-        loop {
-            let byte = match self.read_byte_filtered().await? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            if byte == b'\r' || byte == b'\n' {
-                self.send_raw(b"\r\n").await?;
-                self.flush().await?;
-                let result: String = if self.terminal_type == TerminalType::Petscii {
-                    buf.iter()
-                        .map(|&b| petscii_to_ascii_byte(b) as char)
-                        .collect()
-                } else {
-                    buf.iter().map(|&b| b as char).collect()
-                };
-                return Ok(Some(result.trim().to_string()));
-            }
-
-            if is_esc_key(byte, self.terminal_type == TerminalType::Petscii) {
-                self.drain_input().await;
-                return Ok(None);
-            }
-
-            if is_backspace_key(byte, self.erase_char) {
-                if !buf.is_empty() {
-                    buf.pop();
-                    self.echo_backspace().await?;
-                    self.flush().await?;
-                }
-                continue;
-            }
-
-            if byte < 0x20 {
-                continue;
-            }
-
-            if buf.len() >= MAX_INPUT_LENGTH {
-                self.send_raw(b"\r\n").await?;
-                self.show_error("Input too long.").await?;
-                return Ok(None);
-            }
-
-            self.send_raw(&[byte]).await?;
-            self.flush().await?;
-            buf.push(byte);
-        }
+        self.read_input_loop(buf, InputMode::Normal).await
     }
 
     async fn get_password_input(&mut self) -> Result<Option<String>, std::io::Error> {
-        let mut buf: Vec<u8> = Vec::new();
+        self.read_input_loop(&mut Vec::new(), InputMode::Password).await
+    }
+
+    /// Core input loop shared by `get_line_input`, `get_line_input_continuing`,
+    /// and `get_password_input`. In `Normal` mode, typed characters are echoed
+    /// and the result is trimmed. In `Password` mode, `*` is echoed instead and
+    /// the result is returned untrimmed.
+    async fn read_input_loop(
+        &mut self,
+        buf: &mut Vec<u8>,
+        mode: InputMode,
+    ) -> Result<Option<String>, std::io::Error> {
+        let is_password = matches!(mode, InputMode::Password);
         loop {
             let byte = match self.read_byte_filtered().await? {
                 Some(b) => b,
                 None => return Ok(None),
             };
+
             if byte == b'\r' || byte == b'\n' {
                 self.send_raw(b"\r\n").await?;
                 self.flush().await?;
@@ -775,12 +724,18 @@ impl TelnetSession {
                 } else {
                     buf.iter().map(|&b| b as char).collect()
                 };
-                return Ok(Some(result));
+                return Ok(Some(if is_password {
+                    result
+                } else {
+                    result.trim().to_string()
+                }));
             }
+
             if is_esc_key(byte, self.terminal_type == TerminalType::Petscii) {
                 self.drain_input().await;
                 return Ok(None);
             }
+
             if is_backspace_key(byte, self.erase_char) {
                 if !buf.is_empty() {
                     buf.pop();
@@ -789,15 +744,22 @@ impl TelnetSession {
                 }
                 continue;
             }
+
             if byte < 0x20 {
                 continue;
             }
+
             if buf.len() >= MAX_INPUT_LENGTH {
                 self.send_raw(b"\r\n").await?;
                 self.show_error("Input too long.").await?;
                 return Ok(None);
             }
-            self.send_raw(b"*").await?;
+
+            if is_password {
+                self.send_raw(b"*").await?;
+            } else {
+                self.send_raw(&[byte]).await?;
+            }
             self.flush().await?;
             buf.push(byte);
         }
@@ -1172,7 +1134,9 @@ impl TelnetSession {
                 }
             };
 
-            if username == cfg.username && password == cfg.password {
+            if constant_time_eq(username.as_bytes(), cfg.username.as_bytes())
+                && constant_time_eq(password.as_bytes(), cfg.password.as_bytes())
+            {
                 if let Some(ip) = self.peer_addr {
                     clear_lockout(&self.lockouts, ip);
                 }
@@ -1263,7 +1227,6 @@ impl TelnetSession {
             match self.current_menu {
                 Menu::Main => self.render_main_menu().await?,
                 Menu::FileTransfer => self.render_file_transfer().await?,
-                Menu::Gateway => self.render_gateway().await?,
                 Menu::Browser => self.render_web_browser().await?,
             }
 
@@ -1305,9 +1268,6 @@ impl TelnetSession {
                 Menu::FileTransfer => {
                     self.handle_file_transfer_command(&input).await?;
                 }
-                Menu::Gateway => {
-                    self.handle_gateway_command(&input).await?;
-                }
                 Menu::Browser => {
                     self.handle_web_browser_command(&input).await?;
                 }
@@ -1343,12 +1303,17 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
-            "  {}  SSH Gateway",
-            self.cyan("G")
+            "  {}  Troubleshooting",
+            self.cyan("R")
         ))
         .await?;
         self.send_line(&format!(
-            "  {}  Troubleshooting",
+            "  {}  SSH Gateway",
+            self.cyan("S")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}  Telnet Gateway",
             self.cyan("T")
         ))
         .await?;
@@ -1373,15 +1338,17 @@ impl TelnetSession {
                     "B = Browser: browse the web",
                     "F = File Transfer: upload/download",
                     "    files using the XMODEM protocol",
-                    "G = SSH Gateway: connect to a remote",
-                    "    server via SSH",
-                    "T = Troubleshooting: diagnose",
+                    "R = Troubleshooting: diagnose",
                     "    terminal input issues",
+                    "S = SSH Gateway: connect to a",
+                    "    remote server via SSH",
+                    "T = Telnet Gateway: connect to a",
+                    "    remote server via telnet",
                     "W = Weather: check weather by zip",
                     "X = Exit: disconnect from the server",
                 ]).await?;
             }
-            "t" => {
+            "r" => {
                 self.troubleshooting().await?;
             }
             "w" => {
@@ -1411,8 +1378,11 @@ impl TelnetSession {
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
-            "g" => {
-                self.current_menu = Menu::Gateway;
+            "s" => {
+                self.gateway_ssh().await?;
+            }
+            "t" => {
+                self.gateway_telnet().await?;
             }
             "x" => {
                 self.send_line("").await?;
@@ -1421,7 +1391,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A,B,F,G,T,W,X, or H.").await?;
+                self.show_error("Press A,B,F,R,S,T,W,X, or H.").await?;
             }
         }
         Ok(true)
@@ -2377,52 +2347,6 @@ impl TelnetSession {
     /// Gateway timeout for SSH connection attempts.
     const GATEWAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    async fn render_gateway(&mut self) -> Result<(), std::io::Error> {
-        self.clear_screen().await?;
-        let sep = self.separator();
-        self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("SSH GATEWAY")))
-            .await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-        self.send_line(&format!(
-            "  {}  Connect to SSH server",
-            self.cyan("S")
-        ))
-        .await?;
-        self.send_line("").await?;
-        let footer = self.nav_footer();
-        self.send_line(&footer).await?;
-        Ok(())
-    }
-
-    async fn handle_gateway_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
-        match input {
-            "s" => {
-                self.gateway_ssh().await?;
-            }
-            "q" => {
-                self.current_menu = Menu::Main;
-            }
-            "h" => {
-                self.show_error_lines(&[
-                    "S = Connect to a remote SSH server",
-                    "R = Refresh the screen",
-                    "Q = Back to the main menu",
-                    "",
-                    "The SSH Gateway lets you connect",
-                    "to SSH servers through this telnet",
-                    "session. Press Ctrl+] to disconnect.",
-                ]).await?;
-            }
-            "r" => {} // Refresh
-            _ => {
-                self.show_error("Press S, R, Q, or H.").await?;
-            }
-        }
-        Ok(true)
-    }
-
     /// Gather gateway connection details from the user (host, port, username, password).
     /// Returns None if the user cancelled (ESC or empty input).
     async fn gateway_prompts(
@@ -2733,14 +2657,18 @@ impl TelnetSession {
             return Ok(());
         }
 
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
         self.send_line(&format!(
             "  {}",
             self.green("Connected.")
         ))
         .await?;
         self.send_line(&format!(
-            "  Press {} to disconnect.",
-            self.cyan("Ctrl+]")
+            "  Press {} twice to disconnect.",
+            self.cyan(esc_label)
         ))
         .await?;
         self.send_line("").await?;
@@ -2760,13 +2688,20 @@ impl TelnetSession {
         let mut filter_buf: Vec<u8> = Vec::new();
         let mut ansi_state: u8 = 0;
         let mut last_cr = false;
+        let mut last_was_esc = false;
 
         loop {
             tokio::select! {
                 byte = read_byte_iac_filtered(reader, true) => {
                     match byte {
-                        Ok(Some(0x1D)) => break, // Ctrl+]
+                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
+                            if last_was_esc {
+                                break; // Two consecutive ESC presses — disconnect
+                            }
+                            last_was_esc = true;
+                        }
                         Ok(Some(b)) => {
+                            last_was_esc = false;
                             let b = if is_petscii { petscii_to_ascii_byte(b) } else { b };
                             let b = if b == erase_char && erase_char != 0x7F { 0x7F } else { b };
                             if let Some(b) = normalize_gateway_input(b, &mut last_cr) {
@@ -2807,6 +2742,212 @@ impl TelnetSession {
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "bye", "")
             .await;
+
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("Connection closed.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        if idle_timeout.is_zero() {
+            self.wait_for_key().await?;
+        } else {
+            match tokio::time::timeout(idle_timeout, self.wait_for_key()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = self
+                        .send_line("\r\nDisconnected: idle timeout.")
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ─── TELNET GATEWAY ──────────────────────────────────────
+
+    /// Telnet gateway: connect to a remote telnet server and proxy the session.
+    async fn gateway_telnet(&mut self) -> Result<(), std::io::Error> {
+        let cfg = config::get_config();
+        let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("TELNET GATEWAY")))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line("  Connect to a remote telnet server.")
+            .await?;
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
+        self.send_line(&format!(
+            "  Press {} at any prompt to cancel.",
+            self.cyan(esc_label)
+        ))
+        .await?;
+        self.send_line("").await?;
+
+        // Gather host and port
+        let get_host_port = async {
+            self.send(&format!("  {} ", self.cyan("Host:")))
+                .await?;
+            self.flush().await?;
+            let host = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(None),
+            };
+
+            self.send(&format!("  {} ", self.cyan("Port (23):")))
+                .await?;
+            self.flush().await?;
+            let port: u16 = match self.get_line_input().await? {
+                Some(s) if s.is_empty() => 23,
+                Some(s) => match s.parse::<u16>() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        self.show_error("Invalid port number.").await?;
+                        return Ok(None);
+                    }
+                },
+                None => return Ok(None),
+            };
+
+            Ok::<Option<(String, u16)>, std::io::Error>(Some((host, port)))
+        };
+
+        let (host, port) = if idle_timeout.is_zero() {
+            match get_host_port.await {
+                Ok(Some(hp)) => hp,
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        } else {
+            match tokio::time::timeout(idle_timeout, get_host_port).await {
+                Ok(Ok(Some(hp))) => hp,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let _ = self
+                        .send_line("\r\nDisconnected: idle timeout.")
+                        .await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout in telnet gateway prompts",
+                    ));
+                }
+            }
+        };
+
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Connecting to {}:{}...",
+            self.amber(&host),
+            port
+        ))
+        .await?;
+        self.flush().await?;
+
+        // Connect to remote telnet server
+        let addr = format!("{}:{}", host, port);
+        let remote = match tokio::time::timeout(
+            Self::GATEWAY_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                self.show_error(&format!("Connection failed: {}", e))
+                    .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                self.show_error("Connection timed out.").await?;
+                return Ok(());
+            }
+        };
+        let _ = remote.set_nodelay(true);
+
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
+        self.send_line(&format!(
+            "  {}",
+            self.green("Connected.")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Press {} twice to disconnect.",
+            self.cyan(esc_label)
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.flush().await?;
+
+        // Proxy I/O between local telnet client and remote telnet server
+        let (mut remote_reader, mut remote_writer) = remote.into_split();
+
+        let reader = &mut self.reader;
+        let writer = &self.writer;
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+        let is_ascii = self.terminal_type == TerminalType::Ascii;
+
+        let mut remote_buf = [0u8; 4096];
+        let mut filter_buf: Vec<u8> = Vec::new();
+        let mut ansi_state: u8 = 0;
+        let mut last_was_esc = false;
+
+        loop {
+            tokio::select! {
+                byte = read_byte_iac_filtered(reader, true) => {
+                    match byte {
+                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
+                            if last_was_esc {
+                                break; // Two consecutive ESC presses — disconnect
+                            }
+                            last_was_esc = true;
+                        }
+                        Ok(Some(b)) => {
+                            last_was_esc = false;
+                            if remote_writer.write_all(&[b]).await.is_err() { break; }
+                            if remote_writer.flush().await.is_err() { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                n = remote_reader.read(&mut remote_buf) => {
+                    match n {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let data = if is_petscii || is_ascii {
+                                filter_buf.clear();
+                                filter_gateway_output(&remote_buf[..n], &mut ansi_state, is_petscii, &mut filter_buf);
+                                &filter_buf[..]
+                            } else {
+                                &remote_buf[..n]
+                            };
+                            if !data.is_empty() {
+                                let mut w = writer.lock().await;
+                                if w.write_all(data).await.is_err() { break; }
+                                if w.flush().await.is_err() { break; }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        // Clean up
+        let _ = remote_writer.shutdown().await;
 
         self.send_line("").await?;
         self.send_line(&format!(
@@ -4993,30 +5134,6 @@ mod tests {
         assert!(last_cr);
     }
 
-    // ─── Gateway menu ────────────────────────────────────
-
-    #[test]
-    fn test_gateway_menu_path() {
-        assert_eq!(Menu::Gateway.path(), "xmodem/gw");
-    }
-
-    #[test]
-    fn test_gateway_menu_items_fit_petscii() {
-        let items = [
-            "  S=Connect to SSH server",
-            "  Press S, R, Q, or H.",
-        ];
-        for item in &items {
-            assert!(
-                item.len() <= PETSCII_WIDTH,
-                "item '{}' is {} chars, exceeds {}",
-                item,
-                item.len(),
-                PETSCII_WIDTH,
-            );
-        }
-    }
-
     // ─── Screen layout constraints ───────────────────────
 
     /// All user-facing error messages must fit in PETSCII width (40 cols).
@@ -5025,7 +5142,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A,B,F,G,T,W,X, or H.",
+            "Press A,B,F,R,S,T,W,X, or H.",
             "Press U, D, X, C, I, R, Q, or H.",
             "Disk space is low. Uploads disabled.",
             "File already exists.",
@@ -5088,8 +5205,9 @@ mod tests {
             "  A  AI Chat",
             "  B  Simple Browser",
             "  F  File Transfer",
-            "  G  SSH Gateway",
-            "  T  Troubleshooting",
+            "  R  Troubleshooting",
+            "  S  SSH Gateway",
+            "  T  Telnet Gateway",
             "  W  Weather",
             "  X  Exit",
             // File transfer menu
@@ -5097,8 +5215,6 @@ mod tests {
             "  D  Download a file",
             "  X  Delete a file",
             "  C  Change directory",
-            // Gateway menu
-            "  S  Connect to SSH server",
             // Navigation footers
             "  R=Refresh Q=Back H=Help",
             // Auth prompts
@@ -5120,11 +5236,11 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 7 items + blank + help + prompt = 13 rows.
+    /// Main menu screen: header(3) + blank + 8 items + blank + help + prompt = 14 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, G, T, W, X, blank, H=Help = 13 lines
-        let rows = 13;
+        // sep, title, sep, blank, A, B, F, R, S, T, W, X, blank, H=Help = 14 lines
+        let rows = 14;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
@@ -5164,13 +5280,6 @@ mod tests {
             "AI answer screen is {} rows, exceeds 22",
             total,
         );
-    }
-
-    /// Gateway menu: header(3) + blank + 1 item + blank + footer = 7 rows.
-    #[test]
-    fn test_gateway_menu_row_count() {
-        let rows = 3 + 1 + 1 + 1 + 1; // 7
-        assert!(rows <= 22, "gateway menu is {} rows, exceeds 22", rows);
     }
 
     /// Auth screen: header(3) + blank + up to 3 attempts * 4 lines = 15 rows max.
