@@ -111,8 +111,10 @@ enabled), the main menu offers:
   A  AI Chat
   B  Simple Browser
   F  File Transfer
-  G  SSH Gateway
-  T  Troubleshooting
+  M  Modem Emulator
+  R  Troubleshooting
+  S  SSH Gateway
+  T  Telnet Gateway
   W  Weather
   X  Exit
 ```
@@ -149,6 +151,15 @@ browser_homepage =
 
 # Enable verbose XMODEM protocol logging to stderr
 verbose = false
+
+# Serial modem emulation (Hayes AT commands)
+serial_enabled = false
+serial_port =
+serial_baud = 9600
+serial_databits = 8
+serial_parity = none
+serial_stopbits = 1
+serial_flowcontrol = none
 ```
 
 ### Setting Up Authentication
@@ -255,7 +266,7 @@ The SSH Gateway allows you to connect through the server to a remote SSH host.
 This is useful for accessing SSH servers from terminals that only support telnet
 (such as a Commodore 64).
 
-1. From the main menu, press **G** (SSH Gateway)
+1. From the main menu, press **S** (SSH Gateway)
 2. Press **S** to start a connection
 3. Enter the remote host, port (default 22), username, and password
 4. Once connected, you have a full interactive shell on the remote server
@@ -270,6 +281,57 @@ For PETSCII and ASCII terminals, ANSI escape sequences from the remote host are
 automatically stripped, and text is converted to the appropriate encoding. ANSI
 terminals receive the raw output unmodified. The PTY size is set to 40x25 for
 PETSCII and 80x24 for ANSI/ASCII terminals.
+
+## Telnet Gateway
+
+The Telnet Gateway connects through the server to a remote telnet host. This is
+useful for accessing BBS systems or other telnet services from retro terminals.
+
+1. From the main menu, press **T** (Telnet Gateway)
+2. Enter the remote host and port (default 23)
+3. Once connected, all input and output is proxied between your terminal and the
+   remote server
+4. Press **Ctrl+]** to disconnect
+
+For PETSCII and ASCII terminals, ANSI escape sequences from the remote host are
+automatically filtered.
+
+## Modem Emulator
+
+The modem emulator provides Hayes AT command emulation on a physical serial
+port. This allows retro hardware (Commodore 64, CP/M machines, etc.) to connect
+to the gateway and to remote telnet hosts using a serial connection and standard
+modem commands.
+
+### Setting Up
+
+1. From the main menu on a telnet session, press **M** (Modem Emulator)
+2. Press **E** to enable the emulator
+3. Press **P** to select a serial port (auto-detected)
+4. Configure baud rate, data bits, parity, stop bits, and flow control as needed
+5. Press **Q** to apply -- settings take effect immediately (no restart needed)
+
+Or edit `xmodem.conf` directly and restart the server.
+
+### Supported AT Commands
+
+| Command | Action |
+|---------|--------|
+| `AT`    | OK (attention) |
+| `ATZ`   | Reset modem |
+| `ATE0` / `ATE1` | Echo off / on |
+| `ATI`   | Show modem identification |
+| `ATH`   | Hang up |
+| `ATDT xmodem-gateway` | Connect to this gateway's menus |
+| `ATDT host:port` | Dial a remote telnet host |
+| `+++`   | Return to command mode (with 1-second guard time) |
+
+### Serial Safety
+
+When changing serial port parameters from a serial session, the server asks
+for confirmation. If there is no response within 60 seconds (e.g., because the
+terminal settings no longer match), the settings are automatically reverted.
+This prevents lockout when accidentally misconfiguring the serial port.
 
 ## Web Browser
 

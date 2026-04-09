@@ -480,11 +480,11 @@ struct WeatherData {
 }
 
 // ─── SharedWriter ───────────────────────────────────────────
-type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>;
+pub(crate) type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>;
 
 // ─── TelnetSession ──────────────────────────────────────────
 
-struct TelnetSession {
+pub(crate) struct TelnetSession {
     reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     writer: SharedWriter,
     shutdown: Arc<AtomicBool>,
@@ -503,12 +503,43 @@ struct TelnetSession {
     web_title: Option<String>,
     web_forms: Vec<crate::webbrowser::WebForm>,
     weather_zip: String,
+    is_serial: bool,
 }
 
 impl TelnetSession {
     const TRANSFER_PAGE_SIZE: usize = 10;
     const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
     const MAX_FILENAME_LEN: usize = 64;
+
+    /// Create a session for a serial modem connection.  Uses ASCII terminal
+    /// (no color, no IAC), skips terminal detection and authentication.
+    pub(crate) fn new_serial(
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: SharedWriter,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            shutdown,
+            current_menu: Menu::Main,
+            terminal_type: TerminalType::Ascii,
+            erase_char: 0x7F,
+            lockouts: Arc::new(Mutex::new(HashMap::new())),
+            peer_addr: None,
+            transfer_subdir: String::new(),
+            xmodem_iac: false,
+            web_lines: Vec::new(),
+            web_scroll: 0,
+            web_links: Vec::new(),
+            web_history: Vec::new(),
+            web_url: None,
+            web_title: None,
+            web_forms: Vec::new(),
+            weather_zip: config::get_config().weather_zip,
+            is_serial: true,
+        }
+    }
 
     // ─── Color helpers ─────────────────────────────────────
 
@@ -927,6 +958,28 @@ impl TelnetSession {
         Ok(())
     }
 
+    /// Show a full-screen help page with a header and wait for a keypress.
+    async fn show_help_page(
+        &mut self,
+        title: &str,
+        lines: &[&str],
+    ) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow(title))).await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        for line in lines {
+            self.send_line(line).await?;
+        }
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
     // ─── Terminal detection ─────────────────────────────────
 
     async fn detect_terminal_type(&mut self) -> Result<(), std::io::Error> {
@@ -1186,14 +1239,17 @@ impl TelnetSession {
 
     // ─── Main session loop ──────────────────────────────────
 
-    async fn run(&mut self) -> Result<(), std::io::Error> {
-        self.detect_terminal_type().await?;
-
+    pub(crate) async fn run(&mut self) -> Result<(), std::io::Error> {
         let cfg = config::get_config();
-        if cfg.security_enabled
-            && !self.authenticate().await?
-        {
-            return Ok(());
+
+        if !self.is_serial {
+            self.detect_terminal_type().await?;
+
+            if cfg.security_enabled
+                && !self.authenticate().await?
+            {
+                return Ok(());
+            }
         }
 
         let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
@@ -1303,6 +1359,11 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
+            "  {}  Modem Emulator",
+            self.cyan("M")
+        ))
+        .await?;
+        self.send_line(&format!(
             "  {}  Troubleshooting",
             self.cyan("R")
         ))
@@ -1333,19 +1394,21 @@ impl TelnetSession {
     async fn handle_main_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
         match input {
             "h" => {
-                self.show_error_lines(&[
-                    "A = AI Chat: ask questions to an AI",
-                    "B = Browser: browse the web",
-                    "F = File Transfer: upload/download",
-                    "    files using the XMODEM protocol",
-                    "R = Troubleshooting: diagnose",
-                    "    terminal input issues",
-                    "S = SSH Gateway: connect to a",
-                    "    remote server via SSH",
-                    "T = Telnet Gateway: connect to a",
-                    "    remote server via telnet",
-                    "W = Weather: check weather by zip",
-                    "X = Exit: disconnect from the server",
+                self.show_help_page("HELP", &[
+                    "  A  AI Chat: ask questions to an AI",
+                    "  B  Browser: browse the web",
+                    "  F  File Transfer: upload/download",
+                    "     files using the XMODEM protocol",
+                    "  M  Modem Emulator: configure the",
+                    "     serial port for modem emulation",
+                    "  R  Troubleshooting: diagnose",
+                    "     terminal input issues",
+                    "  S  SSH Gateway: connect to a",
+                    "     remote server via SSH",
+                    "  T  Telnet Gateway: connect to a",
+                    "     remote server via telnet",
+                    "  W  Weather: check weather by zip",
+                    "  X  Exit: disconnect from server",
                 ]).await?;
             }
             "r" => {
@@ -1378,6 +1441,9 @@ impl TelnetSession {
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
+            "m" => {
+                self.modem_settings().await?;
+            }
             "s" => {
                 self.gateway_ssh().await?;
             }
@@ -1391,7 +1457,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A,B,F,R,S,T,W,X, or H.").await?;
+                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -1485,15 +1551,15 @@ impl TelnetSession {
                 self.current_menu = Menu::Main;
             }
             "h" => {
-                self.show_error_lines(&[
-                    "U = Upload a file to the server",
-                    "D = Download a file from the server",
-                    "X = Delete a file on the server",
-                    "C = Change to a subdirectory",
-                    "I = Toggle IAC escaping for binary",
-                    "    file transfers over telnet",
-                    "R = Refresh the screen",
-                    "Q = Back to the main menu",
+                self.show_help_page("FILE TRANSFER HELP", &[
+                    "  U  Upload a file to the server",
+                    "  D  Download a file from server",
+                    "  X  Delete a file on the server",
+                    "  C  Change to a subdirectory",
+                    "  I  Toggle IAC escaping for",
+                    "     binary file transfers",
+                    "  R  Refresh the screen",
+                    "  Q  Back to the main menu",
                 ]).await?;
             }
             "r" => {} // Refresh — just re-render
@@ -1900,12 +1966,12 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 "h" => {
-                    self.show_error_lines(&[
-                        "#  = Enter file number to download",
-                        "P  = Previous page of files",
-                        "N  = Next page of files",
-                        "Q  = Back to file transfer menu",
-                        "ESC= Return to main menu",
+                    self.show_help_page("DOWNLOAD HELP", &[
+                        "  #    Enter file number to download",
+                        "  P    Previous page of files",
+                        "  N    Next page of files",
+                        "  Q    Back to file transfer menu",
+                        "  ESC  Return to main menu",
                     ]).await?;
                 }
                 other => {
@@ -2139,12 +2205,12 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 "h" => {
-                    self.show_error_lines(&[
-                        "#  = Enter file number to delete",
-                        "P  = Previous page of files",
-                        "N  = Next page of files",
-                        "Q  = Back to file transfer menu",
-                        "ESC= Return to main menu",
+                    self.show_help_page("DELETE HELP", &[
+                        "  #    Enter file number to delete",
+                        "  P    Previous page of files",
+                        "  N    Next page of files",
+                        "  Q    Back to file transfer menu",
+                        "  ESC  Return to main menu",
                     ]).await?;
                 }
                 other => {
@@ -2689,6 +2755,7 @@ impl TelnetSession {
         let mut ansi_state: u8 = 0;
         let mut last_cr = false;
         let mut last_was_esc = false;
+        let esc_byte: u8 = if is_petscii { 0x5F } else { 0x1B };
 
         loop {
             tokio::select! {
@@ -2701,7 +2768,13 @@ impl TelnetSession {
                             last_was_esc = true;
                         }
                         Ok(Some(b)) => {
-                            last_was_esc = false;
+                            // Forward the previously held ESC before this byte
+                            if last_was_esc {
+                                last_was_esc = false;
+                                let e = if is_petscii { petscii_to_ascii_byte(esc_byte) } else { esc_byte };
+                                if let Some(e) = normalize_gateway_input(e, &mut last_cr)
+                                    && ssh_writer.write_all(&[e]).await.is_err() { break; }
+                            }
                             let b = if is_petscii { petscii_to_ascii_byte(b) } else { b };
                             let b = if b == erase_char && erase_char != 0x7F { 0x7F } else { b };
                             if let Some(b) = normalize_gateway_input(b, &mut last_cr) {
@@ -2773,6 +2846,10 @@ impl TelnetSession {
     async fn gateway_telnet(&mut self) -> Result<(), std::io::Error> {
         let cfg = config::get_config();
         let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
 
         self.clear_screen().await?;
         let sep = self.separator();
@@ -2783,10 +2860,6 @@ impl TelnetSession {
         self.send_line("").await?;
         self.send_line("  Connect to a remote telnet server.")
             .await?;
-        let esc_label = match self.terminal_type {
-            TerminalType::Petscii => "<-",
-            _ => "ESC",
-        };
         self.send_line(&format!(
             "  Press {} at any prompt to cancel.",
             self.cyan(esc_label)
@@ -2875,10 +2948,6 @@ impl TelnetSession {
         };
         let _ = remote.set_nodelay(true);
 
-        let esc_label = match self.terminal_type {
-            TerminalType::Petscii => "<-",
-            _ => "ESC",
-        };
         self.send_line(&format!(
             "  {}",
             self.green("Connected.")
@@ -2904,6 +2973,7 @@ impl TelnetSession {
         let mut filter_buf: Vec<u8> = Vec::new();
         let mut ansi_state: u8 = 0;
         let mut last_was_esc = false;
+        let esc_byte: u8 = if is_petscii { 0x5F } else { 0x1B };
 
         loop {
             tokio::select! {
@@ -2916,7 +2986,11 @@ impl TelnetSession {
                             last_was_esc = true;
                         }
                         Ok(Some(b)) => {
-                            last_was_esc = false;
+                            // Forward the previously held ESC before this byte
+                            if last_was_esc {
+                                last_was_esc = false;
+                                if remote_writer.write_all(&[esc_byte]).await.is_err() { break; }
+                            }
                             if remote_writer.write_all(&[b]).await.is_err() { break; }
                             if remote_writer.flush().await.is_err() { break; }
                         }
@@ -3149,13 +3223,13 @@ impl TelnetSession {
                 'p' if has_prev => { scroll = scroll.saturating_sub(page_h); }
                 'q' => { return Ok(None); }
                 'h' => {
-                    self.show_error_lines(&[
-                        "P  = Previous page of answer",
-                        "N  = Next page of answer",
-                        "Q  = Done, return to main menu",
+                    self.show_help_page("AI CHAT HELP", &[
+                        "  P    Previous page of answer",
+                        "  N    Next page of answer",
+                        "  Q    Done, return to main menu",
                         "",
-                        "Or type a new question and",
-                        "press Enter to ask again.",
+                        "  Or type a new question and",
+                        "  press Enter to ask again.",
                     ]).await?;
                 }
                 _ => {
@@ -3489,6 +3563,585 @@ impl TelnetSession {
         Ok(())
     }
 
+    // ─── MODEM EMULATOR ──────────────────────────────────────
+
+    async fn modem_settings(&mut self) -> Result<(), std::io::Error> {
+        // Snapshot current config so we can detect changes and revert if needed.
+        let original_cfg = config::get_config();
+
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("MODEM EMULATOR")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            let cfg = config::get_config();
+            let status = if cfg.serial_enabled {
+                self.green("ENABLED")
+            } else {
+                self.red("Disabled")
+            };
+            self.send_line(&format!("  Status: {}", status)).await?;
+            let port_display = if cfg.serial_port.is_empty() {
+                "(not set)".to_string()
+            } else {
+                cfg.serial_port.clone()
+            };
+            self.send_line(&format!(
+                "  Port:   {}",
+                self.amber(&port_display)
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Baud:   {}",
+                self.amber(&cfg.serial_baud.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Data:   {}",
+                self.amber(&format!(
+                    "{}-{}-{}",
+                    cfg.serial_databits,
+                    cfg.serial_parity.chars().next().unwrap_or('N').to_uppercase(),
+                    cfg.serial_stopbits
+                ))
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Flow:   {}",
+                self.amber(&cfg.serial_flowcontrol)
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  Toggle enabled/disabled",
+                self.cyan("E")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Select serial port",
+                self.cyan("P")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set baud rate",
+                self.cyan("B")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set data/parity/stop",
+                self.cyan("D")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set flow control",
+                self.cyan("F")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/modem"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    self.modem_apply_settings(&original_cfg).await?;
+                    return Ok(());
+                }
+            };
+
+            match input.as_str() {
+                "e" => {
+                    let new_val = if cfg.serial_enabled { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("serial_enabled", &v);
+                    })
+                    .await
+                    .ok();
+                }
+                "p" => {
+                    self.modem_select_port().await?;
+                }
+                "b" => {
+                    self.modem_set_baud().await?;
+                }
+                "d" => {
+                    self.modem_set_data_params().await?;
+                }
+                "f" => {
+                    self.modem_set_flow().await?;
+                }
+                "h" => {
+                    self.modem_show_help().await?;
+                }
+                "q" => {
+                    self.modem_apply_settings(&original_cfg).await?;
+                    return Ok(());
+                }
+                _ => {
+                    self.show_error("Press E, P, B, D, F, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    /// Apply modem settings changes.  For serial users, ask for
+    /// acknowledgement and revert if no response within 60 seconds.
+    async fn modem_apply_settings(
+        &mut self,
+        original_cfg: &config::Config,
+    ) -> Result<(), std::io::Error> {
+        let new_cfg = config::get_config();
+        let changed = new_cfg.serial_enabled != original_cfg.serial_enabled
+            || new_cfg.serial_port != original_cfg.serial_port
+            || new_cfg.serial_baud != original_cfg.serial_baud
+            || new_cfg.serial_databits != original_cfg.serial_databits
+            || new_cfg.serial_parity != original_cfg.serial_parity
+            || new_cfg.serial_stopbits != original_cfg.serial_stopbits
+            || new_cfg.serial_flowcontrol != original_cfg.serial_flowcontrol;
+
+        if !changed {
+            return Ok(());
+        }
+
+        crate::serial::restart_serial();
+
+        if !self.is_serial {
+            return Ok(());
+        }
+
+        // Serial user: ask for acknowledgement.  If they changed port
+        // parameters their terminal may need to be reconfigured to match.
+        // I/O errors during the prompt are non-fatal — we still need to
+        // reach the revert logic if the user doesn't respond.
+        let _ = self.send_line("").await;
+        let _ = self.send_line(&format!(
+            "  {}",
+            self.yellow("Settings changed. Adjust your")
+        )).await;
+        let _ = self.send_line(&format!(
+            "  {}",
+            self.yellow("terminal to match, then press")
+        )).await;
+        let _ = self.send_line(&format!(
+            "  {}",
+            self.yellow("any key to confirm.")
+        )).await;
+        let _ = self.send_line("").await;
+        let _ = self.flush().await;
+
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(60);
+        let mut next_remind = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(5);
+
+        loop {
+            let wait_until = std::cmp::min(next_remind, deadline);
+            let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
+
+            match tokio::time::timeout(remaining, self.read_byte_filtered()).await {
+                Ok(Ok(Some(_))) => {
+                    // Acknowledged
+                    let _ = self.send_line("").await;
+                    let _ = self.send_line(&format!(
+                        "  {}",
+                        self.green("Settings confirmed.")
+                    )).await;
+                    let _ = self.send_line("").await;
+                    let _ = self.send("  Press any key to continue.").await;
+                    let _ = self.flush().await;
+                    let _ = self.wait_for_key().await;
+                    return Ok(());
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    // Connection lost — revert
+                    break;
+                }
+                Err(_) => {
+                    // Timeout interval
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let secs_left = deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_secs();
+                    let _ = self.send_line(&format!(
+                        "  Press any key to confirm. ({}s left)",
+                        secs_left
+                    )).await;
+                    let _ = self.flush().await;
+                    next_remind += tokio::time::Duration::from_secs(5);
+                }
+            }
+        }
+
+        // No acknowledgement — revert
+        let _ = self.send_line("").await;
+        let _ = self.send_line(&format!(
+            "  {}",
+            self.red("No response. Reverting settings.")
+        )).await;
+        let _ = self.flush().await;
+
+        Self::revert_serial_config(original_cfg).await;
+        crate::serial::restart_serial();
+        Ok(())
+    }
+
+    /// Revert serial config to a previous snapshot using a single batch write.
+    async fn revert_serial_config(cfg: &config::Config) {
+        let oc = cfg.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            config::update_config_values(&[
+                ("serial_enabled", if oc.serial_enabled { "true" } else { "false" }),
+                ("serial_port", &oc.serial_port),
+                ("serial_baud", &oc.serial_baud.to_string()),
+                ("serial_databits", &oc.serial_databits.to_string()),
+                ("serial_parity", &oc.serial_parity),
+                ("serial_stopbits", &oc.serial_stopbits.to_string()),
+                ("serial_flowcontrol", &oc.serial_flowcontrol),
+            ]);
+        })
+        .await;
+    }
+
+    async fn modem_select_port(&mut self) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line(&format!("  {}...", self.dim("Detecting ports"))).await?;
+        self.flush().await?;
+
+        let ports = tokio::task::spawn_blocking(crate::serial::list_serial_ports)
+            .await
+            .unwrap_or_default();
+
+        if ports.is_empty() {
+            self.show_error("No serial ports detected.").await?;
+            return Ok(());
+        }
+
+        // Redraw with port list
+        self.clear_screen().await?;
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        let max_w = if self.terminal_type == TerminalType::Petscii {
+            30
+        } else {
+            50
+        };
+        for (i, port) in ports.iter().enumerate() {
+            self.send_line(&format!(
+                "  {:>2}. {}",
+                i + 1,
+                truncate_to_width(port, max_w)
+            ))
+            .await?;
+        }
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.dim("Enter # or type a port path.")
+        )).await?;
+        self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+        self.send(&format!("  {} ", self.cyan("Port:"))).await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if input == "q" {
+            return Ok(());
+        }
+
+        if let Ok(idx) = input.parse::<usize>() {
+            if idx >= 1 && idx <= ports.len() {
+                let port_name = ports[idx - 1].clone();
+                tokio::task::spawn_blocking(move || {
+                    config::update_config_value("serial_port", &port_name);
+                })
+                .await
+                .ok();
+            } else {
+                self.show_error("Invalid selection.").await?;
+            }
+        } else {
+            // Allow typing a port path directly
+            let port_name = input;
+            tokio::task::spawn_blocking(move || {
+                config::update_config_value("serial_port", &port_name);
+            })
+            .await
+            .ok();
+        }
+        Ok(())
+    }
+
+    async fn modem_set_baud(&mut self) -> Result<(), std::io::Error> {
+        let bauds = [
+            "300", "1200", "2400", "4800", "9600", "19200", "38400",
+            "57600", "115200",
+        ];
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("BAUD RATE"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            for (i, b) in bauds.iter().enumerate() {
+                self.send_line(&format!(
+                    "  {}  {}",
+                    self.cyan(&(i + 1).to_string()),
+                    b
+                ))
+                .await?;
+            }
+            self.send_line("").await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            let prompt = format!("{}> ", self.cyan("baud"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(true).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "q" => return Ok(()),
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                    let idx = input.parse::<usize>().unwrap() - 1;
+                    let baud_str = bauds[idx].to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("serial_baud", &baud_str);
+                    })
+                    .await
+                    .ok();
+                    return Ok(());
+                }
+                _ => {
+                    self.show_error("Press 1-9 or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn modem_set_data_params(&mut self) -> Result<(), std::io::Error> {
+        // Data bits
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("DATA BITS"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}  5 bits", self.cyan("5"))).await?;
+            self.send_line(&format!("  {}  6 bits", self.cyan("6"))).await?;
+            self.send_line(&format!("  {}  7 bits", self.cyan("7"))).await?;
+            self.send_line(&format!("  {}  8 bits", self.cyan("8"))).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            let prompt = format!("{}> ", self.cyan("data"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(true).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "q" => return Ok(()),
+                "5" | "6" | "7" | "8" => {
+                    let v = input.clone();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("serial_databits", &v);
+                    })
+                    .await
+                    .ok();
+                    break;
+                }
+                _ => {
+                    self.show_error("Press 5-8 or Q.").await?;
+                }
+            }
+        }
+
+        // Parity
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("PARITY"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}  None", self.cyan("1"))).await?;
+            self.send_line(&format!("  {}  Odd", self.cyan("2"))).await?;
+            self.send_line(&format!("  {}  Even", self.cyan("3"))).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            let prompt = format!("{}> ", self.cyan("parity"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(true).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            let parity = match input.as_str() {
+                "1" => "none",
+                "2" => "odd",
+                "3" => "even",
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press 1-3 or Q.").await?;
+                    continue;
+                }
+            };
+            let p = parity.to_string();
+            tokio::task::spawn_blocking(move || {
+                config::update_config_value("serial_parity", &p);
+            })
+            .await
+            .ok();
+            break;
+        }
+
+        // Stop bits
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("STOP BITS"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}  1 stop bit", self.cyan("1"))).await?;
+            self.send_line(&format!("  {}  2 stop bits", self.cyan("2"))).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            let prompt = format!("{}> ", self.cyan("stop"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(true).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "q" => return Ok(()),
+                "1" | "2" => {
+                    let v = input.clone();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("serial_stopbits", &v);
+                    })
+                    .await
+                    .ok();
+                    return Ok(());
+                }
+                _ => {
+                    self.show_error("Press 1-2 or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn modem_set_flow(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("FLOW CONTROL"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}  None", self.cyan("1"))).await?;
+            self.send_line(&format!("  {}  Hardware (RTS/CTS)", self.cyan("2"))).await?;
+            self.send_line(&format!("  {}  Software (XON/XOFF)", self.cyan("3"))).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            let prompt = format!("{}> ", self.cyan("flow"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(true).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            let flow = match input.as_str() {
+                "1" => "none",
+                "2" => "hardware",
+                "3" => "software",
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press 1-3 or Q.").await?;
+                    continue;
+                }
+            };
+            let f = flow.to_string();
+            tokio::task::spawn_blocking(move || {
+                config::update_config_value("serial_flowcontrol", &f);
+            })
+            .await
+            .ok();
+            return Ok(());
+        }
+    }
+
+    async fn modem_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  This server emulates a Hayes-",
+                "  compatible modem on the serial",
+                "  port. Connect your retro",
+                "  hardware and use AT commands:",
+                "",
+                "  ATDT xmodem-gateway",
+                "    Connect to this gateway",
+                "  ATDT host:port",
+                "    Dial a remote telnet host",
+                "  +++  Return to command mode",
+                "  ATH  Hang up",
+            ]
+        } else {
+            &[
+                "  This server emulates a Hayes-compatible",
+                "  modem on the configured serial port.",
+                "  Connect retro hardware (Commodore 64,",
+                "  CP/M, etc.) and use AT commands:",
+                "",
+                "  ATDT xmodem-gateway",
+                "    Connect to this gateway's menus",
+                "  ATDT host:port",
+                "    Dial a remote telnet host",
+                "  +++    Return to command mode",
+                "  ATH    Hang up connection",
+            ]
+        };
+        self.show_help_page("MODEM EMULATOR HELP", lines).await
+    }
+
     // ─── TROUBLESHOOTING ────────────────────────────────────
 
     async fn troubleshooting(&mut self) -> Result<(), std::io::Error> {
@@ -3637,12 +4290,6 @@ impl TelnetSession {
             self.send_line(&format!("  {}", self.yellow("WEB BROWSER"))).await?;
             self.send_line(&sep).await?;
             self.send_line("").await?;
-            self.send_line(&format!("  {}  {}  {}",
-                self.action_prompt("G", "Go/Search"),
-                self.action_prompt("K", "Bookmarks"),
-                self.action_prompt("H", "Help"),
-            )).await?;
-            self.send_line("").await?;
             self.send_line(&format!("  {}", self.dim("Try:"))).await?;
             self.send_line(&format!("  {}",
                 self.dim("  http://telnetbible.com")
@@ -3651,8 +4298,12 @@ impl TelnetSession {
                 self.dim("  gopher://gopher.floodgap.com")
             )).await?;
             self.send_line("").await?;
-            let footer = self.nav_footer();
-            self.send_line(&footer).await?;
+            self.send_line(&format!("  {} {} {} {}",
+                self.action_prompt("G", "Go/Search"),
+                self.action_prompt("K", "Bookmarks"),
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help"),
+            )).await?;
         } else {
             // Page view — show title + paginated content
             let title_display = match &self.web_title {
@@ -4066,10 +4717,10 @@ impl TelnetSession {
         };
 
         if input == "h" {
-            self.show_error_lines(&[
-                "#  = Enter bookmark number to open",
-                "D  = Delete a bookmark by number",
-                "ESC= Cancel and go back",
+            self.show_help_page("BOOKMARKS HELP", &[
+                "  #    Enter bookmark number to open",
+                "  D    Delete a bookmark by number",
+                "  ESC  Cancel and go back",
             ]).await?;
         } else if input == "d" {
             // Delete mode
@@ -4260,11 +4911,11 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 "h" => {
-                    self.show_error_lines(&[
-                        "#  = Enter a field number to edit",
-                        "     its value",
-                        "S  = Submit the form",
-                        "Q  = Cancel and go back",
+                    self.show_help_page("FORM HELP", &[
+                        "  #    Enter a field number to",
+                        "       edit its value",
+                        "  S    Submit the form",
+                        "  Q    Cancel and go back",
                     ]).await?;
                 }
                 other => {
@@ -4518,6 +5169,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     web_title: None,
                                     web_forms: Vec::new(),
                                     weather_zip: config::get_config().weather_zip,
+                                    is_serial: false,
                                 };
                                 if let Err(e) = session.run().await {
                                     eprintln!("Telnet: session error from {}: {}", addr, e);
@@ -5142,7 +5794,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A,B,F,R,S,T,W,X, or H.",
+            "Press A, B, F, M, R, S, T, W, X, or H.",
             "Press U, D, X, C, I, R, Q, or H.",
             "Disk space is low. Uploads disabled.",
             "File already exists.",
@@ -5155,6 +5807,8 @@ mod tests {
             "Access denied.",
             "Enter a number or Q.",
             "Press S, R, Q, or H.",
+            "Press E, P, B, D, F, H, or Q.",
+            "No serial ports detected.",
             "Invalid port number.",
             "Connection timed out.",
             "Authentication failed.",
@@ -5205,11 +5859,18 @@ mod tests {
             "  A  AI Chat",
             "  B  Simple Browser",
             "  F  File Transfer",
+            "  M  Modem Emulator",
             "  R  Troubleshooting",
             "  S  SSH Gateway",
             "  T  Telnet Gateway",
             "  W  Weather",
             "  X  Exit",
+            // Modem emulator menu
+            "  E  Toggle enabled/disabled",
+            "  P  Select serial port",
+            "  B  Set baud rate",
+            "  D  Set data/parity/stop",
+            "  F  Set flow control",
             // File transfer menu
             "  U  Upload a file",
             "  D  Download a file",
@@ -5223,7 +5884,7 @@ mod tests {
             // AI chat
             "  Type a question, or Q to exit.",
             // Web browser
-            "  G=Go/Search  K=Bookmarks  H=Help",
+            "  G=Go/Search K=Bookmarks Q=Back H=Help",
         ];
         for item in &items {
             assert!(
@@ -5236,11 +5897,11 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 8 items + blank + help + prompt = 14 rows.
+    /// Main menu screen: header(3) + blank + 9 items + blank + help + prompt = 15 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, R, S, T, W, X, blank, H=Help = 14 lines
-        let rows = 14;
+        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15 lines
+        let rows = 15;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
@@ -5294,6 +5955,151 @@ mod tests {
             "auth screen is {} rows, exceeds 22",
             total,
         );
+    }
+
+    /// Modem emulator screen: header(3) + blank + 5 status lines + blank
+    /// + 5 menu items + blank + footer + prompt = 17 rows.
+    #[test]
+    fn test_modem_emulator_row_count() {
+        let rows = 3 + 1 + 5 + 1 + 5 + 1 + 1 + 1; // 18 (footer has 2 items on one line)
+        assert!(rows <= 22, "modem emulator is {} rows, exceeds 22", rows);
+    }
+
+    /// Baud rate screen: header(3) + blank + 9 options + blank + footer + prompt = 15.
+    #[test]
+    fn test_baud_screen_row_count() {
+        let rows = 3 + 1 + 9 + 1 + 1 + 1; // 16
+        assert!(rows <= 22, "baud screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Flow control screen: header(3) + blank + 3 options + blank + footer + prompt = 10.
+    #[test]
+    fn test_flow_control_screen_row_count() {
+        let rows = 3 + 1 + 3 + 1 + 1 + 1; // 10
+        assert!(rows <= 22, "flow control screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Data bits screen: header(3) + blank + 4 options + blank + footer + prompt = 11.
+    #[test]
+    fn test_data_bits_screen_row_count() {
+        let rows = 3 + 1 + 4 + 1 + 1 + 1; // 11
+        assert!(rows <= 22, "data bits screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Parity screen: header(3) + blank + 3 options + blank + footer + prompt = 10.
+    #[test]
+    fn test_parity_screen_row_count() {
+        let rows = 3 + 1 + 3 + 1 + 1 + 1; // 10
+        assert!(rows <= 22, "parity screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Stop bits screen: header(3) + blank + 2 options + blank + footer + prompt = 9.
+    #[test]
+    fn test_stop_bits_screen_row_count() {
+        let rows = 3 + 1 + 2 + 1 + 1 + 1; // 9
+        assert!(rows <= 22, "stop bits screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Modem help screen (ANSI): header(3) + blank + 11 content lines +
+    /// blank + "Press any key" = 16 rows.
+    #[test]
+    fn test_modem_help_screen_row_count() {
+        let rows = 3 + 1 + 11 + 1 + 1; // 17
+        assert!(rows <= 22, "modem help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Main help screen: header(3) + blank + 14 content lines +
+    /// blank + "Press any key" = 19 rows.
+    #[test]
+    fn test_main_help_screen_row_count() {
+        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// All help page content lines must fit PETSCII width (40 cols).
+    #[test]
+    fn test_help_lines_fit_petscii() {
+        let help_lines = [
+            // Main menu help
+            "  A  AI Chat: ask questions to an AI",
+            "  B  Browser: browse the web",
+            "  F  File Transfer: upload/download",
+            "     files using the XMODEM protocol",
+            "  M  Modem Emulator: configure the",
+            "     serial port for modem emulation",
+            "  R  Troubleshooting: diagnose",
+            "     terminal input issues",
+            "  S  SSH Gateway: connect to a",
+            "     remote server via SSH",
+            "  T  Telnet Gateway: connect to a",
+            "     remote server via telnet",
+            "  W  Weather: check weather by zip",
+            "  X  Exit: disconnect from server",
+            // File transfer help
+            "  U  Upload a file to the server",
+            "  D  Download a file from server",
+            "  X  Delete a file on the server",
+            "  C  Change to a subdirectory",
+            "  I  Toggle IAC escaping for",
+            "     binary file transfers",
+            "  R  Refresh the screen",
+            "  Q  Back to the main menu",
+            // Download / delete help
+            "  #    Enter file number to download",
+            "  #    Enter file number to delete",
+            "  P    Previous page of files",
+            "  N    Next page of files",
+            "  Q    Back to file transfer menu",
+            "  ESC  Return to main menu",
+            // AI chat help
+            "  P    Previous page of answer",
+            "  N    Next page of answer",
+            "  Q    Done, return to main menu",
+            // Bookmarks help
+            "  #    Enter bookmark number to open",
+            "  D    Delete a bookmark by number",
+            "  ESC  Cancel and go back",
+            // Form help
+            "  #    Enter a field number to",
+            "       edit its value",
+            "  S    Submit the form",
+            "  Q    Cancel and go back",
+        ];
+        for line in &help_lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "help line '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Modem help content lines must fit PETSCII width.
+    #[test]
+    fn test_modem_help_lines_fit_petscii() {
+        let lines = [
+            "  This server emulates a Hayes-",
+            "  compatible modem on the serial",
+            "  port. Connect your retro",
+            "  hardware and use AT commands:",
+            "  ATDT xmodem-gateway",
+            "    Connect to this gateway",
+            "  ATDT host:port",
+            "    Dial a remote telnet host",
+            "  +++  Return to command mode",
+            "  ATH  Hang up",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "modem help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
     }
 
     /// Separator width must match terminal type.
@@ -5498,7 +6304,7 @@ mod tests {
     fn test_web_browser_home_lines_fit_petscii() {
         let lines = [
             "  WEB BROWSER",
-            "  G=Go/Search  K=Bookmarks  H=Help",
+            "  G=Go/Search K=Bookmarks Q=Back H=Help",
         ];
         for line in &lines {
             assert!(
