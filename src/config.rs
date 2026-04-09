@@ -24,6 +24,13 @@ const DEFAULT_GROQ_API_KEY: &str = "";
 const DEFAULT_BROWSER_HOMEPAGE: &str = "";
 const DEFAULT_WEATHER_ZIP: &str = "";
 const DEFAULT_VERBOSE: bool = false;
+const DEFAULT_SERIAL_ENABLED: bool = false;
+const DEFAULT_SERIAL_PORT: &str = "";
+const DEFAULT_SERIAL_BAUD: u32 = 9600;
+const DEFAULT_SERIAL_DATABITS: u8 = 8;
+const DEFAULT_SERIAL_PARITY: &str = "none";
+const DEFAULT_SERIAL_STOPBITS: u8 = 1;
+const DEFAULT_SERIAL_FLOWCONTROL: &str = "none";
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone)]
@@ -43,6 +50,20 @@ pub struct Config {
     pub weather_zip: String,
     /// Enable verbose XMODEM protocol logging to stderr.
     pub verbose: bool,
+    /// Enable serial modem emulation.
+    pub serial_enabled: bool,
+    /// Serial port device (e.g. /dev/ttyUSB0, COM3). Empty = not configured.
+    pub serial_port: String,
+    /// Serial baud rate.
+    pub serial_baud: u32,
+    /// Serial data bits (5, 6, 7, or 8).
+    pub serial_databits: u8,
+    /// Serial parity: "none", "odd", or "even".
+    pub serial_parity: String,
+    /// Serial stop bits (1 or 2).
+    pub serial_stopbits: u8,
+    /// Serial flow control: "none", "hardware", or "software".
+    pub serial_flowcontrol: String,
 }
 
 impl Default for Config {
@@ -59,6 +80,13 @@ impl Default for Config {
             browser_homepage: DEFAULT_BROWSER_HOMEPAGE.into(),
             weather_zip: DEFAULT_WEATHER_ZIP.into(),
             verbose: DEFAULT_VERBOSE,
+            serial_enabled: DEFAULT_SERIAL_ENABLED,
+            serial_port: DEFAULT_SERIAL_PORT.into(),
+            serial_baud: DEFAULT_SERIAL_BAUD,
+            serial_databits: DEFAULT_SERIAL_DATABITS,
+            serial_parity: DEFAULT_SERIAL_PARITY.into(),
+            serial_stopbits: DEFAULT_SERIAL_STOPBITS,
+            serial_flowcontrol: DEFAULT_SERIAL_FLOWCONTROL.into(),
         }
     }
 }
@@ -161,6 +189,38 @@ fn read_config_file(path: &str) -> Config {
             .get("verbose")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(DEFAULT_VERBOSE),
+        serial_enabled: map
+            .get("serial_enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_SERIAL_ENABLED),
+        serial_port: map
+            .get("serial_port")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SERIAL_PORT.into()),
+        serial_baud: map
+            .get("serial_baud")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SERIAL_BAUD),
+        serial_databits: map
+            .get("serial_databits")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u8| matches!(v, 5..=8))
+            .unwrap_or(DEFAULT_SERIAL_DATABITS),
+        serial_parity: map
+            .get("serial_parity")
+            .filter(|v| matches!(v.as_str(), "none" | "odd" | "even"))
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SERIAL_PARITY.into()),
+        serial_stopbits: map
+            .get("serial_stopbits")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u8| v == 1 || v == 2)
+            .unwrap_or(DEFAULT_SERIAL_STOPBITS),
+        serial_flowcontrol: map
+            .get("serial_flowcontrol")
+            .filter(|v| matches!(v.as_str(), "none" | "hardware" | "software"))
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SERIAL_FLOWCONTROL.into()),
     }
 }
 
@@ -210,6 +270,21 @@ weather_zip = {}
 
 # Verbose logging: set to true for detailed XMODEM protocol diagnostics
 verbose = {}
+
+# Serial modem emulation (Hayes AT commands)
+# Set serial_enabled = true and configure the port to activate.
+serial_enabled = {}
+
+# Serial port device (e.g. /dev/ttyUSB0 on Linux, COM3 on Windows)
+# Leave empty if not configured. Use the Modem Emulator menu to detect ports.
+serial_port = {}
+
+# Serial port parameters
+serial_baud = {}
+serial_databits = {}
+serial_parity = {}
+serial_stopbits = {}
+serial_flowcontrol = {}
 ",
         cfg.telnet_port,
         cfg.security_enabled,
@@ -222,6 +297,13 @@ verbose = {}
         sanitize_value(&cfg.browser_homepage),
         sanitize_value(&cfg.weather_zip),
         cfg.verbose,
+        cfg.serial_enabled,
+        sanitize_value(&cfg.serial_port),
+        cfg.serial_baud,
+        cfg.serial_databits,
+        sanitize_value(&cfg.serial_parity),
+        cfg.serial_stopbits,
+        sanitize_value(&cfg.serial_flowcontrol),
     );
 
     // Write to a temporary file and rename into place to prevent partial
@@ -238,20 +320,57 @@ verbose = {}
 /// Reads the current file, updates the key, writes it back, and refreshes
 /// the global config so that subsequent `get_config()` calls see the change.
 pub fn update_config_value(key: &str, value: &str) {
+    update_config_values(&[(key, value)]);
+}
+
+/// Update multiple keys in a single read-modify-write cycle.
+pub fn update_config_values(pairs: &[(&str, &str)]) {
     let mut cfg = if Path::new(CONFIG_FILE).exists() {
         read_config_file(CONFIG_FILE)
     } else {
         Config::default()
     };
-    match key {
-        "weather_zip" => cfg.weather_zip = value.to_string(),
-        _ => return,
+    for &(key, value) in pairs {
+        apply_config_key(&mut cfg, key, value);
     }
     write_config_file(CONFIG_FILE, &cfg);
-
-    // Update the in-memory singleton so get_config() returns the new value.
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(cfg);
+}
+
+/// Apply a single key-value pair to a Config struct.
+fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
+    match key {
+        "weather_zip" => cfg.weather_zip = value.to_string(),
+        "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
+        "serial_port" => cfg.serial_port = value.to_string(),
+        "serial_baud" => {
+            if let Ok(v) = value.parse() {
+                cfg.serial_baud = v;
+            }
+        }
+        "serial_databits" => {
+            if let Ok(v) = value.parse::<u8>() && matches!(v, 5..=8) {
+                cfg.serial_databits = v;
+            }
+        }
+        "serial_parity" => {
+            if matches!(value, "none" | "odd" | "even") {
+                cfg.serial_parity = value.to_string();
+            }
+        }
+        "serial_stopbits" => {
+            if let Ok(v) = value.parse::<u8>() && (v == 1 || v == 2) {
+                cfg.serial_stopbits = v;
+            }
+        }
+        "serial_flowcontrol" => {
+            if matches!(value, "none" | "hardware" | "software") {
+                cfg.serial_flowcontrol = value.to_string();
+            }
+        }
+        _ => {}
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────
@@ -274,6 +393,13 @@ mod tests {
         assert_eq!(cfg.groq_api_key, "");
         assert_eq!(cfg.browser_homepage, "");
         assert_eq!(cfg.weather_zip, "");
+        assert!(!cfg.serial_enabled);
+        assert_eq!(cfg.serial_port, "");
+        assert_eq!(cfg.serial_baud, 9600);
+        assert_eq!(cfg.serial_databits, 8);
+        assert_eq!(cfg.serial_parity, "none");
+        assert_eq!(cfg.serial_stopbits, 1);
+        assert_eq!(cfg.serial_flowcontrol, "none");
     }
 
     #[test]
@@ -356,6 +482,13 @@ mod tests {
             browser_homepage: "https://example.com".into(),
             weather_zip: "90210".into(),
             verbose: true,
+            serial_enabled: true,
+            serial_port: "/dev/ttyUSB0".into(),
+            serial_baud: 115200,
+            serial_databits: 7,
+            serial_parity: "even".into(),
+            serial_stopbits: 2,
+            serial_flowcontrol: "hardware".into(),
         };
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());
@@ -371,6 +504,13 @@ mod tests {
         assert_eq!(loaded.browser_homepage, original.browser_homepage);
         assert_eq!(loaded.weather_zip, original.weather_zip);
         assert_eq!(loaded.verbose, original.verbose);
+        assert_eq!(loaded.serial_enabled, original.serial_enabled);
+        assert_eq!(loaded.serial_port, original.serial_port);
+        assert_eq!(loaded.serial_baud, original.serial_baud);
+        assert_eq!(loaded.serial_databits, original.serial_databits);
+        assert_eq!(loaded.serial_parity, original.serial_parity);
+        assert_eq!(loaded.serial_stopbits, original.serial_stopbits);
+        assert_eq!(loaded.serial_flowcontrol, original.serial_flowcontrol);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -415,5 +555,65 @@ mod tests {
         assert_eq!(cfg.transfer_dir, DEFAULT_TRANSFER_DIR);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_apply_config_key_serial_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "serial_enabled", "true");
+        assert!(cfg.serial_enabled);
+
+        apply_config_key(&mut cfg, "serial_enabled", "false");
+        assert!(!cfg.serial_enabled);
+
+        apply_config_key(&mut cfg, "serial_port", "/dev/ttyS0");
+        assert_eq!(cfg.serial_port, "/dev/ttyS0");
+
+        apply_config_key(&mut cfg, "serial_baud", "115200");
+        assert_eq!(cfg.serial_baud, 115200);
+
+        apply_config_key(&mut cfg, "serial_databits", "7");
+        assert_eq!(cfg.serial_databits, 7);
+
+        // Invalid databits should be ignored
+        apply_config_key(&mut cfg, "serial_databits", "9");
+        assert_eq!(cfg.serial_databits, 7);
+
+        apply_config_key(&mut cfg, "serial_parity", "even");
+        assert_eq!(cfg.serial_parity, "even");
+
+        // Invalid parity should be ignored
+        apply_config_key(&mut cfg, "serial_parity", "bogus");
+        assert_eq!(cfg.serial_parity, "even");
+
+        apply_config_key(&mut cfg, "serial_stopbits", "2");
+        assert_eq!(cfg.serial_stopbits, 2);
+
+        // Invalid stopbits should be ignored
+        apply_config_key(&mut cfg, "serial_stopbits", "3");
+        assert_eq!(cfg.serial_stopbits, 2);
+
+        apply_config_key(&mut cfg, "serial_flowcontrol", "hardware");
+        assert_eq!(cfg.serial_flowcontrol, "hardware");
+
+        // Invalid flow should be ignored
+        apply_config_key(&mut cfg, "serial_flowcontrol", "bogus");
+        assert_eq!(cfg.serial_flowcontrol, "hardware");
+    }
+
+    #[test]
+    fn test_apply_config_key_unknown_key_ignored() {
+        let mut cfg = Config::default();
+        let baud_before = cfg.serial_baud;
+        apply_config_key(&mut cfg, "nonexistent_key", "value");
+        assert_eq!(cfg.serial_baud, baud_before);
+    }
+
+    #[test]
+    fn test_apply_config_key_weather_zip() {
+        let mut cfg = Config::default();
+        apply_config_key(&mut cfg, "weather_zip", "90210");
+        assert_eq!(cfg.weather_zip, "90210");
     }
 }

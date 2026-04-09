@@ -1,6 +1,6 @@
 [package]
 name = "xmodem-gateway"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Ricky Bryce"]
 license = "GPL-3.0-or-later"
@@ -14,3 +14,4 @@ ureq = "3"
 serde_json = "1"
 html2text = "0.14"
 url = "2"
+serialport = "4"
