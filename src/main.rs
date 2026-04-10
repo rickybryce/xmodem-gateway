@@ -9,6 +9,7 @@
 mod aichat;
 mod config;
 mod serial;
+mod ssh;
 mod telnet;
 mod webbrowser;
 mod xmodem;
@@ -54,6 +55,7 @@ fn main() {
     let notify_rt = shutdown_notify.clone();
     runtime.block_on(async move {
         telnet::start_server(shutdown_rt.clone(), notify_rt.clone());
+        ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone());
         serial::start_serial(shutdown_rt.clone());
 
         // Wait for shutdown signal

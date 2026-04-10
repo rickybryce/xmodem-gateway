@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_plus_escape_with_guard_time() {
-        let mut s = PlusState::new();
+        let s = PlusState::new();
         let (mut last, mut count, mut start) = s.as_modem_fields();
         // Long silence already present (5 seconds ago).  Send +++.
         let (forward, _) = test_process_bytes(&mut last, &mut count, &mut start, b"+++");
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_plus_interrupted_by_data() {
-        let mut s = PlusState::new();
+        let s = PlusState::new();
         let (mut last, mut count, mut start) = s.as_modem_fields();
         // Send ++ then 'a' — should flush the two pluses and the 'a'
         let (forward, _) = test_process_bytes(&mut last, &mut count, &mut start, b"++a");
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_plus_partial_two() {
-        let mut s = PlusState::new();
+        let s = PlusState::new();
         let (mut last, mut count, mut start) = s.as_modem_fields();
         let (forward, _) = test_process_bytes(&mut last, &mut count, &mut start, b"++");
         assert!(forward.is_empty(), "should hold ++ bytes");
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn test_plus_four_pluses() {
-        let mut s = PlusState::new();
+        let s = PlusState::new();
         let (mut last, mut count, mut start) = s.as_modem_fields();
         // Send ++++: first three are held, fourth flushes all
         let (forward, _) = test_process_bytes(&mut last, &mut count, &mut start, b"++++");
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_normal_data_passes_through() {
-        let mut s = PlusState::new();
+        let s = PlusState::new();
         let (mut last, mut count, mut start) = s.as_modem_fields();
         let (forward, _) =
             test_process_bytes(&mut last, &mut count, &mut start, b"hello world");

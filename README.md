@@ -10,9 +10,10 @@ Co-Author: Claude (Anthropic)
 
 ## Warning
 
-**This server is intended for local/private network use only.** Telnet transmits
-all data (including credentials) in cleartext. Do not expose this server to the
-public internet.
+**The telnet interface is intended for local/private network use only.** Telnet
+transmits all data (including credentials) in cleartext. Do not expose the
+telnet port to the public internet. The SSH interface provides encrypted access
+but is still intended for trusted environments.
 
 ## Prerequisites
 
@@ -94,12 +95,18 @@ The binary will be at `target/release/xmodem-gateway`.
 ```
 
 On first run, a default configuration file `xmodem.conf` is created in the
-working directory. The server listens on port 2323 by default.
+working directory. The telnet server listens on port 2323 by default.
 
 Connect with any telnet client:
 
 ```sh
 telnet <server-ip> 2323
+```
+
+Or, if the SSH interface is enabled, connect with any SSH client:
+
+```sh
+ssh <ssh-user>@<server-ip> -p 2222
 ```
 
 ## Main Menu
@@ -160,6 +167,12 @@ serial_databits = 8
 serial_parity = none
 serial_stopbits = 1
 serial_flowcontrol = none
+
+# SSH server interface (encrypted access)
+ssh_enabled = false
+ssh_port = 2222
+ssh_username = admin
+ssh_password = changeme
 ```
 
 ### Setting Up Authentication
@@ -259,6 +272,47 @@ transferring binary files that may contain 0xFF, enable IAC escaping with the
 **I** toggle in the File Transfer menu. Both the server and your terminal client
 must agree on whether IAC escaping is active. For text files or when your client
 handles this automatically, leave it off (the default).
+
+## SSH Server
+
+The SSH server provides encrypted access to the same gateway menus and features
+available over telnet. This is useful when connecting from modern clients where
+encryption is preferred over plaintext telnet.
+
+### Enabling the SSH Server
+
+1. Open `xmodem.conf`
+2. Set `ssh_enabled = true`
+3. Change `ssh_username` and `ssh_password` to your desired credentials
+4. Optionally change `ssh_port` (default 2222)
+5. Restart the server
+
+On first start with SSH enabled, the server generates an Ed25519 host key and
+saves it to `xmodem_ssh_host_key` in the working directory. This key is reused
+on subsequent starts so that clients can verify the server's identity.
+
+### Connecting
+
+```sh
+ssh <username>@<server-ip> -p 2222
+```
+
+After authenticating, you are presented with the same XMODEM Gateway menu
+system as a telnet connection, using ANSI terminal mode. All features (file
+transfer, SSH/telnet gateway, browser, AI chat, modem emulator, weather) are
+available.
+
+### SSH vs Telnet Credentials
+
+The SSH server has its own username and password (`ssh_username` /
+`ssh_password`), independent of the telnet credentials (`username` /
+`password`). When `xmodem.conf` is first created, both sets default to the same
+values (`admin` / `changeme`). After that, each set can be changed
+independently.
+
+**Note:** SSH credentials in `xmodem.conf` are stored in plaintext. While the
+SSH connection itself is encrypted, the config file is not. Protect it with
+appropriate file permissions.
 
 ## SSH Gateway
 
