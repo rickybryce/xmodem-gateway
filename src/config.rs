@@ -31,6 +31,10 @@ const DEFAULT_SERIAL_DATABITS: u8 = 8;
 const DEFAULT_SERIAL_PARITY: &str = "none";
 const DEFAULT_SERIAL_STOPBITS: u8 = 1;
 const DEFAULT_SERIAL_FLOWCONTROL: &str = "none";
+const DEFAULT_SSH_ENABLED: bool = false;
+const DEFAULT_SSH_PORT: u16 = 2222;
+const DEFAULT_SSH_USERNAME: &str = "admin";
+const DEFAULT_SSH_PASSWORD: &str = "changeme";
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone)]
@@ -64,6 +68,14 @@ pub struct Config {
     pub serial_stopbits: u8,
     /// Serial flow control: "none", "hardware", or "software".
     pub serial_flowcontrol: String,
+    /// Enable SSH server interface.
+    pub ssh_enabled: bool,
+    /// SSH server port.
+    pub ssh_port: u16,
+    /// SSH login username (independent of telnet credentials).
+    pub ssh_username: String,
+    /// SSH login password (independent of telnet credentials).
+    pub ssh_password: String,
 }
 
 impl Default for Config {
@@ -87,6 +99,10 @@ impl Default for Config {
             serial_parity: DEFAULT_SERIAL_PARITY.into(),
             serial_stopbits: DEFAULT_SERIAL_STOPBITS,
             serial_flowcontrol: DEFAULT_SERIAL_FLOWCONTROL.into(),
+            ssh_enabled: DEFAULT_SSH_ENABLED,
+            ssh_port: DEFAULT_SSH_PORT,
+            ssh_username: DEFAULT_SSH_USERNAME.into(),
+            ssh_password: DEFAULT_SSH_PASSWORD.into(),
         }
     }
 }
@@ -221,6 +237,24 @@ fn read_config_file(path: &str) -> Config {
             .filter(|v| matches!(v.as_str(), "none" | "hardware" | "software"))
             .cloned()
             .unwrap_or_else(|| DEFAULT_SERIAL_FLOWCONTROL.into()),
+        ssh_enabled: map
+            .get("ssh_enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_SSH_ENABLED),
+        ssh_port: map
+            .get("ssh_port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SSH_PORT),
+        ssh_username: map
+            .get("ssh_username")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SSH_USERNAME.into()),
+        ssh_password: map
+            .get("ssh_password")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SSH_PASSWORD.into()),
     }
 }
 
@@ -285,6 +319,17 @@ serial_databits = {}
 serial_parity = {}
 serial_stopbits = {}
 serial_flowcontrol = {}
+
+# SSH server interface (encrypted access to the gateway)
+# Set ssh_enabled = true to activate. Uses its own credentials.
+ssh_enabled = {}
+
+# SSH server port
+ssh_port = {}
+
+# SSH credentials (independent of telnet credentials)
+ssh_username = {}
+ssh_password = {}
 ",
         cfg.telnet_port,
         cfg.security_enabled,
@@ -304,6 +349,10 @@ serial_flowcontrol = {}
         sanitize_value(&cfg.serial_parity),
         cfg.serial_stopbits,
         sanitize_value(&cfg.serial_flowcontrol),
+        cfg.ssh_enabled,
+        cfg.ssh_port,
+        sanitize_value(&cfg.ssh_username),
+        sanitize_value(&cfg.ssh_password),
     );
 
     // Write to a temporary file and rename into place to prevent partial
@@ -369,6 +418,14 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
                 cfg.serial_flowcontrol = value.to_string();
             }
         }
+        "ssh_enabled" => cfg.ssh_enabled = value.eq_ignore_ascii_case("true"),
+        "ssh_port" => {
+            if let Ok(v) = value.parse() {
+                cfg.ssh_port = v;
+            }
+        }
+        "ssh_username" => cfg.ssh_username = value.to_string(),
+        "ssh_password" => cfg.ssh_password = value.to_string(),
         _ => {}
     }
 }
@@ -400,6 +457,10 @@ mod tests {
         assert_eq!(cfg.serial_parity, "none");
         assert_eq!(cfg.serial_stopbits, 1);
         assert_eq!(cfg.serial_flowcontrol, "none");
+        assert!(!cfg.ssh_enabled);
+        assert_eq!(cfg.ssh_port, 2222);
+        assert_eq!(cfg.ssh_username, "admin");
+        assert_eq!(cfg.ssh_password, "changeme");
     }
 
     #[test]
@@ -445,6 +506,11 @@ mod tests {
         assert!(!cfg.security_enabled);
         assert_eq!(cfg.username, "admin");
         assert_eq!(cfg.transfer_dir, "transfer");
+        // SSH fields should also get defaults when missing from file
+        assert!(!cfg.ssh_enabled);
+        assert_eq!(cfg.ssh_port, 2222);
+        assert_eq!(cfg.ssh_username, "admin");
+        assert_eq!(cfg.ssh_password, "changeme");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -489,6 +555,10 @@ mod tests {
             serial_parity: "even".into(),
             serial_stopbits: 2,
             serial_flowcontrol: "hardware".into(),
+            ssh_enabled: true,
+            ssh_port: 2222,
+            ssh_username: "sshuser".into(),
+            ssh_password: "sshpass".into(),
         };
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());
@@ -511,6 +581,10 @@ mod tests {
         assert_eq!(loaded.serial_parity, original.serial_parity);
         assert_eq!(loaded.serial_stopbits, original.serial_stopbits);
         assert_eq!(loaded.serial_flowcontrol, original.serial_flowcontrol);
+        assert_eq!(loaded.ssh_enabled, original.ssh_enabled);
+        assert_eq!(loaded.ssh_port, original.ssh_port);
+        assert_eq!(loaded.ssh_username, original.ssh_username);
+        assert_eq!(loaded.ssh_password, original.ssh_password);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -615,5 +689,56 @@ mod tests {
         let mut cfg = Config::default();
         apply_config_key(&mut cfg, "weather_zip", "90210");
         assert_eq!(cfg.weather_zip, "90210");
+    }
+
+    #[test]
+    fn test_apply_config_key_ssh_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "ssh_enabled", "true");
+        assert!(cfg.ssh_enabled);
+
+        apply_config_key(&mut cfg, "ssh_enabled", "false");
+        assert!(!cfg.ssh_enabled);
+
+        apply_config_key(&mut cfg, "ssh_port", "3333");
+        assert_eq!(cfg.ssh_port, 3333);
+
+        // Invalid port should be ignored
+        apply_config_key(&mut cfg, "ssh_port", "notanumber");
+        assert_eq!(cfg.ssh_port, 3333);
+
+        apply_config_key(&mut cfg, "ssh_username", "sshuser");
+        assert_eq!(cfg.ssh_username, "sshuser");
+
+        apply_config_key(&mut cfg, "ssh_password", "sshpass");
+        assert_eq!(cfg.ssh_password, "sshpass");
+    }
+
+    // ─── sanitize_value ─────────────────────────────────
+
+    #[test]
+    fn test_sanitize_value_clean() {
+        assert_eq!(sanitize_value("hello"), "hello");
+    }
+
+    #[test]
+    fn test_sanitize_value_strips_newlines() {
+        assert_eq!(sanitize_value("line1\nline2"), "line1line2");
+    }
+
+    #[test]
+    fn test_sanitize_value_strips_cr() {
+        assert_eq!(sanitize_value("line1\rline2"), "line1line2");
+    }
+
+    #[test]
+    fn test_sanitize_value_strips_crlf() {
+        assert_eq!(sanitize_value("a\r\nb"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_value_empty() {
+        assert_eq!(sanitize_value(""), "");
     }
 }

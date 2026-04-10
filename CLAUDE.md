@@ -26,11 +26,12 @@ cargo clippy          # lint check (should produce zero warnings)
 | `src/telnet.rs` | Telnet server, session management, terminal detection, auth, menus, file transfer UI, SSH gateway, AI chat UI |
 | `src/xmodem.rs` | XMODEM protocol (CRC-16 + checksum), send/receive, telnet IAC-aware raw I/O |
 | `src/aichat.rs` | Groq API client (llama-3.3-70b-versatile), word-wrap for terminal display |
+| `src/ssh.rs` | SSH server interface (russh server, Ed25519 host key, duplex bridge to TelnetSession) |
 
 ## Key Design Decisions
 
-- **Telnet only** -- compatible with retro hardware (Commodore 64, CP/M, AltairDuino).
-  Port defaults to 2323.
+- **Telnet + SSH** -- telnet for retro hardware (Commodore 64, CP/M, AltairDuino),
+  SSH for encrypted modern access. Telnet defaults to port 2323, SSH to 2222.
 - **Config file** (`xmodem.conf`) is auto-created in the binary's working
   directory if missing. Key=value format, comments with `#`.
 - **Security is optional** -- disabled by default. When enabled, uses
@@ -40,6 +41,9 @@ cargo clippy          # lint check (should produce zero warnings)
   as Y/N after detection (defaults to N for ANSI/ASCII, Y for PETSCII).
 - **XMODEM protocol**: 128-byte blocks, CRC-16 with checksum fallback, 8 MB max
   file size, 90s negotiation timeout, IAC escaping toggle (off by default).
+- **SSH Server**: Optional encrypted interface on port 2222 (default disabled).
+  Ed25519 host key auto-generated and persisted to `xmodem_ssh_host_key`.
+  Own credentials independent of telnet. Bridges to TelnetSession via duplex.
 - **SSH Gateway**: Proxies telnet sessions to remote SSH servers via russh. ANSI
   sequences are stripped for PETSCII/ASCII terminals.
 - **AI Chat**: Groq API with paginated response display. Requires API key in config.
@@ -64,10 +68,13 @@ cargo clippy          # lint check (should produce zero warnings)
 
 ## Testing
 
-124 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
+297 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
 exact block, multi-block, all byte values, protocol bytes in data, empty,
 oversized), telnet IAC subnegotiation parsing, PETSCII encoding, filename
-validation, auth lockout logic, config file parsing/roundtrip, signal handler
-registration, screen layout constraints (row counts, column widths, message
-lengths), pagination math, gateway output filtering, gateway input normalization,
-AI chat word wrapping.
+validation, auth lockout logic, constant-time credential comparison, config
+file parsing/roundtrip, signal handler registration, screen layout constraints
+(row counts, column widths, message lengths), pagination math, gateway output
+filtering, gateway input normalization, AI chat word wrapping, color helper
+dispatch (ANSI/PETSCII/ASCII), link marker colorization, serial modem AT
+command parsing, +++ escape detection, SSH host key generation/roundtrip,
+config sanitization.

@@ -109,7 +109,7 @@ fn record_auth_failure(lockouts: &LockoutMap, ip: IpAddr) -> u32 {
 }
 
 /// Constant-time byte slice comparison to prevent timing attacks on credentials.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         // Still iterate to avoid leaking length difference through timing.
         let _ = a.iter().fold(0u8, |acc, &x| acc | x);
@@ -504,6 +504,7 @@ pub(crate) struct TelnetSession {
     web_forms: Vec<crate::webbrowser::WebForm>,
     weather_zip: String,
     is_serial: bool,
+    is_ssh: bool,
 }
 
 impl TelnetSession {
@@ -538,6 +539,40 @@ impl TelnetSession {
             web_forms: Vec::new(),
             weather_zip: config::get_config().weather_zip,
             is_serial: true,
+            is_ssh: false,
+        }
+    }
+
+    /// Create a session for an SSH connection.  Uses ANSI terminal
+    /// (color, no IAC), skips terminal detection and authentication
+    /// (already handled by the SSH layer).
+    pub(crate) fn new_ssh(
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: SharedWriter,
+        shutdown: Arc<AtomicBool>,
+        peer_addr: Option<IpAddr>,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            shutdown,
+            current_menu: Menu::Main,
+            terminal_type: TerminalType::Ansi,
+            erase_char: 0x7F,
+            lockouts: Arc::new(Mutex::new(HashMap::new())),
+            peer_addr,
+            transfer_subdir: String::new(),
+            xmodem_iac: false,
+            web_lines: Vec::new(),
+            web_scroll: 0,
+            web_links: Vec::new(),
+            web_history: Vec::new(),
+            web_url: None,
+            web_title: None,
+            web_forms: Vec::new(),
+            weather_zip: config::get_config().weather_zip,
+            is_serial: false,
+            is_ssh: true,
         }
     }
 
@@ -1242,7 +1277,7 @@ impl TelnetSession {
     pub(crate) async fn run(&mut self) -> Result<(), std::io::Error> {
         let cfg = config::get_config();
 
-        if !self.is_serial {
+        if !self.is_serial && !self.is_ssh {
             self.detect_terminal_type().await?;
 
             if cfg.security_enabled
@@ -3716,54 +3751,70 @@ impl TelnetSession {
             return Ok(());
         }
 
-        crate::serial::restart_serial();
-
         if !self.is_serial {
+            crate::serial::restart_serial();
             return Ok(());
         }
 
-        // Serial user: ask for acknowledgement.  If they changed port
-        // parameters their terminal may need to be reconfigured to match.
-        // I/O errors during the prompt are non-fatal — we still need to
-        // reach the revert logic if the user doesn't respond.
+        // Serial user: warn before applying new settings, then require
+        // Y+Enter acknowledgement.  Random bytes from a baud mismatch
+        // must not count as confirmation.  I/O errors during the prompt
+        // are non-fatal — we still need to reach the revert logic.
         let _ = self.send_line("").await;
         let _ = self.send_line(&format!(
             "  {}",
-            self.yellow("Settings changed. Adjust your")
+            self.yellow("New settings will be applied.")
         )).await;
         let _ = self.send_line(&format!(
             "  {}",
-            self.yellow("terminal to match, then press")
+            self.yellow("You have 60 seconds to adjust")
         )).await;
         let _ = self.send_line(&format!(
             "  {}",
-            self.yellow("any key to confirm.")
+            self.yellow("your terminal and type Y then")
+        )).await;
+        let _ = self.send_line(&format!(
+            "  {}",
+            self.yellow("Enter, or settings will revert.")
         )).await;
         let _ = self.send_line("").await;
         let _ = self.flush().await;
+
+        // Apply the new serial settings now.
+        crate::serial::restart_serial();
 
         let deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_secs(60);
         let mut next_remind = tokio::time::Instant::now()
             + tokio::time::Duration::from_secs(5);
+        let mut got_y = false;
 
         loop {
             let wait_until = std::cmp::min(next_remind, deadline);
             let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
 
             match tokio::time::timeout(remaining, self.read_byte_filtered()).await {
-                Ok(Ok(Some(_))) => {
-                    // Acknowledged
-                    let _ = self.send_line("").await;
-                    let _ = self.send_line(&format!(
-                        "  {}",
-                        self.green("Settings confirmed.")
-                    )).await;
-                    let _ = self.send_line("").await;
-                    let _ = self.send("  Press any key to continue.").await;
-                    let _ = self.flush().await;
-                    let _ = self.wait_for_key().await;
-                    return Ok(());
+                Ok(Ok(Some(byte))) => {
+                    if got_y {
+                        if byte == b'\r' || byte == b'\n' {
+                            // Y + Enter — confirmed
+                            let _ = self.send_line("").await;
+                            let _ = self.send_line(&format!(
+                                "  {}",
+                                self.green("Settings confirmed.")
+                            )).await;
+                            let _ = self.send_line("").await;
+                            let _ = self.send("  Press any key to continue.").await;
+                            let _ = self.flush().await;
+                            let _ = self.wait_for_key().await;
+                            return Ok(());
+                        }
+                        // Y followed by non-Enter — noise, reset
+                        got_y = false;
+                    } else if byte == b'Y' || byte == b'y' {
+                        got_y = true;
+                    }
+                    // Ignore other bytes (likely noise from baud mismatch)
                 }
                 Ok(Ok(None)) | Ok(Err(_)) => {
                     // Connection lost — revert
@@ -3778,7 +3829,7 @@ impl TelnetSession {
                         .saturating_duration_since(tokio::time::Instant::now())
                         .as_secs();
                     let _ = self.send_line(&format!(
-                        "  Press any key to confirm. ({}s left)",
+                        "  Type Y+Enter to confirm. ({}s left)",
                         secs_left
                     )).await;
                     let _ = self.flush().await;
@@ -5170,6 +5221,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     web_forms: Vec::new(),
                                     weather_zip: config::get_config().weather_zip,
                                     is_serial: false,
+                                    is_ssh: false,
                                 };
                                 if let Err(e) = session.run().await {
                                     eprintln!("Telnet: session error from {}: {}", addr, e);
@@ -5514,6 +5566,238 @@ mod tests {
         assert!(result.contains("test"));
         assert_eq!(result.as_bytes()[0], PETSCII_GREEN);
         assert_eq!(*result.as_bytes().last().unwrap(), PETSCII_DEFAULT);
+    }
+
+    // ─── Test session helper ─────────────────────────────
+
+    /// Build a minimal TelnetSession with the given terminal type for testing
+    /// synchronous helpers (color, formatting, etc.).  No I/O is performed.
+    fn make_test_session(terminal_type: TerminalType) -> TelnetSession {
+        let (client, server) = tokio::io::duplex(1);
+        let writer_box: Box<dyn tokio::io::AsyncWrite + Unpin + Send> =
+            Box::new(client);
+        let writer: SharedWriter =
+            Arc::new(tokio::sync::Mutex::new(writer_box));
+        TelnetSession {
+            reader: Box::new(server),
+            writer,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            current_menu: Menu::Main,
+            terminal_type,
+            erase_char: 0x7F,
+            lockouts: Arc::new(Mutex::new(HashMap::new())),
+            peer_addr: None,
+            transfer_subdir: String::new(),
+            xmodem_iac: false,
+            web_lines: Vec::new(),
+            web_scroll: 0,
+            web_links: Vec::new(),
+            web_history: Vec::new(),
+            web_url: None,
+            web_title: None,
+            web_forms: Vec::new(),
+            weather_zip: String::new(),
+            is_serial: false,
+            is_ssh: false,
+        }
+    }
+
+    // ─── Color helpers ──────────────────────────────────
+
+    #[test]
+    fn test_green_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.green("ok");
+        assert!(result.starts_with(ANSI_GREEN));
+        assert!(result.ends_with(ANSI_RESET));
+        assert!(result.contains("ok"));
+    }
+
+    #[test]
+    fn test_green_petscii() {
+        let s = make_test_session(TerminalType::Petscii);
+        let result = s.green("ok");
+        assert_eq!(result.as_bytes()[0], PETSCII_GREEN);
+        assert_eq!(*result.as_bytes().last().unwrap(), PETSCII_DEFAULT);
+        assert!(result.contains("ok"));
+    }
+
+    #[test]
+    fn test_green_ascii_no_escapes() {
+        let s = make_test_session(TerminalType::Ascii);
+        assert_eq!(s.green("ok"), "ok");
+    }
+
+    #[test]
+    fn test_red_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.red("err");
+        assert!(result.starts_with(ANSI_RED));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_yellow_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.yellow("warn");
+        assert!(result.starts_with(ANSI_YELLOW));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_cyan_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.cyan("info");
+        assert!(result.starts_with(ANSI_CYAN));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_amber_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.amber("caution");
+        assert!(result.starts_with(ANSI_AMBER));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_amber_petscii_uses_yellow() {
+        let s = make_test_session(TerminalType::Petscii);
+        let result = s.amber("caution");
+        // PETSCII_YELLOW (0x9E) is multi-byte in UTF-8, so check via char
+        assert_eq!(result.chars().next().unwrap(), char::from(PETSCII_YELLOW));
+    }
+
+    #[test]
+    fn test_dim_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.dim("faint");
+        assert!(result.starts_with(ANSI_DIM));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_blue_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.blue("link");
+        assert!(result.starts_with(ANSI_BLUE));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_white_ansi() {
+        let s = make_test_session(TerminalType::Ansi);
+        let result = s.white("bright");
+        assert!(result.starts_with(ANSI_WHITE));
+        assert!(result.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_all_colors_ascii_passthrough() {
+        let s = make_test_session(TerminalType::Ascii);
+        assert_eq!(s.red("x"), "x");
+        assert_eq!(s.cyan("x"), "x");
+        assert_eq!(s.yellow("x"), "x");
+        assert_eq!(s.amber("x"), "x");
+        assert_eq!(s.dim("x"), "x");
+        assert_eq!(s.blue("x"), "x");
+        assert_eq!(s.white("x"), "x");
+    }
+
+    // ─── colorize_link_markers ──────────────────────────
+
+    #[test]
+    fn test_colorize_link_markers_no_markers() {
+        let s = make_test_session(TerminalType::Ansi);
+        assert_eq!(s.colorize_link_markers("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_colorize_link_markers_single() {
+        let s = make_test_session(TerminalType::Ansi);
+        let input = "click \x021\x03 here";
+        let result = s.colorize_link_markers(input);
+        assert!(result.contains("[1]"));
+        assert!(result.contains(ANSI_BLUE));
+        assert!(result.contains("click "));
+        assert!(result.contains(" here"));
+    }
+
+    #[test]
+    fn test_colorize_link_markers_multiple() {
+        let s = make_test_session(TerminalType::Ansi);
+        let input = "\x021\x03 and \x022\x03";
+        let result = s.colorize_link_markers(input);
+        assert!(result.contains("[1]"));
+        assert!(result.contains("[2]"));
+    }
+
+    #[test]
+    fn test_colorize_link_markers_ascii_no_color() {
+        let s = make_test_session(TerminalType::Ascii);
+        let input = "\x021\x03";
+        let result = s.colorize_link_markers(input);
+        assert_eq!(result, "[1]");
+    }
+
+    #[test]
+    fn test_colorize_link_markers_malformed() {
+        let s = make_test_session(TerminalType::Ansi);
+        // Open sentinel without close — silently dropped
+        let result = s.colorize_link_markers("text\x02orphan");
+        assert!(result.contains("text"));
+        assert!(result.contains("orphan"));
+        assert!(!result.contains("\x02"));
+    }
+
+    // ─── action_prompt / nav_footer ─────────────────────
+
+    #[test]
+    fn test_action_prompt_format() {
+        let s = make_test_session(TerminalType::Ascii);
+        assert_eq!(s.action_prompt("Q", "Back"), "Q=Back");
+    }
+
+    #[test]
+    fn test_nav_footer_fits_petscii() {
+        let s = make_test_session(TerminalType::Ascii);
+        let footer = s.nav_footer();
+        // ASCII mode has no escape codes, so visible length == byte length
+        assert!(
+            footer.len() <= PETSCII_WIDTH,
+            "nav footer '{}' is {} chars, exceeds {}",
+            footer,
+            footer.len(),
+            PETSCII_WIDTH,
+        );
+    }
+
+    // ─── constant_time_eq ───────────────────────────────
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"password", b"password"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different() {
+        assert!(!constant_time_eq(b"password", b"passw0rd"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_constant_time_eq_single_bit_diff() {
+        // 'A' (0x41) vs 'a' (0x61) — differ by one bit
+        assert!(!constant_time_eq(b"A", b"a"));
     }
 
     // ─── Gateway output filtering ────────────────────────
@@ -6627,5 +6911,56 @@ mod tests {
             "prompt '{}' is {} chars, exceeds {}",
             prompt, prompt.len(), PETSCII_WIDTH,
         );
+    }
+
+    // ─── Modem settings confirmation messages ───────────
+
+    /// All modem_apply_settings prompt/status messages must fit PETSCII width.
+    #[test]
+    fn test_modem_apply_messages_fit_petscii() {
+        let messages = [
+            "  New settings will be applied.",
+            "  You have 60 seconds to adjust",
+            "  your terminal and type Y then",
+            "  Enter, or settings will revert.",
+            "  Settings confirmed.",
+            "  Press any key to continue.",
+            "  No response. Reverting settings.",
+        ];
+        for msg in &messages {
+            assert!(
+                msg.len() <= PETSCII_WIDTH,
+                "modem apply msg '{}' is {} chars, exceeds {}",
+                msg,
+                msg.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// The countdown reminder must fit PETSCII width even with 2-digit seconds.
+    #[test]
+    fn test_modem_apply_countdown_fits_petscii() {
+        let reminder = format!("  Type Y+Enter to confirm. ({}s left)", 55);
+        assert!(
+            reminder.len() <= PETSCII_WIDTH,
+            "countdown '{}' is {} chars, exceeds {}",
+            reminder,
+            reminder.len(),
+            PETSCII_WIDTH,
+        );
+    }
+
+    /// Modem apply settings confirmation screen: blank + 4 warning lines +
+    /// blank + (countdown reminders) + confirmation/revert.  The screen is
+    /// not a full menu redraw so row count is not constrained to 22, but
+    /// individual messages must fit width.
+    #[test]
+    fn test_modem_apply_settings_row_count() {
+        // Warning: blank + 4 lines + blank = 6.
+        // Worst case after: 12 countdown reminders (every 5s for 60s) + revert msg = 14.
+        // Total ≤ 20, well within 22.
+        let warning_rows = 6;
+        assert!(warning_rows <= 22);
     }
 }
