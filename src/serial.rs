@@ -551,7 +551,7 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
             }
             AtResult::Help => {
                 if !state.quiet {
-                    let lines = [
+                    let text = [
                         "AT Commands:",
                         "AT     OK             ATZ   Reset (stored)",
                         "AT&F   Factory reset   AT&W  Save settings",
@@ -563,15 +563,13 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
                         "ATSn?  Query register  ATSn=v Set register",
                         "ATS?   Register help   +++   Escape to cmd",
                         "AT?    This help",
-                    ];
-                    for line in &lines {
-                        send_response(&mut state.port, line);
-                    }
+                    ].join("\r\n");
+                    send_response(&mut state.port, &text);
                 }
             }
             AtResult::SRegHelp => {
                 if !state.quiet {
-                    let lines = [
+                    let text = [
                         "S-Registers (ATSn? to query, ATSn=v to set):",
                         "S00  Auto-answer ring count (0=off)",
                         "S01  Ring counter (current)",
@@ -586,10 +584,8 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
                         "S10  Carrier loss time (1/10s)",
                         "S11  DTMF tone duration (ms)",
                         "S12  Escape guard time (1/50s)",
-                    ];
-                    for line in &lines {
-                        send_response(&mut state.port, line);
-                    }
+                    ].join("\r\n");
+                    send_response(&mut state.port, &text);
                 }
             }
             AtResult::ShowConfig => {
@@ -680,7 +676,8 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
     state.mode = ModemMode::Online;
 
     // Create a duplex pair: one end for TelnetSession, the other for this thread.
-    let (async_stream, serial_stream) = tokio::io::duplex(4096);
+    // Large buffer to handle slow baud rates (300–9600) without data loss.
+    let (async_stream, serial_stream) = tokio::io::duplex(65536);
     let (async_read, async_write) = tokio::io::split(async_stream);
 
     let writer_box: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(async_write);
@@ -820,7 +817,7 @@ fn online_mode_duplex(
             Err(_) => return OnlineExit::Disconnected,
         }
 
-        // Duplex → serial
+        // Duplex → serial (write in small chunks so slow baud rates stay responsive)
         let result = state.handle.block_on(async {
             tokio::time::timeout(Duration::from_millis(10), duplex_read.read(&mut duplex_buf))
                 .await
@@ -828,7 +825,10 @@ fn online_mode_duplex(
         match result {
             Ok(Ok(0)) => return OnlineExit::Disconnected,
             Ok(Ok(n)) => {
-                let _ = state.port.write_all(&duplex_buf[..n]);
+                if state.port.write_all(&duplex_buf[..n]).is_err() {
+                    return OnlineExit::Disconnected;
+                }
+                let _ = state.port.flush();
             }
             Ok(Err(_)) => return OnlineExit::Disconnected,
             Err(_) => {} // timeout — no data from duplex
@@ -873,7 +873,10 @@ fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> Onl
         match tcp.read(&mut tcp_buf) {
             Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
-                let _ = state.port.write_all(&tcp_buf[..n]);
+                if state.port.write_all(&tcp_buf[..n]).is_err() {
+                    return OnlineExit::Disconnected;
+                }
+                let _ = state.port.flush();
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::TimedOut
