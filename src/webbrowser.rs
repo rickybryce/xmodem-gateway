@@ -327,9 +327,24 @@ fn render_html_body(body_bytes: &[u8], final_url: String, width: usize) -> Resul
         }
     }
 
+    // Post-process: collapse consecutive blank lines and trim trailing whitespace.
+    // The html2text library inserts blank lines between block-level elements
+    // which causes excessive vertical spacing on narrow/slow terminals.
+    let mut cleaned: Vec<String> = Vec::with_capacity(rendered_lines.len());
+    let mut prev_blank = false;
+    for line in rendered_lines {
+        let trimmed = line.trim_end().to_string();
+        let is_blank = trimmed.is_empty();
+        if is_blank && prev_blank {
+            continue; // collapse consecutive blank lines
+        }
+        prev_blank = is_blank;
+        cleaned.push(trimmed);
+    }
+
     Ok(WebPage {
         title,
-        lines: rendered_lines,
+        lines: cleaned,
         links,
         url: final_url,
         forms,
