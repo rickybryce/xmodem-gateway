@@ -1391,7 +1391,7 @@ impl TelnetSession {
         .await?;
         if !self.is_serial {
             self.send_line(&format!(
-                "  {}  Serial Gateway",
+                "  {}  Serial Monitor",
                 self.cyan("E")
             ))
             .await?;
@@ -1442,8 +1442,8 @@ impl TelnetSession {
                     "  B  Browser: browse the web",
                 ];
                 if !self.is_serial {
-                    lines.push("  E  Serial Gateway: interact with");
-                    lines.push("     a device on the serial port");
+                    lines.push("  E  Serial Monitor: view traffic on");
+                    lines.push("     the serial port");
                 }
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
@@ -1492,7 +1492,7 @@ impl TelnetSession {
                 self.current_menu = Menu::FileTransfer;
             }
             "e" if !self.is_serial => {
-                self.gateway_serial().await?;
+                self.monitor_serial().await?;
             }
             "m" => {
                 self.modem_settings().await?;
@@ -2905,9 +2905,9 @@ impl TelnetSession {
         Ok(())
     }
 
-    // ─── SERIAL GATEWAY ──────────────────────────────────────
+    // ─── SERIAL MONITOR ─────────────────────────────────────
 
-    async fn gateway_serial(&mut self) -> Result<(), std::io::Error> {
+    async fn monitor_serial(&mut self) -> Result<(), std::io::Error> {
         let cfg = config::get_config();
         let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
         let esc_label = match self.terminal_type {
@@ -2918,7 +2918,7 @@ impl TelnetSession {
         self.clear_screen().await?;
         let sep = self.separator();
         self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("SERIAL GATEWAY")))
+        self.send_line(&format!("  {}", self.yellow("SERIAL MONITOR")))
             .await?;
         self.send_line(&sep).await?;
         self.send_line("").await?;
@@ -2958,15 +2958,13 @@ impl TelnetSession {
             return Ok(());
         }
 
-        // Check if serial port is busy (modem online)
-        if crate::serial::is_serial_port_busy() {
+        // Check if another monitor is already active
+        if crate::serial::is_serial_monitor_active() {
             self.send_line(&format!(
                 "  {}",
-                self.red("Serial port is busy.")
+                self.red("Serial monitor is already in use.")
             ))
             .await?;
-            self.send_line("  The modem has an active connection.")
-                .await?;
             self.send_line("").await?;
             self.send("  Press any key to continue.").await?;
             self.flush().await?;
@@ -2977,10 +2975,10 @@ impl TelnetSession {
         // Create duplex bridge
         let (user_stream, serial_stream) = tokio::io::duplex(4096);
 
-        if !crate::serial::request_serial_gateway(serial_stream) {
+        if !crate::serial::request_serial_monitor(serial_stream) {
             self.send_line(&format!(
                 "  {}",
-                self.red("Serial port is not available.")
+                self.red("Serial monitor is not available.")
             ))
             .await?;
             self.send_line("").await?;
@@ -2991,7 +2989,7 @@ impl TelnetSession {
         }
 
         self.send_line(&format!(
-            "  Connecting to {}...",
+            "  Monitoring {}...",
             self.amber(&cfg.serial_port)
         ))
         .await?;
@@ -3014,7 +3012,8 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        // Proxy I/O: telnet/SSH client ↔ serial port (via duplex bridge)
+        // Monitor I/O: serial tee data → user display,
+        // user keystrokes → serial port (via duplex bridge)
         let (mut bridge_reader, mut bridge_writer) = tokio::io::split(user_stream);
 
         let reader = &mut self.reader;
@@ -3042,10 +3041,6 @@ impl TelnetSession {
                             }
                             if bridge_writer.write_all(&[b]).await.is_err() { break; }
                             if bridge_writer.flush().await.is_err() { break; }
-                            // Echo the typed character back to the local terminal
-                            let mut w = writer.lock().await;
-                            if w.write_all(&[b]).await.is_err() { break; }
-                            if w.flush().await.is_err() { break; }
                         }
                         _ => break,
                     }
@@ -3065,14 +3060,14 @@ impl TelnetSession {
         }
 
         // Clean up — dropping bridge_writer closes the duplex, causing the
-        // serial thread's gateway loop to exit.
+        // serial thread's monitor tee to detach.
         drop(bridge_writer);
         drop(bridge_reader);
 
         self.send_line("").await?;
         self.send_line(&format!(
             "  {}",
-            self.yellow("Connection closed.")
+            self.yellow("Monitor disconnected.")
         ))
         .await?;
         self.send_line("").await?;
@@ -6341,13 +6336,12 @@ mod tests {
             "Not found.",
             "Invalid number.",
             "Unknown command.",
-            // Serial gateway
+            // Serial monitor
             "Serial port is not enabled.",
             "Serial-SSH gateway is active.",
             "SSH snooping is not allowed.",
-            "Serial port is busy.",
-            "The modem has an active connection.",
-            "Serial port is not available.",
+            "Serial monitor is already in use.",
+            "Serial monitor is not available.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -6369,7 +6363,7 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
-            "  E  Serial Gateway",
+            "  E  Serial Monitor",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6524,7 +6518,7 @@ mod tests {
     /// blank + "Press any key" = 19 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        // Non-serial: 14 base lines + 2 serial gateway lines = 16 content lines
+        // Non-serial: 14 base lines + 2 serial monitor lines = 16 content lines
         let rows = 3 + 1 + 16 + 1 + 1; // 22
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
@@ -6536,8 +6530,8 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  E  Serial Gateway: interact with",
-            "     a device on the serial port",
+            "  E  Serial Monitor: view traffic on",
+            "     the serial port",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
