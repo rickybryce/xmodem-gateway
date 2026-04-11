@@ -169,6 +169,33 @@ fn reject_insecure_ip(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Returns true if the IP is a private/link-local address (not loopback, not public).
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                let o = mapped.octets();
+                return o[0] == 10
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 168)
+                    || (o[0] == 169 && o[1] == 254);
+            }
+            let seg = v6.segments();
+            // Link-local (fe80::/10)
+            (seg[0] & 0xffc0 == 0xfe80)
+            // Unique local (fd00::/8)
+            || (seg[0] & 0xff00 == 0xfd00)
+        }
+    }
+}
+
 // ─── PETSCII encoding helpers ───────────────────────────────
 
 fn swap_case_for_petscii(text: &str) -> String {
@@ -207,6 +234,28 @@ pub(crate) fn is_esc_key(byte: u8, petscii: bool) -> bool {
 }
 
 use crate::webbrowser::truncate_to_width;
+
+/// Return the private (RFC 1918 / link-local / ULA) IPv4 and IPv6
+/// addresses of this machine, excluding loopback.
+fn get_server_addresses() -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            let ip = iface.ip();
+            if !is_private_ip(ip) {
+                continue;
+            }
+            let s = ip.to_string();
+            if !addrs.contains(&s) {
+                addrs.push(s);
+            }
+        }
+    }
+    addrs
+}
 
 /// Read a single byte, filtering out telnet IAC protocol sequences.
 async fn read_byte_iac_filtered(
@@ -1390,6 +1439,11 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
+            "  {}  Configuration",
+            self.cyan("C")
+        ))
+        .await?;
+        self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
         ))
@@ -1433,6 +1487,8 @@ impl TelnetSession {
                 let mut lines = vec![
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
+                    "  C  Configuration: enable/disable",
+                    "     services and set port numbers",
                 ];
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
@@ -1477,6 +1533,9 @@ impl TelnetSession {
             "b" => {
                 self.current_menu = Menu::Browser;
             }
+            "c" => {
+                self.configuration().await?;
+            }
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
@@ -1496,7 +1555,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
+                self.show_error("Press A-C, F, M, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -3914,6 +3973,13 @@ impl TelnetSession {
                 self.amber(&cfg.serial_flowcontrol)
             ))
             .await?;
+            if cfg.serial_enabled {
+                self.send_line(&format!(
+                    "  {}",
+                    self.amber("ATD XMODEM-GATEWAY")
+                ))
+                .await?;
+            }
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}  Toggle enabled/disabled",
@@ -4696,6 +4762,246 @@ impl TelnetSession {
             ]
         };
         self.show_help_page("MODEM EMULATOR HELP", lines).await
+    }
+
+    // ─── CONFIGURATION ──────────────────────────────────────
+
+    async fn configuration(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("SERVER CONFIGURATION")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            let telnet_status = if cfg.telnet_enabled {
+                self.green("ENABLED")
+            } else {
+                self.red("Disabled")
+            };
+            self.send_line(&format!(
+                "  Telnet: {} (port {})",
+                telnet_status, cfg.telnet_port
+            ))
+            .await?;
+            let ssh_status = if cfg.ssh_enabled {
+                self.green("ENABLED")
+            } else {
+                self.red("Disabled")
+            };
+            self.send_line(&format!(
+                "  SSH:    {} (port {})",
+                ssh_status, cfg.ssh_port
+            ))
+            .await?;
+            self.send_line("").await?;
+
+            // Show server IP addresses and ATD example
+            let addrs = get_server_addresses();
+            if !addrs.is_empty() {
+                self.send_line(&format!(
+                    "  {}",
+                    self.dim("Server addresses:")
+                ))
+                .await?;
+                let max_w = if self.terminal_type == TerminalType::Petscii {
+                    36 // 40 - 4 chars indent
+                } else {
+                    52 // 56 - 4 chars indent
+                };
+                for addr in &addrs {
+                    let display = truncate_to_width(addr, max_w);
+                    self.send_line(&format!("    {}", display)).await?;
+                }
+                if cfg.telnet_enabled {
+                    let example = format!("ATD {}:{}", addrs[0], cfg.telnet_port);
+                    let max_example = if self.terminal_type == TerminalType::Petscii {
+                        38 // 40 - 2 chars indent
+                    } else {
+                        54 // 56 - 2 chars indent
+                    };
+                    let example = truncate_to_width(&example, max_example);
+                    self.send_line(&format!("  {}", self.amber(&example)))
+                        .await?;
+                }
+                self.send_line("").await?;
+            }
+
+            self.send_line(&format!(
+                "  {}  Toggle telnet",
+                self.cyan("T")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set telnet port",
+                self.cyan("P")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle SSH",
+                self.cyan("S")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set SSH port",
+                self.cyan("O")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "t" => {
+                    let new_val = if cfg.telnet_enabled { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("telnet_enabled", &v);
+                    })
+                    .await
+                    .ok();
+                    self.config_restart_notice().await?;
+                }
+                "p" => {
+                    self.config_set_port("Telnet", "telnet_port", cfg.telnet_port).await?;
+                }
+                "s" => {
+                    let new_val = if cfg.ssh_enabled { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("ssh_enabled", &v);
+                    })
+                    .await
+                    .ok();
+                    self.config_restart_notice().await?;
+                }
+                "o" => {
+                    self.config_set_port("SSH", "ssh_port", cfg.ssh_port).await?;
+                }
+                "h" => {
+                    self.config_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press T, P, S, O, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn config_set_port(
+        &mut self,
+        label: &str,
+        key: &str,
+        current: u16,
+    ) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Current {} port: {}",
+            label,
+            self.amber(&current.to_string())
+        ))
+        .await?;
+        self.send("  New port (1-65535): ").await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if let Ok(port) = input.parse::<u16>() {
+            if port >= 1 {
+                let k = key.to_string();
+                let v = port.to_string();
+                tokio::task::spawn_blocking(move || {
+                    config::update_config_value(&k, &v);
+                })
+                .await
+                .ok();
+                self.config_restart_notice().await?;
+            } else {
+                self.show_error("Invalid port number.").await?;
+            }
+        } else {
+            self.show_error("Invalid port number.").await?;
+        }
+        Ok(())
+    }
+
+    async fn config_restart_notice(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("Restart the server for changes")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("to take effect.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    async fn config_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Change settings for THIS server.",
+                "  The SSH Gateway and Telnet",
+                "  Gateway options in the main",
+                "  menu are not affected.",
+                "",
+                "  T  Enable or disable the telnet",
+                "     server listener",
+                "  P  Change the telnet port",
+                "  S  Enable or disable the SSH",
+                "     server listener",
+                "  O  Change the SSH port",
+                "",
+                "  Changes are saved immediately",
+                "  but require a server restart.",
+            ]
+        } else {
+            &[
+                "  Change settings for THIS server.",
+                "  The SSH Gateway and Telnet Gateway",
+                "  options in the main menu (outbound",
+                "  connections to other servers) are not",
+                "  affected by these settings.",
+                "",
+                "  T  Enable or disable the telnet server",
+                "  P  Change the telnet listening port",
+                "  S  Enable or disable the SSH server",
+                "  O  Change the SSH listening port",
+                "",
+                "  Changes are saved to the config file",
+                "  immediately but require a server restart",
+                "  to take effect.",
+            ]
+        };
+        self.show_help_page("SERVER CONFIGURATION HELP", lines).await
     }
 
     // ─── TROUBLESHOOTING ────────────────────────────────────
@@ -6584,7 +6890,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A, B, F, M, R, S, T, W, X, or H.",
+            "Press A-C, F, M, R, S, T, W, X, or H.",
             // Non-serial prompt includes E but is only shown to
             // ANSI/SSH users (80 cols), so it is not tested here.
             "Press U, D, X, C, I, R, Q, or H.",
@@ -6636,6 +6942,9 @@ mod tests {
             "Invalid entry number.",
             "Mapping saved.",
             "No other mappings defined.",
+            // Configuration
+            "Press T, P, S, O, H, or Q.",
+            "Invalid port number.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -6657,6 +6966,7 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
+            "  C  Configuration",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6675,6 +6985,11 @@ mod tests {
             "  R  Refresh port list",
             "  N  None (clear port)",
             "  Enter #, R, N, or type a path.",
+            // Configuration menu
+            "  T  Toggle telnet",
+            "  P  Set telnet port",
+            "  S  Toggle SSH",
+            "  O  Set SSH port",
             // Dialup mapping menu
             "  A  Add mapping",
             "  D  Delete mapping",
@@ -6704,42 +7019,44 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 9 items + blank + help = 15 rows.
+    /// Main menu screen: header(3) + blank + 10 items + blank + help = 16 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15
-        let rows = 15;
+        // sep, title, sep, blank, A, B, C, F, M, R, S, T, W, X, blank, H=Help = 16
+        let rows = 16;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
-    /// Main menu items must be exactly A, B, F, M, R, S, T, W, X (9 items).
+    /// Main menu items must be exactly A, B, C, F, M, R, S, T, W, X (10 items).
     #[test]
     fn test_main_menu_item_count() {
-        let items = ["A", "B", "F", "M", "R", "S", "T", "W", "X"];
-        assert_eq!(items.len(), 9, "main menu should have exactly 9 items");
+        let items = ["A", "B", "C", "F", "M", "R", "S", "T", "W", "X"];
+        assert_eq!(items.len(), 10, "main menu should have exactly 10 items");
     }
 
     /// Error hint must list exactly the valid main menu keys.
     #[test]
     fn test_main_menu_error_hint() {
-        let hint = "Press A, B, F, M, R, S, T, W, X, or H.";
+        let hint = "Press A-C, F, M, R, S, T, W, X, or H.";
         // Must not mention removed keys (D, E)
         assert!(!hint.contains(" D,"), "error hint must not mention D");
         assert!(!hint.contains(" E,"), "error hint must not mention E");
         assert!(!hint.contains(" E "), "error hint must not mention E");
         // Must mention all valid keys
-        for key in ["A", "B", "F", "M", "R", "S", "T", "W", "X", "H"] {
+        for key in ["A", "C", "F", "M", "R", "S", "T", "W", "X", "H"] {
             assert!(hint.contains(key), "error hint must mention {}", key);
         }
         assert!(hint.len() <= PETSCII_WIDTH, "error hint exceeds PETSCII width");
     }
 
-    /// Main help screen content must have exactly 14 lines (matching row count test).
+    /// Main help screen content must have exactly 16 lines (matching row count test).
     #[test]
     fn test_main_help_content_line_count() {
         let lines = [
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
+            "  C  Configuration: enable/disable",
+            "     services and set port numbers",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
@@ -6753,7 +7070,7 @@ mod tests {
             "  W  Weather: check weather by zip",
             "  X  Exit: disconnect from server",
         ];
-        assert_eq!(lines.len(), 14, "main help should have exactly 14 content lines");
+        assert_eq!(lines.len(), 16, "main help should have exactly 16 content lines");
     }
 
     /// Shutdown broadcast message must be valid and end with CRLF.
@@ -6884,13 +7201,12 @@ mod tests {
         );
     }
 
-    /// Modem emulator screen: header(3) + blank + 5 status lines + blank
-    /// + 5 menu items + blank + footer + prompt = 17 rows.
+    /// Modem emulator screen worst case: non-serial + serial enabled.
+    /// header(3) + blank + status(5) + ATD(1) + blank
+    /// + menu(7: E,S,B,P,F,D,I) + blank + footer(1) + prompt(1) = 21.
     #[test]
     fn test_modem_emulator_row_count() {
-        // Non-serial worst case: header(3) + blank + status(5) + blank
-        // + menu(7: E,S,B,P,F,D,I) + blank + footer(1) + prompt(1) = 20
-        let rows = 3 + 1 + 5 + 1 + 7 + 1 + 1 + 1; // 20
+        let rows = 3 + 1 + 5 + 1 + 1 + 7 + 1 + 1 + 1; // 21
         assert!(rows <= 22, "modem emulator is {} rows, exceeds 22", rows);
     }
 
@@ -6929,6 +7245,55 @@ mod tests {
         assert!(rows <= 22, "stop bits screen is {} rows, exceeds 22", rows);
     }
 
+    /// Configuration menu static rows (no addresses):
+    /// header(3) + blank + status(2) + blank + menu(4) + blank + footer(1) + prompt(1) = 14.
+    /// The IP address list is dynamic; with addresses it adds a label + N addrs + blank.
+    /// Typical machines have 1-3 addresses, fitting well within 22.
+    #[test]
+    fn test_config_menu_row_count() {
+        let static_rows = 3 + 1 + 2 + 1 + 4 + 1 + 1 + 1; // 14
+        assert!(static_rows <= 22, "config menu static is {} rows, exceeds 22", static_rows);
+        // With address list: +1 label +3 addrs +1 blank = 5 extra → 19
+        let with_addrs = static_rows + 1 + 3 + 1; // 19
+        assert!(with_addrs <= 22, "config menu with 3 addrs is {} rows, exceeds 22", with_addrs);
+    }
+
+    /// Configuration help screen (ANSI): header(3) + blank + 14 content lines +
+    /// blank + "Press any key" = 20 rows.
+    #[test]
+    fn test_config_help_screen_row_count() {
+        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        assert!(rows <= 22, "config help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Configuration help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_config_help_lines_fit_petscii() {
+        let lines = [
+            "  Change settings for THIS server.",
+            "  The SSH Gateway and Telnet",
+            "  Gateway options in the main",
+            "  menu are not affected.",
+            "  T  Enable or disable the telnet",
+            "     server listener",
+            "  P  Change the telnet port",
+            "  S  Enable or disable the SSH",
+            "     server listener",
+            "  O  Change the SSH port",
+            "  Changes are saved immediately",
+            "  but require a server restart.",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "config help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
     /// Modem help screen (ANSI): header(3) + blank + 16 content lines +
     /// blank + "Press any key" = 22 rows.
     #[test]
@@ -6937,11 +7302,11 @@ mod tests {
         assert!(rows <= 22, "modem help screen is {} rows, exceeds 22", rows);
     }
 
-    /// Main help screen: header(3) + blank + 14 content lines +
-    /// blank + "Press any key" = 20 rows.
+    /// Main help screen: header(3) + blank + 16 content lines +
+    /// blank + "Press any key" = 22 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        let rows = 3 + 1 + 16 + 1 + 1; // 22
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6952,6 +7317,8 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
+            "  C  Configuration: enable/disable",
+            "     services and set port numbers",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
