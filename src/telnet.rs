@@ -1388,6 +1388,13 @@ impl TelnetSession {
             self.cyan("B")
         ))
         .await?;
+        if !self.is_serial {
+            self.send_line(&format!(
+                "  {}  Serial Gateway",
+                self.cyan("E")
+            ))
+            .await?;
+        }
         self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
@@ -1429,9 +1436,15 @@ impl TelnetSession {
     async fn handle_main_command(&mut self, input: &str) -> Result<bool, std::io::Error> {
         match input {
             "h" => {
-                self.show_help_page("HELP", &[
+                let mut lines = vec![
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
+                ];
+                if !self.is_serial {
+                    lines.push("  E  Serial Gateway: interact with");
+                    lines.push("     a device on the serial port");
+                }
+                lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
                     "     files using the XMODEM protocol",
                     "  M  Modem Emulator: configure the",
@@ -1444,7 +1457,8 @@ impl TelnetSession {
                     "     remote server via telnet",
                     "  W  Weather: check weather by zip",
                     "  X  Exit: disconnect from server",
-                ]).await?;
+                ]);
+                self.show_help_page("HELP", &lines).await?;
             }
             "r" => {
                 self.troubleshooting().await?;
@@ -1476,11 +1490,21 @@ impl TelnetSession {
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
+            "e" if !self.is_serial => {
+                self.gateway_serial().await?;
+            }
             "m" => {
                 self.modem_settings().await?;
             }
             "s" => {
-                self.gateway_ssh().await?;
+                if self.is_serial {
+                    crate::serial::set_serial_ssh_active(true);
+                }
+                let result = self.gateway_ssh().await;
+                if self.is_serial {
+                    crate::serial::set_serial_ssh_active(false);
+                }
+                result?;
             }
             "t" => {
                 self.gateway_telnet().await?;
@@ -1492,7 +1516,12 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
+                let msg = if self.is_serial {
+                    "Press A, B, F, M, R, S, T, W, X, or H."
+                } else {
+                    "Press A, B, E, F, M, R, S, T, W, X, or H."
+                };
+                self.show_error(msg).await?;
             }
         }
         Ok(true)
@@ -2875,6 +2904,190 @@ impl TelnetSession {
         Ok(())
     }
 
+    // ─── SERIAL GATEWAY ──────────────────────────────────────
+
+    async fn gateway_serial(&mut self) -> Result<(), std::io::Error> {
+        let cfg = config::get_config();
+        let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
+        let esc_label = match self.terminal_type {
+            TerminalType::Petscii => "<-",
+            _ => "ESC",
+        };
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("SERIAL GATEWAY")))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+
+        // Check if serial port is enabled
+        if !cfg.serial_enabled || cfg.serial_port.is_empty() {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial port is not enabled.")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line("  Enable it in xmodem.conf or via")
+                .await?;
+            self.send_line("  the Modem Emulator menu.")
+                .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        // Check if serial device is in the SSH gateway
+        if crate::serial::is_serial_ssh_active() {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial-SSH gateway is active.")
+            ))
+            .await?;
+            self.send_line("  SSH snooping is not allowed.")
+                .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        // Check if serial port is busy (modem online)
+        if crate::serial::is_serial_port_busy() {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial port is busy.")
+            ))
+            .await?;
+            self.send_line("  The modem has an active connection.")
+                .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        // Create duplex bridge
+        let (user_stream, serial_stream) = tokio::io::duplex(4096);
+
+        if !crate::serial::request_serial_gateway(serial_stream) {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial port is not available.")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        self.send_line(&format!(
+            "  Connecting to {}...",
+            self.amber(&cfg.serial_port)
+        ))
+        .await?;
+        self.flush().await?;
+
+        // Wait briefly for the serial thread to pick up the request.
+        // The serial thread polls every ~100ms (SERIAL_READ_TIMEOUT).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        self.send_line(&format!(
+            "  {}",
+            self.green("Connected.")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Press {} twice to disconnect.",
+            self.cyan(esc_label)
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.flush().await?;
+
+        // Proxy I/O: telnet/SSH client ↔ serial port (via duplex bridge)
+        let (mut bridge_reader, mut bridge_writer) = tokio::io::split(user_stream);
+
+        let reader = &mut self.reader;
+        let writer = &self.writer;
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+
+        let mut bridge_buf = [0u8; 4096];
+        let mut last_was_esc = false;
+
+        loop {
+            tokio::select! {
+                byte = read_byte_iac_filtered(reader, true) => {
+                    match byte {
+                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
+                            if last_was_esc {
+                                break; // Two consecutive ESC presses — disconnect
+                            }
+                            last_was_esc = true;
+                        }
+                        Ok(Some(b)) => {
+                            if last_was_esc {
+                                last_was_esc = false;
+                                // Forward the previously held ESC
+                                if bridge_writer.write_all(&[0x1B]).await.is_err() { break; }
+                            }
+                            if bridge_writer.write_all(&[b]).await.is_err() { break; }
+                            if bridge_writer.flush().await.is_err() { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                n = bridge_reader.read(&mut bridge_buf) => {
+                    match n {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut w = writer.lock().await;
+                            if w.write_all(&bridge_buf[..n]).await.is_err() { break; }
+                            if w.flush().await.is_err() { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        // Clean up — dropping bridge_writer closes the duplex, causing the
+        // serial thread's gateway loop to exit.
+        drop(bridge_writer);
+        drop(bridge_reader);
+
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("Connection closed.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        if idle_timeout.is_zero() {
+            self.wait_for_key().await?;
+        } else {
+            match tokio::time::timeout(idle_timeout, self.wait_for_key()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = self
+                        .send_line("\r\nDisconnected: idle timeout.")
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ─── TELNET GATEWAY ──────────────────────────────────────
 
     /// Telnet gateway: connect to a remote telnet server and proxy the session.
@@ -4173,6 +4386,7 @@ impl TelnetSession {
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
                 "  +++  Return to command mode",
+                "  ATO  Return online",
                 "  ATH  Hang up",
             ]
         } else {
@@ -4187,6 +4401,7 @@ impl TelnetSession {
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
                 "  +++    Return to command mode",
+                "  ATO    Return to online mode",
                 "  ATH    Hang up connection",
             ]
         };
@@ -6079,6 +6294,8 @@ mod tests {
         let messages = [
             "Input too long.",
             "Press A, B, F, M, R, S, T, W, X, or H.",
+            // Non-serial prompt includes E but is only shown to
+            // ANSI/SSH users (80 cols), so it is not tested here.
             "Press U, D, X, C, I, R, Q, or H.",
             "Disk space is low. Uploads disabled.",
             "File already exists.",
@@ -6121,6 +6338,13 @@ mod tests {
             "Not found.",
             "Invalid number.",
             "Unknown command.",
+            // Serial gateway
+            "Serial port is not enabled.",
+            "Serial-SSH gateway is active.",
+            "SSH snooping is not allowed.",
+            "Serial port is busy.",
+            "The modem has an active connection.",
+            "Serial port is not available.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -6142,6 +6366,7 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
+            "  E  Serial Gateway",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6184,8 +6409,8 @@ mod tests {
     /// Main menu screen: header(3) + blank + 9 items + blank + help + prompt = 15 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15 lines
-        let rows = 15;
+        // Non-serial: sep, title, sep, blank, A, B, E, F, M, R, S, T, W, X, blank, H=Help = 16
+        let rows = 16;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
@@ -6284,11 +6509,11 @@ mod tests {
         assert!(rows <= 22, "stop bits screen is {} rows, exceeds 22", rows);
     }
 
-    /// Modem help screen (ANSI): header(3) + blank + 11 content lines +
-    /// blank + "Press any key" = 16 rows.
+    /// Modem help screen (ANSI): header(3) + blank + 12 content lines +
+    /// blank + "Press any key" = 18 rows.
     #[test]
     fn test_modem_help_screen_row_count() {
-        let rows = 3 + 1 + 11 + 1 + 1; // 17
+        let rows = 3 + 1 + 12 + 1 + 1; // 18
         assert!(rows <= 22, "modem help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6296,7 +6521,8 @@ mod tests {
     /// blank + "Press any key" = 19 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        // Non-serial: 14 base lines + 2 serial gateway lines = 16 content lines
+        let rows = 3 + 1 + 16 + 1 + 1; // 22
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6307,6 +6533,8 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
+            "  E  Serial Gateway: interact with",
+            "     a device on the serial port",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
@@ -6373,6 +6601,7 @@ mod tests {
             "  ATDT host:port",
             "    Dial a remote telnet host",
             "  +++  Return to command mode",
+            "  ATO  Return online",
             "  ATH  Hang up",
         ];
         for line in &lines {

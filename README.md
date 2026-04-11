@@ -23,7 +23,7 @@ Install build dependencies and the Rust toolchain:
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential pkg-config cmake curl
+sudo apt install -y build-essential pkg-config cmake curl libudev-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
@@ -117,6 +117,7 @@ enabled), the main menu offers:
 ```
   A  AI Chat
   B  Simple Browser
+  E  Serial Gateway  (telnet/SSH only)
   F  File Transfer
   M  Modem Emulator
   R  Troubleshooting
@@ -273,6 +274,33 @@ transferring binary files that may contain 0xFF, enable IAC escaping with the
 must agree on whether IAC escaping is active. For text files or when your client
 handles this automatically, leave it off (the default).
 
+## Serial Gateway
+
+The Serial Gateway allows telnet and SSH users to interact directly with a
+device connected to the serial port. This is useful for remote access to
+equipment that has a serial console (routers, switches, embedded systems, retro
+hardware, etc.).
+
+1. From the main menu, press **E** (Serial Gateway)
+2. The server connects you to the configured serial port
+3. All input and output is proxied between your terminal and the serial device
+4. Press **ESC** twice (or **<-** twice on PETSCII) to disconnect
+
+### Requirements
+
+- The serial port must be enabled and configured (via `xmodem.conf` or the
+  Modem Emulator menu)
+- The modem emulator must not have an active connection (the serial port
+  cannot be shared while the modem is in online mode)
+
+### Restrictions
+
+- **Serial users** do not see the Serial Gateway option (prevents feedback
+  loops where a serial device would interact with its own port)
+- **SSH snooping blocked**: If the device on the serial port is currently
+  using the SSH Gateway feature, the Serial Gateway is disabled. This
+  prevents telnet/SSH users from observing encrypted SSH sessions in transit.
+
 ## SSH Server
 
 The SSH server provides encrypted access to the same gateway menus and features
@@ -372,13 +400,31 @@ Or edit `xmodem.conf` directly and restart the server.
 | Command | Action |
 |---------|--------|
 | `AT`    | OK (attention) |
-| `ATZ`   | Reset modem |
+| `ATZ`   | Reset modem (echo on, verbose on, quiet off) |
+| `AT&F`  | Factory defaults (same as ATZ) |
 | `ATE0` / `ATE1` | Echo off / on |
+| `ATV0` / `ATV1` | Numeric / verbose result codes |
+| `ATQ0` / `ATQ1` | Result codes on / quiet mode (suppress results) |
 | `ATI`   | Show modem identification |
-| `ATH`   | Hang up |
+| `ATH`   | Hang up (close any active connection) |
+| `ATA`   | Answer (returns NO CARRIER — no incoming calls) |
+| `ATO`   | Return to online mode (resume after `+++` escape) |
 | `ATDT xmodem-gateway` | Connect to this gateway's menus |
 | `ATDT host:port` | Dial a remote telnet host |
 | `+++`   | Return to command mode (with 1-second guard time) |
+
+**Result codes:** In verbose mode (default), results are text (`OK`, `CONNECT`,
+`NO CARRIER`, `ERROR`). In numeric mode (`ATV0`), results are digits (`0`, `1`,
+`3`, `4`). Quiet mode (`ATQ1`) suppresses all result codes.
+
+### Serial Safety
+
+### Escaping and Resuming
+
+The `+++` escape sequence returns to command mode while keeping the connection
+alive. Type `ATO` to resume the connection, or `ATH` to hang up. This follows
+standard Hayes modem behavior: one second of silence, then `+++`, then another
+second of silence.
 
 ### Serial Safety
 

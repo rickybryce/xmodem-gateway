@@ -26,6 +26,20 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Flag to signal the serial thread to restart with new config.
 static SERIAL_RESTART: AtomicBool = AtomicBool::new(false);
 
+/// True when the serial device's TelnetSession is inside the SSH gateway.
+/// Checked by the serial gateway to prevent SSH snooping.
+static SERIAL_SSH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True when the modem is in online mode or serial gateway is bridging.
+/// Prevents a second gateway session from starting while the port is busy.
+static SERIAL_PORT_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Slot for a telnet/SSH session to request serial port access.
+/// The serial thread checks this on each command-mode tick and, when
+/// present, enters passthrough mode bridging serial port ↔ duplex.
+static SERIAL_GATEWAY_REQUEST: std::sync::Mutex<Option<tokio::io::DuplexStream>> =
+    std::sync::Mutex::new(None);
+
 // ─── Modem state ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,10 +48,30 @@ enum ModemMode {
     Online,
 }
 
+/// An active connection preserved across a +++ escape so that ATO can resume.
+enum ActiveConnection {
+    Tcp(std::net::TcpStream),
+    Duplex {
+        read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    },
+}
+
+/// Why the online-mode loop exited.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OnlineExit {
+    /// Remote end disconnected or I/O error.
+    Disconnected,
+    /// User sent +++ escape sequence.
+    Escaped,
+}
+
 struct ModemState {
     port: Box<dyn serialport::SerialPort>,
     mode: ModemMode,
     echo: bool,
+    verbose: bool,
+    quiet: bool,
     last_data_time: Instant,
     plus_count: u8,
     plus_start: Instant,
@@ -45,6 +79,8 @@ struct ModemState {
     handle: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
     baud: u32,
+    /// Connection preserved after +++ escape for ATO to resume.
+    active_connection: Option<ActiveConnection>,
 }
 
 // ─── Public API ────────────────────────────────────────────
@@ -78,6 +114,33 @@ pub fn list_serial_ports() -> Vec<String> {
         Ok(ports) => ports.into_iter().map(|p| p.port_name).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// True when the serial device's session is inside the SSH gateway.
+pub fn is_serial_ssh_active() -> bool {
+    SERIAL_SSH_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Set the SSH-gateway-active flag (called by TelnetSession for serial sessions).
+pub fn set_serial_ssh_active(active: bool) {
+    SERIAL_SSH_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+/// True when the serial port is busy (modem online or gateway active).
+pub fn is_serial_port_busy() -> bool {
+    SERIAL_PORT_BUSY.load(Ordering::SeqCst)
+}
+
+/// Submit a serial gateway request.  The serial thread will pick it up
+/// and bridge the duplex stream to the serial port.  Returns `false` if
+/// a request is already pending.
+pub fn request_serial_gateway(stream: tokio::io::DuplexStream) -> bool {
+    let mut slot = SERIAL_GATEWAY_REQUEST.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return false; // another session already waiting
+    }
+    *slot = Some(stream);
+    true
 }
 
 // ─── Serial manager ────────────────────────────────────────
@@ -152,6 +215,8 @@ fn serial_thread(
         port,
         mode: ModemMode::Command,
         echo: true,
+        verbose: true,
+        quiet: false,
         last_data_time: now,
         plus_count: 0,
         plus_start: now,
@@ -159,11 +224,17 @@ fn serial_thread(
         handle,
         shutdown,
         baud: cfg.serial_baud,
+        active_connection: None,
     };
 
     send_response(&mut state.port, "OK");
 
     while !state.shutdown.load(Ordering::SeqCst) && !SERIAL_RESTART.load(Ordering::SeqCst) {
+        // Check for a pending serial gateway request before modem processing.
+        if let Some(stream) = take_gateway_request() {
+            run_serial_gateway(&mut state, stream);
+            continue;
+        }
         match state.mode {
             ModemMode::Command => command_mode_tick(&mut state),
             ModemMode::Online => {
@@ -234,13 +305,25 @@ fn command_mode_tick(state: &mut ModemState) {
 enum AtResult {
     Ok,
     Error,
+    NoCarrier,
     Info(String),
     Dial(String),
+    /// ATO — return to online mode (resume after +++ escape).
+    Online,
+    /// ATH — hang up (close any active connection).
+    Hangup,
+    /// ATZ / AT&F — reset modem settings (also closes active connection).
+    Reset,
 }
 
 /// Parse an AT command line into a list of responses.  Pure function for
-/// testability — does not touch the serial port.
-fn parse_at_command(cmd: &str, echo: &mut bool) -> Vec<AtResult> {
+/// testability — does not touch the serial port or active connection.
+fn parse_at_command(
+    cmd: &str,
+    echo: &mut bool,
+    verbose: &mut bool,
+    quiet: &mut bool,
+) -> Vec<AtResult> {
     let upper = cmd.to_ascii_uppercase();
 
     if upper == "AT" {
@@ -256,15 +339,33 @@ fn parse_at_command(cmd: &str, echo: &mut bool) -> Vec<AtResult> {
     match rest {
         "Z" => {
             *echo = true;
-            vec![AtResult::Ok]
+            *verbose = true;
+            *quiet = false;
+            vec![AtResult::Reset]
         }
-        "H" | "H0" => vec![AtResult::Ok],
+        "H" | "H0" => vec![AtResult::Hangup],
         "E0" => {
             *echo = false;
             vec![AtResult::Ok]
         }
         "E1" => {
             *echo = true;
+            vec![AtResult::Ok]
+        }
+        "V0" => {
+            *verbose = false;
+            vec![AtResult::Ok]
+        }
+        "V1" => {
+            *verbose = true;
+            vec![AtResult::Ok]
+        }
+        "Q0" => {
+            *quiet = false;
+            vec![AtResult::Ok]
+        }
+        "Q1" => {
+            *quiet = true;
             vec![AtResult::Ok]
         }
         "I" | "I0" => vec![
@@ -274,6 +375,14 @@ fn parse_at_command(cmd: &str, echo: &mut bool) -> Vec<AtResult> {
             )),
             AtResult::Ok,
         ],
+        "O" | "O0" => vec![AtResult::Online],
+        "A" => vec![AtResult::NoCarrier],
+        "&F" => {
+            *echo = true;
+            *verbose = true;
+            *quiet = false;
+            vec![AtResult::Reset]
+        }
         _ if rest.starts_with("DT") || rest.starts_with("DP") || rest.starts_with("D") => {
             // Preserve original case for the dial string (hostnames).
             let dial_str = if rest.starts_with("DT") || rest.starts_with("DP") {
@@ -288,22 +397,88 @@ fn parse_at_command(cmd: &str, echo: &mut bool) -> Vec<AtResult> {
             }
         }
         _ => {
-            // Accept unknown AT commands silently (ATV, ATQ, AT&F, etc.)
+            // Accept unknown AT commands silently (AT&C, AT&D, ATL, ATM, etc.)
             vec![AtResult::Ok]
         }
     }
 }
 
 fn process_at_command(state: &mut ModemState, cmd: &str) {
-    let results = parse_at_command(cmd, &mut state.echo);
+    let results = parse_at_command(
+        cmd,
+        &mut state.echo,
+        &mut state.verbose,
+        &mut state.quiet,
+    );
     for result in results {
         match result {
-            AtResult::Ok => send_response(&mut state.port, "OK"),
-            AtResult::Error => send_response(&mut state.port, "ERROR"),
-            AtResult::Info(msg) => send_response(&mut state.port, &msg),
+            AtResult::Ok => send_result(state, "OK"),
+            AtResult::Error => send_result(state, "ERROR"),
+            AtResult::NoCarrier => send_result(state, "NO CARRIER"),
+            AtResult::Info(msg) => {
+                if !state.quiet {
+                    send_response(&mut state.port, &msg);
+                }
+            }
             AtResult::Dial(target) => {
+                // Hang up any existing connection before dialing.
+                state.active_connection = None;
                 handle_dial(state, &target);
                 return; // dial takes over the session
+            }
+            AtResult::Online => {
+                handle_return_online(state);
+                return; // online mode takes over
+            }
+            AtResult::Hangup => {
+                state.active_connection = None;
+                send_result(state, "OK");
+            }
+            AtResult::Reset => {
+                state.active_connection = None;
+                send_result(state, "OK");
+            }
+        }
+    }
+}
+
+/// ATO — resume a connection that was suspended with +++.
+fn handle_return_online(state: &mut ModemState) {
+    let Some(conn) = state.active_connection.take() else {
+        send_result(state, "NO CARRIER");
+        return;
+    };
+    send_result(state, &format!("CONNECT {}", state.baud));
+    state.mode = ModemMode::Online;
+    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
+    match conn {
+        ActiveConnection::Tcp(mut tcp) => {
+            let exit = online_mode_tcp(state, &mut tcp);
+            state.mode = ModemMode::Command;
+            SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+            match exit {
+                OnlineExit::Escaped => {
+                    state.active_connection = Some(ActiveConnection::Tcp(tcp));
+                    send_result(state, "OK");
+                }
+                OnlineExit::Disconnected => {
+                    send_result(state, "NO CARRIER");
+                }
+            }
+        }
+        ActiveConnection::Duplex { mut read, mut write } => {
+            let exit = online_mode_duplex(state, &mut read, &mut write);
+            state.mode = ModemMode::Command;
+            SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+            match exit {
+                OnlineExit::Escaped => {
+                    state.active_connection =
+                        Some(ActiveConnection::Duplex { read, write });
+                    send_result(state, "OK");
+                }
+                OnlineExit::Disconnected => {
+                    send_result(state, "NO CARRIER");
+                }
             }
         }
     }
@@ -321,7 +496,7 @@ fn handle_dial(state: &mut ModemState, target: &str) {
             match p.parse::<u16>() {
                 Ok(port) if port > 0 => (h.to_string(), port),
                 _ => {
-                    send_response(&mut state.port, "ERROR");
+                    send_result(state, "ERROR");
                     return;
                 }
             }
@@ -334,8 +509,9 @@ fn handle_dial(state: &mut ModemState, target: &str) {
 
 /// Dial into the local XMODEM Gateway menu via an in-memory duplex bridge.
 fn dial_xmodem_gateway(state: &mut ModemState) {
-    send_response(&mut state.port, &format!("CONNECT {}", state.baud));
+    send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
+    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
 
     // Create a duplex pair: one end for TelnetSession, the other for this thread.
     let (async_stream, serial_stream) = tokio::io::duplex(4096);
@@ -365,10 +541,22 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
     // Bridge serial port <-> duplex stream on this thread.
     let (mut duplex_read, mut duplex_write) =
         tokio::io::split(serial_stream);
-    online_mode_duplex(state, &mut duplex_read, &mut duplex_write);
+    let exit = online_mode_duplex(state, &mut duplex_read, &mut duplex_write);
 
     state.mode = ModemMode::Command;
-    send_response(&mut state.port, "NO CARRIER");
+    SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+    match exit {
+        OnlineExit::Escaped => {
+            state.active_connection = Some(ActiveConnection::Duplex {
+                read: duplex_read,
+                write: duplex_write,
+            });
+            send_result(state, "OK");
+        }
+        OnlineExit::Disconnected => {
+            send_result(state, "NO CARRIER");
+        }
+    }
 }
 
 /// Dial a remote telnet host via blocking TCP.
@@ -380,34 +568,44 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
         Ok(mut addrs) => match addrs.next() {
             Some(a) => a,
             None => {
-                send_response(&mut state.port, "NO CARRIER");
+                send_result(state, "NO CARRIER");
                 return;
             }
         },
         Err(_) => {
-            send_response(&mut state.port, "NO CARRIER");
+            send_result(state, "NO CARRIER");
             return;
         }
     };
 
-    let stream =
+    let mut stream =
         match std::net::TcpStream::connect_timeout(&socket_addr, TCP_CONNECT_TIMEOUT) {
             Ok(s) => s,
             Err(_) => {
-                send_response(&mut state.port, "NO CARRIER");
+                send_result(state, "NO CARRIER");
                 return;
             }
         };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(SERIAL_READ_TIMEOUT));
 
-    send_response(&mut state.port, &format!("CONNECT {}", state.baud));
+    send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
+    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
 
-    online_mode_tcp(state, stream);
+    let exit = online_mode_tcp(state, &mut stream);
 
     state.mode = ModemMode::Command;
-    send_response(&mut state.port, "NO CARRIER");
+    SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+    match exit {
+        OnlineExit::Escaped => {
+            state.active_connection = Some(ActiveConnection::Tcp(stream));
+            send_result(state, "OK");
+        }
+        OnlineExit::Disconnected => {
+            send_result(state, "NO CARRIER");
+        }
+    }
 }
 
 // ─── Online mode (data passthrough) ────────────────────────
@@ -416,11 +614,12 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
 ///
 /// Uses `Handle::block_on` to perform async reads/writes on the duplex stream.
 /// This is safe because the serial thread is a `std::thread`, not a tokio task.
+/// Returns `Escaped` if the user sent +++, `Disconnected` on I/O error or EOF.
 fn online_mode_duplex(
     state: &mut ModemState,
     duplex_read: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
     duplex_write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
-) {
+) -> OnlineExit {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut serial_buf = [0u8; 256];
@@ -431,12 +630,12 @@ fn online_mode_duplex(
 
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
-            break;
+            return OnlineExit::Disconnected;
         }
 
         // Serial → duplex
         match state.port.read(&mut serial_buf) {
-            Ok(0) => break,
+            Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
                 let mut forward = Vec::with_capacity(n);
                 process_online_bytes(state, &serial_buf[..n], &mut forward);
@@ -450,12 +649,12 @@ fn online_mode_duplex(
                     });
                     match result {
                         Ok(Ok(())) => {}
-                        _ => break,
+                        _ => return OnlineExit::Disconnected,
                     }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
+            Err(_) => return OnlineExit::Disconnected,
         }
 
         // Duplex → serial
@@ -464,23 +663,24 @@ fn online_mode_duplex(
                 .await
         });
         match result {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0)) => return OnlineExit::Disconnected,
             Ok(Ok(n)) => {
                 let _ = state.port.write_all(&duplex_buf[..n]);
             }
-            Ok(Err(_)) => break,
+            Ok(Err(_)) => return OnlineExit::Disconnected,
             Err(_) => {} // timeout — no data from duplex
         }
 
         // Check trailing +++ guard time
         if check_plus_complete(state) {
-            return;
+            return OnlineExit::Escaped;
         }
     }
 }
 
 /// Online mode for direct TCP connections (ATDT host:port).
-fn online_mode_tcp(state: &mut ModemState, mut tcp: std::net::TcpStream) {
+/// Returns `Escaped` if the user sent +++, `Disconnected` on I/O error or EOF.
+fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> OnlineExit {
     let mut serial_buf = [0u8; 256];
     let mut tcp_buf = [0u8; 4096];
 
@@ -489,38 +689,38 @@ fn online_mode_tcp(state: &mut ModemState, mut tcp: std::net::TcpStream) {
 
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
-            break;
+            return OnlineExit::Disconnected;
         }
 
         // Serial → TCP
         match state.port.read(&mut serial_buf) {
-            Ok(0) => break,
+            Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
                 let mut forward = Vec::with_capacity(n);
                 process_online_bytes(state, &serial_buf[..n], &mut forward);
                 if !forward.is_empty() && tcp.write_all(&forward).is_err() {
-                    break;
+                    return OnlineExit::Disconnected;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
+            Err(_) => return OnlineExit::Disconnected,
         }
 
         // TCP → serial
         match tcp.read(&mut tcp_buf) {
-            Ok(0) => break,
+            Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
                 let _ = state.port.write_all(&tcp_buf[..n]);
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
+            Err(_) => return OnlineExit::Disconnected,
         }
 
         // Check trailing +++ guard time
         if check_plus_complete(state) {
-            return;
+            return OnlineExit::Escaped;
         }
     }
 }
@@ -586,12 +786,104 @@ fn check_plus_complete(state: &mut ModemState) -> bool {
     false
 }
 
+// ─── Serial gateway (remote access to serial port) ────────
+
+/// Take a pending gateway request from the global slot, if any.
+fn take_gateway_request() -> Option<tokio::io::DuplexStream> {
+    SERIAL_GATEWAY_REQUEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Bridge the serial port directly to a duplex stream from a telnet/SSH session.
+/// The modem emulator is paused while this runs.  Exits when the duplex closes.
+fn run_serial_gateway(state: &mut ModemState, stream: tokio::io::DuplexStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
+    eprintln!("Serial gateway: session started");
+
+    let (mut duplex_read, mut duplex_write) = tokio::io::split(stream);
+    let mut serial_buf = [0u8; 256];
+    let mut duplex_buf = [0u8; 4096];
+
+    loop {
+        if state.shutdown.load(Ordering::SeqCst) || SERIAL_RESTART.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Serial port → duplex (to telnet/SSH user)
+        match state.port.read(&mut serial_buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let result = state.handle.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        duplex_write.write_all(&serial_buf[..n]),
+                    )
+                    .await
+                });
+                match result {
+                    Ok(Ok(())) => {}
+                    _ => break,
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+
+        // Duplex (from telnet/SSH user) → serial port
+        let result = state.handle.block_on(async {
+            tokio::time::timeout(Duration::from_millis(10), duplex_read.read(&mut duplex_buf))
+                .await
+        });
+        match result {
+            Ok(Ok(0)) => break, // user disconnected
+            Ok(Ok(n)) => {
+                let _ = state.port.write_all(&duplex_buf[..n]);
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {} // timeout — no data from user
+        }
+    }
+
+    SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+    eprintln!("Serial gateway: session ended");
+}
+
 // ─── Helpers ───────────────────────────────────────────────
 
 fn send_response(port: &mut Box<dyn serialport::SerialPort>, msg: &str) {
     let response = format!("\r\n{}\r\n", msg);
     let _ = port.write_all(response.as_bytes());
     let _ = port.flush();
+}
+
+/// Send a result code, respecting verbose/quiet settings.
+fn send_result(state: &mut ModemState, msg: &str) {
+    if state.quiet {
+        return;
+    }
+    if state.verbose {
+        let response = format!("\r\n{}\r\n", msg);
+        let _ = state.port.write_all(response.as_bytes());
+    } else {
+        let code = match msg {
+            "OK" => "0",
+            _ if msg.starts_with("CONNECT") => "1",
+            "RING" => "2",
+            "NO CARRIER" => "3",
+            "ERROR" => "4",
+            "NO DIALTONE" => "6",
+            "BUSY" => "7",
+            "NO ANSWER" => "8",
+            _ => msg,
+        };
+        let response = format!("{}\r", code);
+        let _ = state.port.write_all(response.as_bytes());
+    }
+    let _ = state.port.flush();
 }
 
 // ─── Tests ─────────────────────────────────────────────────
@@ -602,48 +894,72 @@ mod tests {
 
     // ─── AT command parsing ──────────────────────────────
 
+    /// Helper: call parse_at_command with default verbose/quiet settings.
+    fn parse(cmd: &str, echo: &mut bool) -> Vec<AtResult> {
+        let mut verbose = true;
+        let mut quiet = false;
+        parse_at_command(cmd, echo, &mut verbose, &mut quiet)
+    }
+
+    /// Helper: call parse_at_command with full settings access.
+    fn parse_full(
+        cmd: &str,
+        echo: &mut bool,
+        verbose: &mut bool,
+        quiet: &mut bool,
+    ) -> Vec<AtResult> {
+        parse_at_command(cmd, echo, verbose, quiet)
+    }
+
     #[test]
     fn test_at_bare() {
         let mut echo = true;
-        assert_eq!(parse_at_command("AT", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("AT", &mut echo), vec![AtResult::Ok]);
         assert!(echo);
     }
 
     #[test]
     fn test_at_case_insensitive() {
         let mut echo = true;
-        assert_eq!(parse_at_command("at", &mut echo), vec![AtResult::Ok]);
-        assert_eq!(parse_at_command("At", &mut echo), vec![AtResult::Ok]);
-        assert_eq!(parse_at_command("aT", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("at", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("At", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("aT", &mut echo), vec![AtResult::Ok]);
     }
 
     #[test]
-    fn test_atz_resets_echo() {
+    fn test_atz_resets_all() {
         let mut echo = false;
-        assert_eq!(parse_at_command("ATZ", &mut echo), vec![AtResult::Ok]);
+        let mut verbose = false;
+        let mut quiet = true;
+        assert_eq!(
+            parse_full("ATZ", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Reset]
+        );
         assert!(echo, "ATZ should reset echo to true");
+        assert!(verbose, "ATZ should reset verbose to true");
+        assert!(!quiet, "ATZ should reset quiet to false");
     }
 
     #[test]
     fn test_ate0_ate1() {
         let mut echo = true;
-        assert_eq!(parse_at_command("ATE0", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("ATE0", &mut echo), vec![AtResult::Ok]);
         assert!(!echo);
-        assert_eq!(parse_at_command("ATE1", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("ATE1", &mut echo), vec![AtResult::Ok]);
         assert!(echo);
     }
 
     #[test]
     fn test_ath() {
         let mut echo = true;
-        assert_eq!(parse_at_command("ATH", &mut echo), vec![AtResult::Ok]);
-        assert_eq!(parse_at_command("ATH0", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("ATH", &mut echo), vec![AtResult::Hangup]);
+        assert_eq!(parse("ATH0", &mut echo), vec![AtResult::Hangup]);
     }
 
     #[test]
     fn test_ati() {
         let mut echo = true;
-        let results = parse_at_command("ATI", &mut echo);
+        let results = parse("ATI", &mut echo);
         assert_eq!(results.len(), 2);
         match &results[0] {
             AtResult::Info(msg) => assert!(msg.contains("XMODEM Gateway")),
@@ -655,7 +971,7 @@ mod tests {
     #[test]
     fn test_atdt_gateway() {
         let mut echo = true;
-        let results = parse_at_command("ATDT xmodem-gateway", &mut echo);
+        let results = parse("ATDT xmodem-gateway", &mut echo);
         assert_eq!(results.len(), 1);
         match &results[0] {
             AtResult::Dial(target) => assert_eq!(target, "xmodem-gateway"),
@@ -666,7 +982,7 @@ mod tests {
     #[test]
     fn test_atdt_host_port() {
         let mut echo = true;
-        let results = parse_at_command("ATDT telnetbible.com:6400", &mut echo);
+        let results = parse("ATDT telnetbible.com:6400", &mut echo);
         assert_eq!(results.len(), 1);
         match &results[0] {
             AtResult::Dial(target) => assert_eq!(target, "telnetbible.com:6400"),
@@ -677,7 +993,7 @@ mod tests {
     #[test]
     fn test_atdt_host_no_port() {
         let mut echo = true;
-        let results = parse_at_command("ATDT somehost.com", &mut echo);
+        let results = parse("ATDT somehost.com", &mut echo);
         assert_eq!(results.len(), 1);
         match &results[0] {
             AtResult::Dial(target) => assert_eq!(target, "somehost.com"),
@@ -688,14 +1004,14 @@ mod tests {
     #[test]
     fn test_atdt_empty_target() {
         let mut echo = true;
-        assert_eq!(parse_at_command("ATDT", &mut echo), vec![AtResult::Error]);
-        assert_eq!(parse_at_command("ATDT ", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATDT", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATDT ", &mut echo), vec![AtResult::Error]);
     }
 
     #[test]
     fn test_atdp_pulse_dial() {
         let mut echo = true;
-        let results = parse_at_command("ATDP somehost.com", &mut echo);
+        let results = parse("ATDP somehost.com", &mut echo);
         assert_eq!(results.len(), 1);
         match &results[0] {
             AtResult::Dial(target) => assert_eq!(target, "somehost.com"),
@@ -706,24 +1022,121 @@ mod tests {
     #[test]
     fn test_non_at_command() {
         let mut echo = true;
-        assert_eq!(parse_at_command("HELLO", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("HELLO", &mut echo), vec![AtResult::Error]);
     }
 
     #[test]
     fn test_unknown_at_command_accepted() {
         let mut echo = true;
-        assert_eq!(parse_at_command("AT&F", &mut echo), vec![AtResult::Ok]);
-        assert_eq!(parse_at_command("ATV1", &mut echo), vec![AtResult::Ok]);
-        assert_eq!(parse_at_command("ATQ0", &mut echo), vec![AtResult::Ok]);
+        // These are NOT recognized commands, so they hit the catch-all OK
+        assert_eq!(parse("AT&C", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("ATL2", &mut echo), vec![AtResult::Ok]);
+        assert_eq!(parse("ATM1", &mut echo), vec![AtResult::Ok]);
     }
 
     #[test]
     fn test_atdt_preserves_case() {
         let mut echo = true;
-        let results = parse_at_command("ATDT TelnetBible.Com:6400", &mut echo);
+        let results = parse("ATDT TelnetBible.Com:6400", &mut echo);
         match &results[0] {
             AtResult::Dial(target) => assert_eq!(target, "TelnetBible.Com:6400"),
             other => panic!("Expected Dial, got {:?}", other),
+        }
+    }
+
+    // ─── New AT commands ────────────────────────────────
+
+    #[test]
+    fn test_atv0_atv1() {
+        let mut echo = true;
+        let mut verbose = true;
+        let mut quiet = false;
+        assert_eq!(
+            parse_full("ATV0", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Ok]
+        );
+        assert!(!verbose);
+        assert_eq!(
+            parse_full("ATV1", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Ok]
+        );
+        assert!(verbose);
+    }
+
+    #[test]
+    fn test_atq0_atq1() {
+        let mut echo = true;
+        let mut verbose = true;
+        let mut quiet = false;
+        assert_eq!(
+            parse_full("ATQ1", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Ok]
+        );
+        assert!(quiet);
+        assert_eq!(
+            parse_full("ATQ0", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Ok]
+        );
+        assert!(!quiet);
+    }
+
+    #[test]
+    fn test_ato() {
+        let mut echo = true;
+        assert_eq!(parse("ATO", &mut echo), vec![AtResult::Online]);
+        assert_eq!(parse("ATO0", &mut echo), vec![AtResult::Online]);
+    }
+
+    #[test]
+    fn test_ata_no_carrier() {
+        let mut echo = true;
+        assert_eq!(parse("ATA", &mut echo), vec![AtResult::NoCarrier]);
+    }
+
+    #[test]
+    fn test_at_ampersand_f_resets_all() {
+        let mut echo = false;
+        let mut verbose = false;
+        let mut quiet = true;
+        assert_eq!(
+            parse_full("AT&F", &mut echo, &mut verbose, &mut quiet),
+            vec![AtResult::Reset]
+        );
+        assert!(echo, "AT&F should reset echo to true");
+        assert!(verbose, "AT&F should reset verbose to true");
+        assert!(!quiet, "AT&F should reset quiet to false");
+    }
+
+    #[test]
+    fn test_numeric_result_codes() {
+        // Verify the mapping used by send_result in non-verbose mode
+        let codes = [
+            ("OK", "0"),
+            ("CONNECT 9600", "1"),
+            ("RING", "2"),
+            ("NO CARRIER", "3"),
+            ("ERROR", "4"),
+            ("NO DIALTONE", "6"),
+            ("BUSY", "7"),
+            ("NO ANSWER", "8"),
+        ];
+        for (verbose_msg, expected_code) in &codes {
+            let code = match *verbose_msg {
+                "OK" => "0",
+                m if m.starts_with("CONNECT") => "1",
+                "RING" => "2",
+                "NO CARRIER" => "3",
+                "ERROR" => "4",
+                "NO DIALTONE" => "6",
+                "BUSY" => "7",
+                "NO ANSWER" => "8",
+                _ => verbose_msg,
+            };
+            assert_eq!(
+                code, *expected_code,
+                "numeric code for '{}' should be '{}'",
+                verbose_msg, expected_code
+            );
         }
     }
 
@@ -928,5 +1341,47 @@ mod tests {
     #[test]
     fn test_tcp_connect_timeout_constant() {
         assert_eq!(TCP_CONNECT_TIMEOUT, Duration::from_secs(15));
+    }
+
+    // ─── Serial gateway state ───────────────────────────
+
+    #[test]
+    fn test_serial_ssh_active_flag() {
+        set_serial_ssh_active(false);
+        assert!(!is_serial_ssh_active());
+        set_serial_ssh_active(true);
+        assert!(is_serial_ssh_active());
+        set_serial_ssh_active(false);
+    }
+
+    #[test]
+    fn test_serial_port_busy_flag() {
+        SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+        assert!(!is_serial_port_busy());
+        SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
+        assert!(is_serial_port_busy());
+        SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_gateway_request_slot() {
+        // Slot should start empty
+        assert!(take_gateway_request().is_none());
+
+        // Submit a request
+        let (a, b) = tokio::io::duplex(64);
+        assert!(request_serial_gateway(a));
+        drop(b); // keep the pair valid briefly
+
+        // Second request should be rejected while first is pending
+        let (c, d) = tokio::io::duplex(64);
+        assert!(!request_serial_gateway(c));
+        drop(d);
+
+        // Take the first request
+        assert!(take_gateway_request().is_some());
+
+        // Slot is now empty again
+        assert!(take_gateway_request().is_none());
     }
 }
