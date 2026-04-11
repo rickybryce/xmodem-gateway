@@ -1757,7 +1757,7 @@ impl TelnetSession {
                 QuadPart: u64,
             }
 
-            extern "system" {
+            unsafe extern "system" {
                 fn GetDiskFreeSpaceExW(
                     lpDirectoryName: *const u16,
                     lpFreeBytesAvailableToCaller: *mut ULARGE_INTEGER,
