@@ -8,6 +8,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::config;
 use crate::telnet::is_esc_key;
 
 // XMODEM protocol constants
@@ -31,12 +32,8 @@ const DONT: u8 = 254;
 pub(crate) const XMODEM_BLOCK_SIZE: usize = 128;
 
 const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
-/// How long to wait for the remote side to begin the transfer (negotiation phase).
-const NEGOTIATION_TIMEOUT_SECS: u64 = 90;
-const BLOCK_TIMEOUT_SECS: u64 = 20;
 /// Time allowed for the full 131-byte block body (after SOH) to arrive.
 const BLOCK_BODY_TIMEOUT_SECS: u64 = 60;
-const MAX_RETRIES: usize = 10;
 
 #[derive(Clone, Copy)]
 enum TransferMode {
@@ -55,18 +52,27 @@ pub(crate) async fn xmodem_receive(
     is_petscii: bool,
     verbose: bool,
 ) -> Result<Vec<u8>, String> {
+    let cfg = config::get_config();
+    let negotiation_timeout = cfg.xmodem_negotiation_timeout;
+    let block_timeout = cfg.xmodem_block_timeout;
+    let max_retries = cfg.xmodem_max_retries;
+
     let mut file_data = Vec::new();
     let mut expected_block: u8 = 1;
     let negotiation_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(NEGOTIATION_TIMEOUT_SECS);
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(negotiation_timeout);
 
     if verbose { eprintln!("XMODEM recv: starting negotiation (is_tcp={}, is_petscii={})", is_tcp, is_petscii); }
 
-    // Negotiate mode: try CRC first ('C'), fall back to checksum (NAK).
+    // Negotiate mode: try CRC first ('C') for 20 attempts (60 seconds),
+    // then fall back to checksum (NAK) for the remaining time.  This gives
+    // the user plenty of time to start their XMODEM sender in CRC mode.
     let mut mode = TransferMode::Crc16;
     let mut attempt: u32 = 0;
 
-    let max_negotiation_attempts = (MAX_RETRIES + 3) as u32;
+    // Send CRC requests for 2/3 of the negotiation time, then fall back to checksum.
+    let crc_attempts = (negotiation_timeout * 2 / 3 / 3).max(3) as u32;
+    let max_negotiation_attempts = crc_attempts + max_retries as u32;
     loop {
         if tokio::time::Instant::now() >= negotiation_deadline {
             return Err("Negotiation timeout: start your XMODEM sender".into());
@@ -75,8 +81,8 @@ pub(crate) async fn xmodem_receive(
             return Err("Negotiation failed: no response from sender".into());
         }
 
-        let request = if attempt < 3 { CRC_REQUEST } else { NAK };
-        if attempt == 3 {
+        let request = if attempt < crc_attempts { CRC_REQUEST } else { NAK };
+        if attempt == crc_attempts {
             mode = TransferMode::Checksum;
         }
         if verbose { eprintln!("XMODEM recv: attempt {} sending 0x{:02X} ({})",
@@ -145,7 +151,7 @@ pub(crate) async fn xmodem_receive(
         }
 
         let byte = match tokio::time::timeout(
-            std::time::Duration::from_secs(BLOCK_TIMEOUT_SECS),
+            std::time::Duration::from_secs(block_timeout),
             raw_read_byte(reader, is_tcp),
         )
         .await
@@ -172,7 +178,7 @@ pub(crate) async fn xmodem_receive(
                 }
                 Ok(Err(_)) | Err(_) => {
                     error_count += 1;
-                    if error_count > MAX_RETRIES {
+                    if error_count > max_retries {
                         raw_write_bytes(writer, &[CAN, CAN, CAN], is_tcp).await?;
                         return Err("Too many block errors".into());
                     }
@@ -269,8 +275,13 @@ pub(crate) async fn xmodem_send(
     is_petscii: bool,
     verbose: bool,
 ) -> Result<(), String> {
+    let cfg = config::get_config();
+    let negotiation_timeout = cfg.xmodem_negotiation_timeout;
+    let block_timeout = cfg.xmodem_block_timeout;
+    let max_retries = cfg.xmodem_max_retries;
+
     let negotiation_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(NEGOTIATION_TIMEOUT_SECS);
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(negotiation_timeout);
 
     if verbose { eprintln!("XMODEM send: starting negotiation (is_tcp={}, is_petscii={}, data_len={})",
         is_tcp, is_petscii, data.len()); }
@@ -345,7 +356,7 @@ pub(crate) async fn xmodem_send(
 
         let mut retries = 0;
         loop {
-            if retries >= MAX_RETRIES {
+            if retries >= max_retries {
                 raw_write_bytes(writer, &[CAN, CAN, CAN], is_tcp).await?;
                 return Err("Too many retries, transfer aborted".into());
             }
@@ -379,7 +390,7 @@ pub(crate) async fn xmodem_send(
 
             // Wait for ACK/NAK
             match tokio::time::timeout(
-                std::time::Duration::from_secs(BLOCK_TIMEOUT_SECS),
+                std::time::Duration::from_secs(block_timeout),
                 raw_read_byte(reader, is_tcp),
             )
             .await
@@ -418,10 +429,10 @@ pub(crate) async fn xmodem_send(
     }
 
     // Send EOT and wait for ACK
-    for _ in 0..MAX_RETRIES {
+    for _ in 0..max_retries {
         raw_write_byte(writer, EOT, is_tcp).await?;
         match tokio::time::timeout(
-            std::time::Duration::from_secs(BLOCK_TIMEOUT_SECS),
+            std::time::Duration::from_secs(block_timeout),
             raw_read_byte(reader, is_tcp),
         )
         .await
@@ -439,7 +450,7 @@ pub(crate) async fn xmodem_send(
             Err(_) => continue,
         }
     }
-    if verbose { eprintln!("XMODEM send: EOT not ACKed after {} retries, assuming success", MAX_RETRIES); }
+    if verbose { eprintln!("XMODEM send: EOT not ACKed after {} retries, assuming success", max_retries); }
     Ok(())
 }
 
@@ -766,22 +777,25 @@ mod tests {
 
     #[test]
     fn test_transfer_timeout_is_reasonable() {
+        let cfg = config::get_config();
         assert!(
-            NEGOTIATION_TIMEOUT_SECS >= 30,
+            cfg.xmodem_negotiation_timeout >= 30,
             "too short — user needs time to start sender"
         );
-        assert!(NEGOTIATION_TIMEOUT_SECS <= 300, "excessive negotiation timeout");
+        assert!(cfg.xmodem_negotiation_timeout <= 300, "excessive negotiation timeout");
     }
 
     #[test]
     fn test_block_timeout_less_than_negotiation_timeout() {
-        assert!(BLOCK_TIMEOUT_SECS < NEGOTIATION_TIMEOUT_SECS);
+        let cfg = config::get_config();
+        assert!(cfg.xmodem_block_timeout < cfg.xmodem_negotiation_timeout);
     }
 
     #[test]
     fn test_max_retries_is_reasonable() {
-        assert!(MAX_RETRIES >= 3, "too few retries");
-        assert!(MAX_RETRIES <= 50, "excessive retries");
+        let cfg = config::get_config();
+        assert!(cfg.xmodem_max_retries >= 3, "too few retries");
+        assert!(cfg.xmodem_max_retries <= 50, "excessive retries");
     }
 
     #[tokio::test]
