@@ -24,8 +24,19 @@ fn main() {
 
     // Load or create config
     let cfg = config::load_or_create_config();
-    eprintln!("Config: port={}, security={}, transfer_dir={}",
-        cfg.telnet_port, cfg.security_enabled, cfg.transfer_dir);
+    eprintln!("Config: telnet={}, port={}, security={}, transfer_dir={}",
+        cfg.telnet_enabled, cfg.telnet_port, cfg.security_enabled, cfg.transfer_dir);
+    if !cfg.telnet_enabled && !cfg.ssh_enabled {
+        eprintln!("WARNING: Both telnet and SSH are disabled. No network access is possible.");
+        eprintln!("         Enable at least one service in {}.", config::CONFIG_FILE);
+    } else {
+        if !cfg.telnet_enabled {
+            eprintln!("Info: Telnet server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
+        }
+        if !cfg.ssh_enabled {
+            eprintln!("Info: SSH server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
+        }
+    }
     if cfg.security_enabled && cfg.password == "changeme" {
         eprintln!("WARNING: Security is enabled with the default password. Change it in {}.", config::CONFIG_FILE);
     }

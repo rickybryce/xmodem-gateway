@@ -13,6 +13,7 @@ use std::sync::Mutex;
 pub const CONFIG_FILE: &str = "xmodem.conf";
 
 // ─── Defaults ──────────────────────────────────────────────
+const DEFAULT_TELNET_ENABLED: bool = true;
 const DEFAULT_TELNET_PORT: u16 = 2323;
 const DEFAULT_SECURITY_ENABLED: bool = false;
 const DEFAULT_USERNAME: &str = "admin";
@@ -47,6 +48,8 @@ const DEFAULT_SSH_PASSWORD: &str = "changeme";
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Enable the telnet server. Set to false for SSH-only access.
+    pub telnet_enabled: bool,
     pub telnet_port: u16,
     pub security_enabled: bool,
     pub username: String,
@@ -103,6 +106,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            telnet_enabled: DEFAULT_TELNET_ENABLED,
             telnet_port: DEFAULT_TELNET_PORT,
             security_enabled: DEFAULT_SECURITY_ENABLED,
             username: DEFAULT_USERNAME.into(),
@@ -187,6 +191,10 @@ fn read_config_file(path: &str) -> Config {
     }
 
     Config {
+        telnet_enabled: map
+            .get("telnet_enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_TELNET_ENABLED),
         telnet_port: map
             .get("telnet_port")
             .and_then(|v| v.parse().ok())
@@ -329,6 +337,9 @@ fn write_config_file(path: &str, cfg: &Config) {
 # This file is auto-generated if it does not exist.
 # Edit values below to customise the server.
 
+# Telnet server: set to false to disable (SSH-only mode)
+telnet_enabled = {}
+
 # Telnet server port
 telnet_port = {}
 
@@ -399,6 +410,7 @@ ssh_port = {}
 ssh_username = {}
 ssh_password = {}
 ",
+        cfg.telnet_enabled,
         cfg.telnet_port,
         cfg.security_enabled,
         sanitize_value(&cfg.username),
@@ -616,6 +628,7 @@ mod tests {
         let path = dir.join("roundtrip.conf");
 
         let original = Config {
+            telnet_enabled: false,
             telnet_port: 1234,
             security_enabled: true,
             username: "bob".into(),
@@ -649,6 +662,7 @@ mod tests {
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());
 
+        assert_eq!(loaded.telnet_enabled, original.telnet_enabled);
         assert_eq!(loaded.telnet_port, original.telnet_port);
         assert_eq!(loaded.security_enabled, original.security_enabled);
         assert_eq!(loaded.username, original.username);

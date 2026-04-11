@@ -1746,7 +1746,44 @@ impl TelnetSession {
             let used_pct = 100 - (avail * 100 / total);
             used_pct > 90
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+
+            #[repr(C)]
+            #[allow(non_snake_case)]
+            struct ULARGE_INTEGER {
+                QuadPart: u64,
+            }
+
+            extern "system" {
+                fn GetDiskFreeSpaceExW(
+                    lpDirectoryName: *const u16,
+                    lpFreeBytesAvailableToCaller: *mut ULARGE_INTEGER,
+                    lpTotalNumberOfBytes: *mut ULARGE_INTEGER,
+                    lpTotalNumberOfFreeBytes: *mut ULARGE_INTEGER,
+                ) -> i32;
+            }
+
+            let cfg = config::get_config();
+            let dir = if std::path::Path::new(&cfg.transfer_dir).exists() {
+                cfg.transfer_dir.clone()
+            } else {
+                ".".to_string()
+            };
+            let wide: Vec<u16> = OsStr::new(&dir).encode_wide().chain(std::iter::once(0)).collect();
+            let mut avail = ULARGE_INTEGER { QuadPart: 0 };
+            let mut total = ULARGE_INTEGER { QuadPart: 0 };
+            let mut _free = ULARGE_INTEGER { QuadPart: 0 };
+            let rc = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut _free) };
+            if rc == 0 || total.QuadPart == 0 {
+                return total.QuadPart == 0;
+            }
+            let used_pct = 100 - (avail.QuadPart * 100 / total.QuadPart);
+            used_pct > 90
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -5280,6 +5317,9 @@ impl TelnetSession {
 /// Start the telnet server accept loop.
 pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: SessionWriters) {
     let cfg = config::get_config();
+    if !cfg.telnet_enabled {
+        return;
+    }
     let port = cfg.telnet_port;
     let max_sessions = cfg.max_sessions;
     let security_enabled = cfg.security_enabled;

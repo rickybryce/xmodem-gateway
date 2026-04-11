@@ -15,6 +15,26 @@ transmits all data (including credentials) in cleartext. Do not expose the
 telnet port to the public internet. The SSH interface provides encrypted access
 but is still intended for trusted environments.
 
+### Network Security Behavior
+
+When **security is disabled** (the default), the server only accepts telnet
+connections from private IP addresses:
+
+- `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918 private ranges)
+- `127.0.0.0/8` (loopback)
+- `169.254.0.0/16` (link-local)
+- IPv6 loopback (`::1`), link-local (`fe80::/10`), and unique local (`fd00::/8`)
+
+Connections from public IP addresses are refused with an error message.
+Additionally, gateway addresses (those ending in `.1`, such as `192.168.1.1`)
+are rejected to prevent accidental exposure through router interfaces.
+
+To accept connections from **any IP address**, you must enable security
+(`security_enabled = true` in `xmodem.conf`) and set a strong username and
+password. Even with security enabled, running this software on a public network
+is **not recommended** — telnet credentials are transmitted in cleartext and can
+be intercepted. Use the SSH interface for any non-local access.
+
 ## Prerequisites
 
 ### Debian 13 / Ubuntu
@@ -131,6 +151,9 @@ enabled), the main menu offers:
 Edit `xmodem.conf` in the same directory as the binary. All options:
 
 ```ini
+# Telnet server: set to false to disable (SSH-only mode)
+telnet_enabled = true
+
 # Telnet server port
 telnet_port = 2323
 
