@@ -1871,6 +1871,9 @@ impl TelnetSession {
         }
 
         self.drain_input().await;
+        // Brief pause so the remote terminal can switch back from XMODEM
+        // mode to text display before we send the completion message.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let blocks = data.len().div_ceil(crate::xmodem::XMODEM_BLOCK_SIZE);
         self.send_line("").await?;
@@ -2101,6 +2104,9 @@ impl TelnetSession {
 
         match result {
             Ok(()) => {
+                // Brief pause so the remote terminal can switch back from
+                // XMODEM mode to text display.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 self.send_line("").await?;
                 self.send_line(&format!(
                     "  {}",

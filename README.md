@@ -159,6 +159,11 @@ browser_homepage =
 # Enable verbose XMODEM protocol logging to stderr
 verbose = false
 
+# XMODEM protocol timeouts
+xmodem_negotiation_timeout = 45
+xmodem_block_timeout = 20
+xmodem_max_retries = 10
+
 # Serial modem emulation (Hayes AT commands)
 serial_enabled = false
 serial_port =
@@ -390,17 +395,32 @@ Or edit `xmodem.conf` directly and restart the server.
 | `ATDL`  | Redial last number |
 | `ATDT xmodem-gateway` | Connect to this gateway's menus |
 | `ATDT host:port` | Dial a remote telnet host (commas in dial string are stripped) |
+| `ATDP host:port` | Pulse dial (same as ATDT — no distinction for TCP) |
 | `+++`   | Return to command mode (with guard time from S12) |
 
 **Result codes:** In verbose mode (default), results are text (`OK`, `CONNECT`,
 `NO CARRIER`, `ERROR`). In numeric mode (`ATV0`), results are digits (`0`, `1`,
 `3`, `4`). Quiet mode (`ATQ1`) suppresses all result codes.
 
-**S-registers:** Standard Hayes registers S0–S12 are supported. S2 controls the
-escape character (default 43 = `+`) and S12 controls the escape guard time in
-1/50ths of a second (default 50 = 1 second). `AT&W` saves all registers to
-`xmodem.conf`; `ATZ` restores from saved values; `AT&F` resets to factory
-defaults.
+**S-registers:** Query with `ATSn?`, set with `ATSn=v`, or type `ATS?` for help.
+`AT&W` saves all registers to `xmodem.conf`; `ATZ` restores saved values;
+`AT&F` resets to factory defaults.
+
+| Register | Default | Description |
+|----------|---------|-------------|
+| S0  | 5   | Auto-answer ring count (0 = disabled) |
+| S1  | 0   | Ring counter (current) |
+| S2  | 43  | Escape character (43 = `+`) |
+| S3  | 13  | Carriage return character |
+| S4  | 10  | Line feed character |
+| S5  | 8   | Backspace character |
+| S6  | 2   | Wait for dial tone (seconds) |
+| S7  | 50  | Wait for carrier (seconds) |
+| S8  | 2   | Comma pause time (seconds) |
+| S9  | 6   | Carrier detect response time (1/10s) |
+| S10 | 14  | Carrier loss disconnect time (1/10s) |
+| S11 | 95  | DTMF tone duration (milliseconds) |
+| S12 | 50  | Escape guard time (1/50s; 50 = 1 second) |
 
 ### Escaping and Resuming
 
