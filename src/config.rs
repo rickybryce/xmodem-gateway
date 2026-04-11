@@ -602,15 +602,22 @@ pub fn save_dialup_mappings(entries: &[DialupEntry]) {
     }
 }
 
+/// Normalize a phone number to digits only for comparison.
+/// e.g. "(555) 123-4567" → "5551234567"
+pub fn normalize_phone_number(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
 /// Look up a phone number in the dialup mappings.
 /// Returns the host:port string if found, or None.
 pub fn lookup_dialup_number(number: &str) -> Option<String> {
+    let normalized = normalize_phone_number(number);
+    if normalized.is_empty() {
+        return None;
+    }
     let entries = load_dialup_mappings();
-    // Strip non-digit characters for flexible matching (e.g. "555-1234" matches "5551234")
-    let normalized: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
     for entry in &entries {
-        let entry_normalized: String = entry.number.chars().filter(|c| c.is_ascii_digit()).collect();
-        if entry_normalized == normalized {
+        if normalize_phone_number(&entry.number) == normalized {
             return Some(format!("{}:{}", entry.host, entry.port));
         }
     }
@@ -991,6 +998,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_dialup_mappings_port_zero_defaults() {
+        let content = "5551234 = bbs.example.com:0\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+        // Port 0 is invalid, so the whole "host:0" is treated as the host
+        // and port defaults to 23
+        assert_eq!(entries[0].port, 23);
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_port_overflow() {
+        let content = "5551234 = host:99999\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+        // Port overflow fails u16 parse, entire target treated as host
+        assert_eq!(entries[0].port, 23);
+    }
+
+    #[test]
     fn test_dialup_save_load_roundtrip() {
         let dir = std::env::temp_dir().join("xmodem_test_dialup_rt");
         let _ = std::fs::create_dir_all(&dir);
@@ -1026,18 +1052,38 @@ mod tests {
         assert_eq!(entries[0].port, 23);
     }
 
+    // ─── normalize_phone_number ─────────────────────────
+
+    #[test]
+    fn test_normalize_phone_number_digits_only() {
+        assert_eq!(normalize_phone_number("5551234"), "5551234");
+    }
+
+    #[test]
+    fn test_normalize_phone_number_strips_formatting() {
+        assert_eq!(normalize_phone_number("555-1234"), "5551234");
+        assert_eq!(normalize_phone_number("(800) 555-1234"), "8005551234");
+        assert_eq!(normalize_phone_number("+1-800-555-1234"), "18005551234");
+    }
+
+    #[test]
+    fn test_normalize_phone_number_empty() {
+        assert_eq!(normalize_phone_number(""), "");
+        assert_eq!(normalize_phone_number("---"), "");
+    }
+
+    // ─── lookup matching ──────────────────────────────────
+
     #[test]
     fn test_lookup_dialup_normalized_matching() {
         // "555-5555" should match an entry stored as "5555555"
         let content = "5555555 = bbs.example.com:23\n";
         let entries = parse_dialup_mappings(content);
         assert_eq!(entries.len(), 1);
-
-        // Simulate lookup normalization
-        let input = "555-5555";
-        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
-        let entry_norm: String = entries[0].number.chars().filter(|c| c.is_ascii_digit()).collect();
-        assert_eq!(normalized, entry_norm);
+        assert_eq!(
+            normalize_phone_number("555-5555"),
+            normalize_phone_number(&entries[0].number)
+        );
     }
 
     #[test]
@@ -1046,19 +1092,17 @@ mod tests {
         let content = "555-1234 = bbs.example.com:23\n";
         let entries = parse_dialup_mappings(content);
         assert_eq!(entries.len(), 1);
-
-        let input = "5551234";
-        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
-        let entry_norm: String = entries[0].number.chars().filter(|c| c.is_ascii_digit()).collect();
-        assert_eq!(normalized, entry_norm);
+        assert_eq!(
+            normalize_phone_number("5551234"),
+            normalize_phone_number(&entries[0].number)
+        );
     }
 
     #[test]
-    fn test_lookup_dialup_parentheses_stripped() {
-        // "(800) 555-1234" normalizes to "8005551234"
-        let input = "(800) 555-1234";
-        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
-        assert_eq!(normalized, "8005551234");
+    fn test_lookup_empty_normalized_returns_none() {
+        // A number with no digits should never match anything
+        let normalized = normalize_phone_number("---");
+        assert!(normalized.is_empty());
     }
 
     #[test]

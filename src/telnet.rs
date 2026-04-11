@@ -3747,10 +3747,10 @@ impl TelnetSession {
                         "  Map phone numbers to host:port",
                         "  targets for the modem emulator.",
                         "",
-                        "  When you dial a number with ATDT,",
-                        "  ATDP, or ATD, the server looks up",
-                        "  the number here and connects to",
-                        "  the mapped host:port instead.",
+                        "  Dial a number with ATDT, ATDP,",
+                        "  or ATD (all work the same) and",
+                        "  the server connects to the",
+                        "  mapped host:port for you.",
                         "",
                         "  You can still dial host:port",
                         "  directly - mappings are optional.",
@@ -3813,11 +3813,8 @@ impl TelnetSession {
         let mut entries = config::load_dialup_mappings();
 
         // Remove any existing entry with the same normalized number
-        let new_norm: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
-        entries.retain(|e| {
-            let e_norm: String = e.number.chars().filter(|c| c.is_ascii_digit()).collect();
-            e_norm != new_norm
-        });
+        let new_norm = config::normalize_phone_number(&number);
+        entries.retain(|e| config::normalize_phone_number(&e.number) != new_norm);
 
         entries.push(config::DialupEntry {
             number,
@@ -3825,6 +3822,13 @@ impl TelnetSession {
             port,
         });
         config::save_dialup_mappings(&entries);
+
+        self.send_line("").await?;
+        self.send_line("  Mapping saved.").await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
         Ok(())
     }
 
@@ -6579,6 +6583,7 @@ mod tests {
             "Press A, D, H, or Q.",
             "Number must contain digits.",
             "Invalid entry number.",
+            "Mapping saved.",
             "No other mappings defined.",
         ];
         for msg in &messages {
@@ -6734,10 +6739,10 @@ mod tests {
             "  Map phone numbers to host:port",
             "  targets for the modem emulator.",
             "",
-            "  When you dial a number with ATDT,",
-            "  ATDP, or ATD, the server looks up",
-            "  the number here and connects to",
-            "  the mapped host:port instead.",
+            "  Dial a number with ATDT, ATDP,",
+            "  or ATD (all work the same) and",
+            "  the server connects to the",
+            "  mapped host:port for you.",
             "",
             "  You can still dial host:port",
             "  directly - mappings are optional.",
@@ -6941,10 +6946,10 @@ mod tests {
             // Dialup mapping help
             "  Map phone numbers to host:port",
             "  targets for the modem emulator.",
-            "  When you dial a number with ATDT,",
-            "  ATDP, or ATD, the server looks up",
-            "  the number here and connects to",
-            "  the mapped host:port instead.",
+            "  Dial a number with ATDT, ATDP,",
+            "  or ATD (all work the same) and",
+            "  the server connects to the",
+            "  mapped host:port for you.",
             "  You can still dial host:port",
             "  directly - mappings are optional.",
             "  Mappings are saved in dialup.conf.",

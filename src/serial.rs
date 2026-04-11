@@ -658,12 +658,11 @@ fn handle_dial(state: &mut ModemState, target: &str) {
     let lower = target.to_ascii_lowercase();
 
     // Check for the built-in gateway number (digits only, ignoring formatting).
-    if is_phone_number(target) {
-        let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits == GATEWAY_PHONE_NUMBER {
-            dial_xmodem_gateway(state);
-            return;
-        }
+    if is_phone_number(target)
+        && config::normalize_phone_number(target) == GATEWAY_PHONE_NUMBER
+    {
+        dial_xmodem_gateway(state);
+        return;
     }
 
     if lower == "xmodem-gateway" || lower == "xmodem gateway" {
@@ -748,6 +747,12 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
         let _ = w.shutdown().await;
     });
 
+    // Drain any stale bytes from the serial port buffer.  Some terminal
+    // programs (e.g. IMP8 on CP/M) blast an init string immediately after the
+    // dial command without waiting for CONNECT.  Those bytes would otherwise be
+    // forwarded into the TelnetSession as data.
+    drain_serial_buffer(&mut state.port);
+
     // Bridge serial port <-> duplex stream on this thread.
     let (mut duplex_read, mut duplex_write) =
         tokio::io::split(serial_stream);
@@ -801,6 +806,8 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
     send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
 
+    drain_serial_buffer(&mut state.port);
+
     let exit = online_mode_tcp(state, &mut stream);
 
     state.mode = ModemMode::Command;
@@ -811,6 +818,22 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
         }
         OnlineExit::Disconnected => {
             send_result(state, "NO CARRIER");
+        }
+    }
+}
+
+/// Drain any bytes sitting in the serial port's OS read buffer.
+///
+/// Called after CONNECT and before entering online mode so that stale AT
+/// commands queued behind the dial command (common with programs like IMP8
+/// that blast init strings without waiting for CONNECT) are discarded.
+fn drain_serial_buffer(port: &mut Box<dyn serialport::SerialPort>) {
+    let mut junk = [0u8; 256];
+    loop {
+        match port.read(&mut junk) {
+            Ok(0) => break,
+            Ok(_) => continue, // keep draining
+            Err(_) => break,   // timeout or error — buffer is empty
         }
     }
 }
@@ -2035,11 +2058,10 @@ mod tests {
 
     #[test]
     fn test_gateway_phone_number_detected() {
-        let digits: String = GATEWAY_PHONE_NUMBER
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect();
-        assert_eq!(digits, "1001000");
+        assert_eq!(
+            config::normalize_phone_number(GATEWAY_PHONE_NUMBER),
+            "1001000"
+        );
     }
 
     #[test]
@@ -2047,8 +2069,10 @@ mod tests {
         // "100-1000" should match the gateway number
         let input = "100-1000";
         assert!(is_phone_number(input));
-        let digits: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
-        assert_eq!(digits, GATEWAY_PHONE_NUMBER);
+        assert_eq!(
+            config::normalize_phone_number(input),
+            GATEWAY_PHONE_NUMBER
+        );
     }
 
 }
