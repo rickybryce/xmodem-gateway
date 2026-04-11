@@ -137,6 +137,7 @@ enabled), the main menu offers:
 ```
   A  AI Chat
   B  Simple Browser
+  D  Dialup Mapping
   F  File Transfer
   M  Modem Emulator
   R  Troubleshooting
@@ -468,6 +469,53 @@ When changing serial port parameters from a serial session, the server asks
 for confirmation. If there is no response within 60 seconds (e.g., because the
 terminal settings no longer match), the settings are automatically reverted.
 This prevents lockout when accidentally misconfiguring the serial port.
+
+### Dialup Mapping
+
+The Dialup Mapping feature (main menu **D**) lets you map phone numbers to
+`host:port` targets. When a number is dialed with `ATDT`, `ATDP`, or `ATD`,
+the server looks up the number and connects to the mapped host instead.
+
+A built-in entry maps **1001000** to the local XMODEM Gateway menu (equivalent
+to `ATDT xmodem-gateway`). This entry cannot be deleted.
+
+Mappings are stored in `dialup.conf` (created automatically on first access
+with a default starter entry). Phone numbers are matched by digits only --
+formatting characters like dashes, spaces, and parentheses are ignored, so
+`555-1234` and `5551234` are treated as the same number.
+
+If a dialed number has no mapping, the modem returns `NO CARRIER`. You can
+still dial hostnames and `host:port` targets directly -- mappings only apply
+when the dial string looks like a phone number (digits and formatting only, no
+letters or dots).
+
+### Limitations
+
+This is a software modem emulator, not a real modem. It does not control
+RS-232 hardware signal pins. Specifically:
+
+- **DCD (Data Carrier Detect, pin 1)** -- A real modem asserts DCD when a
+  carrier signal is established with the remote modem. This emulator cannot
+  drive DCD, so the serial device has no hardware indication that a connection
+  is active.
+- **RI (Ring Indicator, pin 9)** -- A real modem asserts RI when an incoming
+  call is ringing. The ring emulator sends `RING` result codes over the serial
+  data line, but the RI pin is never driven.
+- **DSR (Data Set Ready, pin 6)** -- A real modem asserts DSR when powered on
+  and ready. This emulator does not control DSR.
+- **DTR (Data Terminal Ready, pin 4)** -- A real modem monitors DTR from the
+  terminal to detect hangup requests. This emulator does not read DTR; use the
+  `ATH` command or `+++` escape to hang up instead.
+- **CTS/RTS (Clear to Send / Request to Send, pins 8/7)** -- Hardware flow
+  control is handled by the serial port driver when `serial_flowcontrol` is set
+  to `hardware`, but the emulator itself does not manipulate these pins for
+  modem state signaling.
+
+Most retro terminal software works fine without these signals, especially when
+configured to ignore DCD (sometimes labeled "Force DTR" or "Ignore Carrier" in
+the terminal program settings). If your software requires DCD to be asserted
+before it will communicate, check its configuration for an option to disable
+carrier detection.
 
 ## Web Browser
 
