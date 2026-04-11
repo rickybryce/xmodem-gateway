@@ -1390,11 +1390,6 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
-            "  {}  Dialup Mapping",
-            self.cyan("D")
-        ))
-        .await?;
-        self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
         ))
@@ -1438,8 +1433,6 @@ impl TelnetSession {
                 let mut lines = vec![
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
-                    "  D  Dialup Mapping: map phone",
-                    "     numbers to host:port targets",
                 ];
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
@@ -1484,9 +1477,6 @@ impl TelnetSession {
             "b" => {
                 self.current_menu = Menu::Browser;
             }
-            "d" => {
-                self.dialup_mapping().await?;
-            }
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
@@ -1506,7 +1496,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A-D, F, M, R, S, T, W, X, or H.").await?;
+                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -3932,7 +3922,7 @@ impl TelnetSession {
             .await?;
             self.send_line(&format!(
                 "  {}  Select serial port",
-                self.cyan("P")
+                self.cyan("S")
             ))
             .await?;
             self.send_line(&format!(
@@ -3942,12 +3932,17 @@ impl TelnetSession {
             .await?;
             self.send_line(&format!(
                 "  {}  Set data/parity/stop",
-                self.cyan("D")
+                self.cyan("P")
             ))
             .await?;
             self.send_line(&format!(
                 "  {}  Set flow control",
                 self.cyan("F")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Dialup Mapping",
+                self.cyan("D")
             ))
             .await?;
             if !self.is_serial {
@@ -3987,17 +3982,20 @@ impl TelnetSession {
                     .await
                     .ok();
                 }
-                "p" => {
+                "s" => {
                     self.modem_select_port().await?;
                 }
                 "b" => {
                     self.modem_set_baud().await?;
                 }
-                "d" => {
+                "p" => {
                     self.modem_set_data_params().await?;
                 }
                 "f" => {
                     self.modem_set_flow().await?;
+                }
+                "d" => {
+                    self.dialup_mapping().await?;
                 }
                 "i" if !self.is_serial => {
                     self.modem_ring_emulator().await?;
@@ -4011,9 +4009,9 @@ impl TelnetSession {
                 }
                 _ => {
                     let msg = if self.is_serial {
-                        "Press E, P, B, D, F, H, or Q."
+                        "Press E, S, B, P, D, F, H, or Q."
                     } else {
-                        "Press E, P, B, D, F, I, H, or Q."
+                        "Press E, S, B, P, D, F, I, H, or Q."
                     };
                     self.show_error(msg).await?;
                 }
@@ -4186,6 +4184,11 @@ impl TelnetSession {
                     self.cyan("R")
                 ))
                 .await?;
+                self.send_line(&format!(
+                    "  {}  None (clear port)",
+                    self.cyan("N")
+                ))
+                .await?;
                 self.send_line("").await?;
                 self.send_line(&format!("  {}", self.action_prompt("Q", "Back")))
                     .await?;
@@ -4198,6 +4201,14 @@ impl TelnetSession {
                 };
                 match input.as_str() {
                     "r" => continue,
+                    "n" => {
+                        tokio::task::spawn_blocking(|| {
+                            config::update_config_value("serial_port", "");
+                        })
+                        .await
+                        .ok();
+                        return Ok(());
+                    }
                     "q" | "" => return Ok(()),
                     _ => {
                         // Allow typing a port path directly even with no ports detected
@@ -4237,10 +4248,15 @@ impl TelnetSession {
                 self.cyan("R")
             ))
             .await?;
+            self.send_line(&format!(
+                "  {}  None (clear port)",
+                self.cyan("N")
+            ))
+            .await?;
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}",
-                self.dim("Enter #, R, or type a path.")
+                self.dim("Enter #, R, N, or type a path.")
             )).await?;
             self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
             self.send(&format!("  {} ", self.cyan("Port:"))).await?;
@@ -4253,6 +4269,14 @@ impl TelnetSession {
 
             match input.as_str() {
                 "r" => continue,
+                "n" => {
+                    tokio::task::spawn_blocking(|| {
+                        config::update_config_value("serial_port", "");
+                    })
+                    .await
+                    .ok();
+                    return Ok(());
+                }
                 "q" => return Ok(()),
                 _ => {}
             }
@@ -4526,7 +4550,7 @@ impl TelnetSession {
         if !crate::serial::request_ring(tx) {
             self.send_line(&format!(
                 "  {}",
-                self.red("Ring emulator is not available.")
+                self.red("A ring is already in progress.")
             ))
             .await?;
             self.send_line("").await?;
@@ -4542,21 +4566,29 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line("").await?;
+        self.send_line(&format!("  {}", self.action_prompt("Q", "Cancel")))
+            .await?;
         self.flush().await?;
 
-        // Show rings as they happen.  ESC cancels (drops rx which
-        // signals the serial thread to abort).
+        // Show rings as they happen.  Q or ESC cancels (drops rx
+        // which signals the serial thread to abort).  Timeout if the
+        // serial thread never picks up the request.
         let reader = &mut self.reader;
         let writer = &self.writer;
         let is_petscii = self.terminal_type == TerminalType::Petscii;
         let mut answered = false;
+        let mut serial_error = false;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
+        tokio::pin!(timeout);
 
         loop {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
                         Some(0) => {
-                            // RING
+                            // RING — reset timeout on each ring
+                            timeout.as_mut().reset(tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(15));
                             let mut w = writer.lock().await;
                             let _ = w.write_all(b"  RING...\r\n").await;
                             let _ = w.flush().await;
@@ -4566,29 +4598,48 @@ impl TelnetSession {
                             answered = true;
                             break;
                         }
+                        Some(2) => {
+                            // Serial port error
+                            serial_error = true;
+                            break;
+                        }
                         _ => break, // channel closed
                     }
                 }
                 byte = read_byte_iac_filtered(reader, true) => {
                     match byte {
-                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
-                            break; // ESC cancels
+                        Ok(Some(b)) if is_esc_key(b, is_petscii)
+                            || b == b'q' || b == b'Q' =>
+                        {
+                            break;
                         }
                         Ok(None) | Err(_) => break,
                         _ => {} // ignore other keys
                     }
                 }
+                _ = &mut timeout => {
+                    serial_error = true;
+                    break;
+                }
             }
         }
 
-        // Drop the receiver to signal cancellation if we broke out early.
+        // Drop the receiver to signal cancellation if we broke out early,
+        // and clear the slot in case the serial thread never picked it up.
         drop(rx);
+        crate::serial::cancel_ring_request();
 
         self.send_line("").await?;
         if answered {
             self.send_line(&format!(
                 "  {}",
                 self.green("Remote machine connected.")
+            ))
+            .await?;
+        } else if serial_error {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial connection failed.")
             ))
             .await?;
         } else {
@@ -6533,7 +6584,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A-D, F, M, R, S, T, W, X, or H.",
+            "Press A, B, F, M, R, S, T, W, X, or H.",
             // Non-serial prompt includes E but is only shown to
             // ANSI/SSH users (80 cols), so it is not tested here.
             "Press U, D, X, C, I, R, Q, or H.",
@@ -6548,7 +6599,7 @@ mod tests {
             "Access denied.",
             "Enter a number or Q.",
             "Press S, R, Q, or H.",
-            "Press E, P, B, D, F, H, or Q.",
+            "Press E, S, B, P, D, F, H, or Q.",
             "No serial ports detected.",
             "Invalid port number.",
             "Connection timed out.",
@@ -6606,7 +6657,6 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
-            "  D  Dialup Mapping",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6616,13 +6666,15 @@ mod tests {
             "  X  Exit",
             // Modem emulator menu
             "  E  Toggle enabled/disabled",
-            "  P  Select serial port",
+            "  S  Select serial port",
             "  B  Set baud rate",
-            "  D  Set data/parity/stop",
+            "  P  Set data/parity/stop",
             "  F  Set flow control",
+            "  D  Dialup Mapping",
             // Port selection menu
             "  R  Refresh port list",
-            "  Enter #, R, or type a path.",
+            "  N  None (clear port)",
+            "  Enter #, R, N, or type a path.",
             // Dialup mapping menu
             "  A  Add mapping",
             "  D  Delete mapping",
@@ -6652,43 +6704,42 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 10 items + blank + help = 16 rows.
+    /// Main menu screen: header(3) + blank + 9 items + blank + help = 15 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, D, F, M, R, S, T, W, X, blank, H=Help = 16
-        let rows = 16;
+        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15
+        let rows = 15;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
-    /// Main menu items must be exactly A, B, D, F, M, R, S, T, W, X (10 items).
+    /// Main menu items must be exactly A, B, F, M, R, S, T, W, X (9 items).
     #[test]
     fn test_main_menu_item_count() {
-        let items = ["A", "B", "D", "F", "M", "R", "S", "T", "W", "X"];
-        assert_eq!(items.len(), 10, "main menu should have exactly 10 items");
+        let items = ["A", "B", "F", "M", "R", "S", "T", "W", "X"];
+        assert_eq!(items.len(), 9, "main menu should have exactly 9 items");
     }
 
     /// Error hint must list exactly the valid main menu keys.
     #[test]
     fn test_main_menu_error_hint() {
-        let hint = "Press A-D, F, M, R, S, T, W, X, or H.";
-        // Must not mention removed keys (E)
+        let hint = "Press A, B, F, M, R, S, T, W, X, or H.";
+        // Must not mention removed keys (D, E)
+        assert!(!hint.contains(" D,"), "error hint must not mention D");
         assert!(!hint.contains(" E,"), "error hint must not mention E");
         assert!(!hint.contains(" E "), "error hint must not mention E");
         // Must mention all valid keys
-        for key in ["A", "D", "F", "M", "R", "S", "T", "W", "X", "H"] {
+        for key in ["A", "B", "F", "M", "R", "S", "T", "W", "X", "H"] {
             assert!(hint.contains(key), "error hint must mention {}", key);
         }
         assert!(hint.len() <= PETSCII_WIDTH, "error hint exceeds PETSCII width");
     }
 
-    /// Main help screen content must have exactly 16 lines (matching row count test).
+    /// Main help screen content must have exactly 14 lines (matching row count test).
     #[test]
     fn test_main_help_content_line_count() {
         let lines = [
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  D  Dialup Mapping: map phone",
-            "     numbers to host:port targets",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
@@ -6702,7 +6753,7 @@ mod tests {
             "  W  Weather: check weather by zip",
             "  X  Exit: disconnect from server",
         ];
-        assert_eq!(lines.len(), 16, "main help should have exactly 16 content lines");
+        assert_eq!(lines.len(), 14, "main help should have exactly 14 content lines");
     }
 
     /// Shutdown broadcast message must be valid and end with CRLF.
@@ -6837,7 +6888,9 @@ mod tests {
     /// + 5 menu items + blank + footer + prompt = 17 rows.
     #[test]
     fn test_modem_emulator_row_count() {
-        let rows = 3 + 1 + 5 + 1 + 5 + 1 + 1 + 1; // 18 (footer has 2 items on one line)
+        // Non-serial worst case: header(3) + blank + status(5) + blank
+        // + menu(7: E,S,B,P,F,D,I) + blank + footer(1) + prompt(1) = 20
+        let rows = 3 + 1 + 5 + 1 + 7 + 1 + 1 + 1; // 20
         assert!(rows <= 22, "modem emulator is {} rows, exceeds 22", rows);
     }
 
@@ -6888,8 +6941,7 @@ mod tests {
     /// blank + "Press any key" = 20 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        // 16 content lines (with D Dialup Mapping added)
-        let rows = 3 + 1 + 16 + 1 + 1; // 22
+        let rows = 3 + 1 + 14 + 1 + 1; // 20
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6900,8 +6952,6 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  D  Dialup Mapping: map phone",
-            "     numbers to host:port targets",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",

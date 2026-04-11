@@ -137,7 +137,6 @@ enabled), the main menu offers:
 ```
   A  AI Chat
   B  Simple Browser
-  D  Dialup Mapping
   F  File Transfer
   M  Modem Emulator
   R  Troubleshooting
@@ -390,7 +389,7 @@ modem commands.
 
 1. From the main menu on a telnet session, press **M** (Modem Emulator)
 2. Press **E** to enable the emulator
-3. Press **P** to select a serial port (auto-detected)
+3. Press **S** to select a serial port (auto-detected)
 4. Configure baud rate, data bits, parity, stop bits, and flow control as needed
 5. Press **Q** to apply -- settings take effect immediately (no restart needed)
 
@@ -472,7 +471,7 @@ This prevents lockout when accidentally misconfiguring the serial port.
 
 ### Dialup Mapping
 
-The Dialup Mapping feature (main menu **D**) lets you map phone numbers to
+The Dialup Mapping feature (modem menu **D**) lets you map phone numbers to
 `host:port` targets. When a number is dialed with `ATDT`, `ATDP`, or `ATD`,
 the server looks up the number and connects to the mapped host instead.
 
