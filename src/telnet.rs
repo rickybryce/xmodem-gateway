@@ -1390,6 +1390,11 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
+            "  {}  Dialup Mapping",
+            self.cyan("D")
+        ))
+        .await?;
+        self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
         ))
@@ -1433,6 +1438,8 @@ impl TelnetSession {
                 let mut lines = vec![
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
+                    "  D  Dialup Mapping: map phone",
+                    "     numbers to host:port targets",
                 ];
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
@@ -1477,6 +1484,9 @@ impl TelnetSession {
             "b" => {
                 self.current_menu = Menu::Browser;
             }
+            "d" => {
+                self.dialup_mapping().await?;
+            }
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
@@ -1496,7 +1506,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
+                self.show_error("Press A-D, F, M, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -3647,6 +3657,219 @@ impl TelnetSession {
 
     // ─── MODEM EMULATOR ──────────────────────────────────────
 
+    // ─── Dialup Mapping ────────────────────────────────────
+
+    async fn dialup_mapping(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let entries = config::load_dialup_mappings();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("DIALUP MAPPING")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            // Built-in gateway entry (not deletable)
+            self.send_line(&format!(
+                "     {} = {}",
+                self.cyan("1001000"),
+                self.amber("xmodem-gateway")
+            ))
+            .await?;
+
+            if entries.is_empty() {
+                self.send_line("").await?;
+                self.send_line("  No other mappings defined.").await?;
+            } else {
+                // Show up to 9 user entries to fit the screen
+                let max_show = 9;
+                for (i, entry) in entries.iter().take(max_show).enumerate() {
+                    let num_col = self.cyan(&entry.number);
+                    let target = format!("{}:{}", entry.host, entry.port);
+                    let line = format!(
+                        "  {}. {} = {}",
+                        i + 1,
+                        num_col,
+                        self.amber(&target)
+                    );
+                    self.send_line(&line).await?;
+                }
+                if entries.len() > max_show {
+                    self.send_line(&format!(
+                        "  ... and {} more",
+                        entries.len() - max_show
+                    ))
+                    .await?;
+                }
+            }
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Add mapping",
+                self.cyan("A")
+            ))
+            .await?;
+            if !entries.is_empty() {
+                self.send_line(&format!(
+                    "  {}  Delete mapping",
+                    self.cyan("D")
+                ))
+                .await?;
+            }
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/dialup"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "a" => {
+                    self.dialup_add_entry().await?;
+                }
+                "d" if !entries.is_empty() => {
+                    self.dialup_delete_entry(&entries).await?;
+                }
+                "h" => {
+                    self.show_help_page("DIALUP MAPPING HELP", &[
+                        "  Map phone numbers to host:port",
+                        "  targets for the modem emulator.",
+                        "",
+                        "  When you dial a number with ATDT,",
+                        "  ATDP, or ATD, the server looks up",
+                        "  the number here and connects to",
+                        "  the mapped host:port instead.",
+                        "",
+                        "  You can still dial host:port",
+                        "  directly - mappings are optional.",
+                        "",
+                        "  Mappings are saved in dialup.conf.",
+                    ]).await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    if entries.is_empty() {
+                        self.show_error("Press A, H, or Q.").await?;
+                    } else {
+                        self.show_error("Press A, D, H, or Q.").await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn dialup_add_entry(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+
+        self.send(&format!("  {} ", self.cyan("Phone number:")))
+            .await?;
+        self.flush().await?;
+        let number = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        // Validate: must contain at least one digit
+        if !number.chars().any(|c| c.is_ascii_digit()) {
+            self.show_error("Number must contain digits.").await?;
+            return Ok(());
+        }
+
+        self.send(&format!("  {} ", self.cyan("Host:")))
+            .await?;
+        self.flush().await?;
+        let host = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        self.send(&format!("  {} ", self.cyan("Port (23):")))
+            .await?;
+        self.flush().await?;
+        let port: u16 = match self.get_line_input().await? {
+            Some(s) if s.is_empty() => 23,
+            Some(s) => match s.parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    self.show_error("Invalid port number.").await?;
+                    return Ok(());
+                }
+            },
+            None => return Ok(()),
+        };
+
+        let mut entries = config::load_dialup_mappings();
+
+        // Remove any existing entry with the same normalized number
+        let new_norm: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
+        entries.retain(|e| {
+            let e_norm: String = e.number.chars().filter(|c| c.is_ascii_digit()).collect();
+            e_norm != new_norm
+        });
+
+        entries.push(config::DialupEntry {
+            number,
+            host,
+            port,
+        });
+        config::save_dialup_mappings(&entries);
+        Ok(())
+    }
+
+    async fn dialup_delete_entry(
+        &mut self,
+        entries: &[config::DialupEntry],
+    ) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send(&format!(
+            "  {} ",
+            self.cyan("Entry # to delete:")
+        ))
+        .await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        let idx: usize = match input.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= entries.len() => n - 1,
+            _ => {
+                self.show_error("Invalid entry number.").await?;
+                return Ok(());
+            }
+        };
+
+        let mut entries = entries.to_vec();
+        let removed = entries.remove(idx);
+        config::save_dialup_mappings(&entries);
+        self.send_line(&format!(
+            "  Removed: {} = {}:{}",
+            removed.number, removed.host, removed.port
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    // ─── Modem settings ───────────────────────────────────
+
     async fn modem_settings(&mut self) -> Result<(), std::io::Error> {
         // Snapshot current config so we can detect changes and revert if needed.
         let original_cfg = config::get_config();
@@ -3931,82 +4154,128 @@ impl TelnetSession {
     }
 
     async fn modem_select_port(&mut self) -> Result<(), std::io::Error> {
-        self.clear_screen().await?;
-        let sep = self.separator();
-        self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-        self.send_line(&format!("  {}...", self.dim("Detecting ports"))).await?;
-        self.flush().await?;
+        loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            self.send_line(&format!("  {}...", self.dim("Detecting ports"))).await?;
+            self.flush().await?;
 
-        let ports = tokio::task::spawn_blocking(crate::serial::list_serial_ports)
-            .await
-            .unwrap_or_default();
+            let ports = tokio::task::spawn_blocking(crate::serial::list_serial_ports)
+                .await
+                .unwrap_or_default();
 
-        if ports.is_empty() {
-            self.show_error("No serial ports detected.").await?;
-            return Ok(());
-        }
+            if ports.is_empty() {
+                self.clear_screen().await?;
+                self.send_line(&sep).await?;
+                self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
+                self.send_line(&sep).await?;
+                self.send_line("").await?;
+                self.send_line(&format!("  {}", self.red("No serial ports detected.")))
+                    .await?;
+                self.send_line("").await?;
+                self.send_line(&format!(
+                    "  {}  Refresh port list",
+                    self.cyan("R")
+                ))
+                .await?;
+                self.send_line("").await?;
+                self.send_line(&format!("  {}", self.action_prompt("Q", "Back")))
+                    .await?;
+                self.send(&format!("  {} ", self.cyan("Port:"))).await?;
+                self.flush().await?;
 
-        // Redraw with port list
-        self.clear_screen().await?;
-        self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-        let max_w = if self.terminal_type == TerminalType::Petscii {
-            30
-        } else {
-            50
-        };
-        for (i, port) in ports.iter().enumerate() {
+                let input = match self.get_line_input().await? {
+                    Some(s) if !s.is_empty() => s,
+                    _ => return Ok(()),
+                };
+                match input.as_str() {
+                    "r" => continue,
+                    "q" | "" => return Ok(()),
+                    _ => {
+                        // Allow typing a port path directly even with no ports detected
+                        let port_name = input;
+                        tokio::task::spawn_blocking(move || {
+                            config::update_config_value("serial_port", &port_name);
+                        })
+                        .await
+                        .ok();
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Redraw with port list
+            self.clear_screen().await?;
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("SERIAL PORT"))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            let max_w = if self.terminal_type == TerminalType::Petscii {
+                30
+            } else {
+                50
+            };
+            for (i, port) in ports.iter().enumerate() {
+                self.send_line(&format!(
+                    "  {:>2}. {}",
+                    i + 1,
+                    truncate_to_width(port, max_w)
+                ))
+                .await?;
+            }
+            self.send_line("").await?;
             self.send_line(&format!(
-                "  {:>2}. {}",
-                i + 1,
-                truncate_to_width(port, max_w)
+                "  {}  Refresh port list",
+                self.cyan("R")
             ))
             .await?;
-        }
-        self.send_line("").await?;
-        self.send_line(&format!(
-            "  {}",
-            self.dim("Enter # or type a port path.")
-        )).await?;
-        self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
-        self.send(&format!("  {} ", self.cyan("Port:"))).await?;
-        self.flush().await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}",
+                self.dim("Enter #, R, or type a path.")
+            )).await?;
+            self.send_line(&format!("  {}", self.action_prompt("Q", "Back"))).await?;
+            self.send(&format!("  {} ", self.cyan("Port:"))).await?;
+            self.flush().await?;
 
-        let input = match self.get_line_input().await? {
-            Some(s) if !s.is_empty() => s,
-            _ => return Ok(()),
-        };
+            let input = match self.get_line_input().await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
 
-        if input == "q" {
-            return Ok(());
-        }
+            match input.as_str() {
+                "r" => continue,
+                "q" => return Ok(()),
+                _ => {}
+            }
 
-        if let Ok(idx) = input.parse::<usize>() {
-            if idx >= 1 && idx <= ports.len() {
-                let port_name = ports[idx - 1].clone();
+            if let Ok(idx) = input.parse::<usize>() {
+                if idx >= 1 && idx <= ports.len() {
+                    let port_name = ports[idx - 1].clone();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("serial_port", &port_name);
+                    })
+                    .await
+                    .ok();
+                } else {
+                    self.show_error("Invalid selection.").await?;
+                    continue;
+                }
+            } else {
+                // Allow typing a port path directly
+                let port_name = input;
                 tokio::task::spawn_blocking(move || {
                     config::update_config_value("serial_port", &port_name);
                 })
                 .await
                 .ok();
-            } else {
-                self.show_error("Invalid selection.").await?;
             }
-        } else {
-            // Allow typing a port path directly
-            let port_name = input;
-            tokio::task::spawn_blocking(move || {
-                config::update_config_value("serial_port", &port_name);
-            })
-            .await
-            .ok();
+            return Ok(());
         }
-        Ok(())
     }
 
     async fn modem_set_baud(&mut self) -> Result<(), std::io::Error> {
@@ -6260,7 +6529,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A, B, F, M, R, S, T, W, X, or H.",
+            "Press A-D, F, M, R, S, T, W, X, or H.",
             // Non-serial prompt includes E but is only shown to
             // ANSI/SSH users (80 cols), so it is not tested here.
             "Press U, D, X, C, I, R, Q, or H.",
@@ -6305,6 +6574,12 @@ mod tests {
             "Not found.",
             "Invalid number.",
             "Unknown command.",
+            // Dialup mapping
+            "Press A, H, or Q.",
+            "Press A, D, H, or Q.",
+            "Number must contain digits.",
+            "Invalid entry number.",
+            "No other mappings defined.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -6326,6 +6601,7 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
+            "  D  Dialup Mapping",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6339,6 +6615,12 @@ mod tests {
             "  B  Set baud rate",
             "  D  Set data/parity/stop",
             "  F  Set flow control",
+            // Port selection menu
+            "  R  Refresh port list",
+            "  Enter #, R, or type a path.",
+            // Dialup mapping menu
+            "  A  Add mapping",
+            "  D  Delete mapping",
             // File transfer menu
             "  U  Upload a file",
             "  D  Download a file",
@@ -6365,41 +6647,43 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 9 items + blank + help = 15 rows.
+    /// Main menu screen: header(3) + blank + 10 items + blank + help = 16 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15
-        let rows = 15;
+        // sep, title, sep, blank, A, B, D, F, M, R, S, T, W, X, blank, H=Help = 16
+        let rows = 16;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
-    /// Main menu items must be exactly A, B, F, M, R, S, T, W, X (9 items).
+    /// Main menu items must be exactly A, B, D, F, M, R, S, T, W, X (10 items).
     #[test]
     fn test_main_menu_item_count() {
-        let items = ["A", "B", "F", "M", "R", "S", "T", "W", "X"];
-        assert_eq!(items.len(), 9, "main menu should have exactly 9 items");
+        let items = ["A", "B", "D", "F", "M", "R", "S", "T", "W", "X"];
+        assert_eq!(items.len(), 10, "main menu should have exactly 10 items");
     }
 
     /// Error hint must list exactly the valid main menu keys.
     #[test]
     fn test_main_menu_error_hint() {
-        let hint = "Press A, B, F, M, R, S, T, W, X, or H.";
+        let hint = "Press A-D, F, M, R, S, T, W, X, or H.";
         // Must not mention removed keys (E)
         assert!(!hint.contains(" E,"), "error hint must not mention E");
         assert!(!hint.contains(" E "), "error hint must not mention E");
         // Must mention all valid keys
-        for key in ["A", "B", "F", "M", "R", "S", "T", "W", "X", "H"] {
+        for key in ["A", "D", "F", "M", "R", "S", "T", "W", "X", "H"] {
             assert!(hint.contains(key), "error hint must mention {}", key);
         }
         assert!(hint.len() <= PETSCII_WIDTH, "error hint exceeds PETSCII width");
     }
 
-    /// Main help screen content must have exactly 14 lines (matching row count test).
+    /// Main help screen content must have exactly 16 lines (matching row count test).
     #[test]
     fn test_main_help_content_line_count() {
         let lines = [
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
+            "  D  Dialup Mapping: map phone",
+            "     numbers to host:port targets",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
@@ -6413,7 +6697,7 @@ mod tests {
             "  W  Weather: check weather by zip",
             "  X  Exit: disconnect from server",
         ];
-        assert_eq!(lines.len(), 14, "main help should have exactly 14 content lines");
+        assert_eq!(lines.len(), 16, "main help should have exactly 16 content lines");
     }
 
     /// Shutdown broadcast message must be valid and end with CRLF.
@@ -6424,6 +6708,72 @@ mod tests {
         // Message must be short enough that it fits any terminal
         let text = "Server shutting down. Goodbye.";
         assert!(text.len() <= PETSCII_WIDTH, "shutdown message exceeds PETSCII width");
+    }
+
+    /// Dialup mapping menu (with entries): header(3) + blank + 10 entries + blank
+    /// + 2 items + blank + footer = 18 rows max.
+    #[test]
+    fn test_dialup_mapping_menu_row_count() {
+        // Worst case: static entry + 9 user entries + A + D menu items
+        let rows = 3 + 1 + 1 + 9 + 1 + 2 + 1 + 1; // 19
+        assert!(rows <= 22, "dialup mapping menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Dialup mapping help screen row count.
+    #[test]
+    fn test_dialup_help_screen_row_count() {
+        // header(3) + blank + 12 content lines + blank + "press any key" = 18
+        let rows = 3 + 1 + 12 + 1 + 1; // 18
+        assert!(rows <= 22, "dialup help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Dialup mapping help content must have exactly 12 lines and fit PETSCII.
+    #[test]
+    fn test_dialup_help_content() {
+        let lines = [
+            "  Map phone numbers to host:port",
+            "  targets for the modem emulator.",
+            "",
+            "  When you dial a number with ATDT,",
+            "  ATDP, or ATD, the server looks up",
+            "  the number here and connects to",
+            "  the mapped host:port instead.",
+            "",
+            "  You can still dial host:port",
+            "  directly - mappings are optional.",
+            "",
+            "  Mappings are saved in dialup.conf.",
+        ];
+        assert_eq!(lines.len(), 12, "dialup help should have exactly 12 content lines");
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "dialup help line '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Dialup mapping prompts must fit PETSCII width.
+    #[test]
+    fn test_dialup_prompts_fit_petscii() {
+        let prompts = [
+            "  Phone number: ",
+            "  Host: ",
+            "  Port (23): ",
+            "  Entry # to delete: ",
+        ];
+        for prompt in &prompts {
+            assert!(
+                prompt.len() <= PETSCII_WIDTH,
+                "dialup prompt '{}' is {} chars, exceeds {}",
+                prompt,
+                prompt.len(),
+                PETSCII_WIDTH,
+            );
+        }
     }
 
     /// File transfer menu: header(3) + blank + dir + blank + 5 items + blank + footer = 12 rows.
@@ -6533,8 +6883,8 @@ mod tests {
     /// blank + "Press any key" = 20 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        // 14 base lines
-        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        // 16 content lines (with D Dialup Mapping added)
+        let rows = 3 + 1 + 16 + 1 + 1; // 22
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6545,6 +6895,8 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
+            "  D  Dialup Mapping: map phone",
+            "     numbers to host:port targets",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",
@@ -6586,6 +6938,16 @@ mod tests {
             "       edit its value",
             "  S    Submit the form",
             "  Q    Cancel and go back",
+            // Dialup mapping help
+            "  Map phone numbers to host:port",
+            "  targets for the modem emulator.",
+            "  When you dial a number with ATDT,",
+            "  ATDP, or ATD, the server looks up",
+            "  the number here and connects to",
+            "  the mapped host:port instead.",
+            "  You can still dial host:port",
+            "  directly - mappings are optional.",
+            "  Mappings are saved in dialup.conf.",
         ];
         for line in &help_lines {
             assert!(

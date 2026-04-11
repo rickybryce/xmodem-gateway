@@ -304,7 +304,9 @@ fn command_mode_tick(state: &mut ModemState) {
             }
         }
         Ok(_) => {}
-        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) => {
             eprintln!("Serial modem: read error: {}", e);
             std::thread::sleep(Duration::from_millis(500));
@@ -649,13 +651,40 @@ fn handle_return_online(state: &mut ModemState) {
 
 // ─── Dialing ───────────────────────────────────────────────
 
+/// Built-in phone number that dials the local XMODEM Gateway menu.
+const GATEWAY_PHONE_NUMBER: &str = "1001000";
+
 fn handle_dial(state: &mut ModemState, target: &str) {
     let lower = target.to_ascii_lowercase();
+
+    // Check for the built-in gateway number (digits only, ignoring formatting).
+    if is_phone_number(target) {
+        let digits: String = target.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits == GATEWAY_PHONE_NUMBER {
+            dial_xmodem_gateway(state);
+            return;
+        }
+    }
 
     if lower == "xmodem-gateway" || lower == "xmodem gateway" {
         dial_xmodem_gateway(state);
     } else {
-        let (host, port) = if let Some((h, p)) = target.rsplit_once(':') {
+        // If the target looks like a phone number (digits, dashes, spaces,
+        // parens, etc.), look it up in the dialup mapping file.
+        let resolved = if is_phone_number(target) {
+            match config::lookup_dialup_number(target) {
+                Some(mapped) => mapped,
+                None => {
+                    // No mapping found for this number.
+                    send_result(state, "NO CARRIER");
+                    return;
+                }
+            }
+        } else {
+            target.to_string()
+        };
+
+        let (host, port) = if let Some((h, p)) = resolved.rsplit_once(':') {
             match p.parse::<u16>() {
                 Ok(port) if port > 0 => (h.to_string(), port),
                 _ => {
@@ -664,10 +693,28 @@ fn handle_dial(state: &mut ModemState, target: &str) {
                 }
             }
         } else {
-            (target.to_string(), 23u16)
+            (resolved, 23u16)
         };
         dial_tcp(state, &host, port);
     }
+}
+
+/// Returns true if the dial string looks like a phone number rather than a
+/// hostname.  Phone numbers contain only digits, dashes, spaces, parentheses,
+/// and the leading `+` for international format.  Dots are excluded so that
+/// IP addresses (e.g. `192.168.1.1`) and hostnames are not mistaken for
+/// phone numbers.
+fn is_phone_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Must contain at least one digit
+    let has_digit = s.chars().any(|c| c.is_ascii_digit());
+    // Must contain only phone-number characters (no dots or colons)
+    let all_phone = s.chars().all(|c| {
+        c.is_ascii_digit() || c == '-' || c == ' ' || c == '(' || c == ')' || c == '+'
+    });
+    has_digit && all_phone
 }
 
 /// Dial into the local XMODEM Gateway menu via an in-memory duplex bridge.
@@ -813,7 +860,9 @@ fn online_mode_duplex(
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return OnlineExit::Disconnected,
         }
 
@@ -865,7 +914,9 @@ fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> Onl
                     return OnlineExit::Disconnected;
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return OnlineExit::Disconnected,
         }
 
@@ -1929,6 +1980,75 @@ mod tests {
         // Values > 255 fail u8 parse, fall back to default
         let regs = parse_s_regs("999,0,43,13,10,8,2,50,2,6,14,95,50");
         assert_eq!(regs[0], S_REG_DEFAULTS[0]); // overflow → default
+    }
+
+    // ─── Phone number detection ───────────────────────────
+
+    #[test]
+    fn test_is_phone_number_digits_only() {
+        assert!(is_phone_number("1234567"));
+        assert!(is_phone_number("5551234"));
+        assert!(is_phone_number("18005551234"));
+    }
+
+    #[test]
+    fn test_is_phone_number_with_formatting() {
+        assert!(is_phone_number("555-1234"));
+        assert!(is_phone_number("(800) 555-1234"));
+        assert!(is_phone_number("+1-800-555-1234"));
+    }
+
+    #[test]
+    fn test_is_phone_number_not_hostname() {
+        assert!(!is_phone_number("bbs.example.com"));
+        assert!(!is_phone_number("bbs.example.com:23"));
+        assert!(!is_phone_number("xmodem-gateway"));
+        assert!(!is_phone_number("localhost"));
+    }
+
+    #[test]
+    fn test_is_phone_number_not_ip_or_host() {
+        assert!(!is_phone_number("192.168.1.1"));
+        assert!(!is_phone_number("192.168.1.1:23"));
+        assert!(!is_phone_number("retro.host:2323"));
+        assert!(!is_phone_number("1.800.555.1234"));
+    }
+
+    #[test]
+    fn test_is_phone_number_empty() {
+        assert!(!is_phone_number(""));
+    }
+
+    #[test]
+    fn test_is_phone_number_only_formatting() {
+        // No digits — not a phone number
+        assert!(!is_phone_number("---"));
+        assert!(!is_phone_number("()"));
+    }
+
+    // ─── Gateway phone number ─────────────────────────────
+
+    #[test]
+    fn test_gateway_phone_number_is_valid() {
+        assert!(is_phone_number(GATEWAY_PHONE_NUMBER));
+    }
+
+    #[test]
+    fn test_gateway_phone_number_detected() {
+        let digits: String = GATEWAY_PHONE_NUMBER
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        assert_eq!(digits, "1001000");
+    }
+
+    #[test]
+    fn test_gateway_phone_number_formatted() {
+        // "100-1000" should match the gateway number
+        let input = "100-1000";
+        assert!(is_phone_number(input));
+        let digits: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
+        assert_eq!(digits, GATEWAY_PHONE_NUMBER);
     }
 
 }
