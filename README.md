@@ -5,6 +5,18 @@ emulator for serial-attached retro hardware, text-mode web browser, and AI chat
 client written in Rust. Supports PETSCII (Commodore 64), ANSI, and ASCII
 terminals. Designed for local network use with retro and modern terminal clients.
 
+Once you run the server on your PC, you can telnet to that server from anywhere 
+on your network (allow firewall port 2323).  Example:  ATDT 192.168.1.160:2323
+
+This program also serves as a modem emulator.  For an Altairduino PRO, connect 
+directly to the altairduino, and set your modem port to be 2SIO2. (A6/A7 on 
+mine).  Remember, you can configure the serial ports by pressing stop and aux1
+up.
+
+This should also work with the RC2014 / SC126, etc as well.
+
+
+
 Author: Ricky Bryce
 Co-Author: Claude (Anthropic)
 
@@ -652,4 +664,4 @@ this software on untrusted networks.
 
 ## License
 
-All rights reserved.
+This project is licensed under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0-or-later).
