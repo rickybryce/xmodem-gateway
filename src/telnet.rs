@@ -3042,6 +3042,10 @@ impl TelnetSession {
                             }
                             if bridge_writer.write_all(&[b]).await.is_err() { break; }
                             if bridge_writer.flush().await.is_err() { break; }
+                            // Echo the typed character back to the local terminal
+                            let mut w = writer.lock().await;
+                            if w.write_all(&[b]).await.is_err() { break; }
+                            if w.flush().await.is_err() { break; }
                         }
                         _ => break,
                     }
