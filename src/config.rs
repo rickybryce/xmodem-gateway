@@ -31,6 +31,9 @@ const DEFAULT_SERIAL_DATABITS: u8 = 8;
 const DEFAULT_SERIAL_PARITY: &str = "none";
 const DEFAULT_SERIAL_STOPBITS: u8 = 1;
 const DEFAULT_SERIAL_FLOWCONTROL: &str = "none";
+const DEFAULT_XMODEM_NEGOTIATION_TIMEOUT: u64 = 45;
+const DEFAULT_XMODEM_BLOCK_TIMEOUT: u64 = 20;
+const DEFAULT_XMODEM_MAX_RETRIES: usize = 10;
 const DEFAULT_SERIAL_ECHO: bool = true;
 const DEFAULT_SERIAL_VERBOSE: bool = true;
 const DEFAULT_SERIAL_QUIET: bool = false;
@@ -59,6 +62,12 @@ pub struct Config {
     pub weather_zip: String,
     /// Enable verbose XMODEM protocol logging to stderr.
     pub verbose: bool,
+    /// XMODEM negotiation timeout in seconds.
+    pub xmodem_negotiation_timeout: u64,
+    /// XMODEM per-block timeout in seconds.
+    pub xmodem_block_timeout: u64,
+    /// XMODEM maximum retries per block.
+    pub xmodem_max_retries: usize,
     /// Enable serial modem emulation.
     pub serial_enabled: bool,
     /// Serial port device (e.g. /dev/ttyUSB0, COM3). Empty = not configured.
@@ -105,6 +114,9 @@ impl Default for Config {
             browser_homepage: DEFAULT_BROWSER_HOMEPAGE.into(),
             weather_zip: DEFAULT_WEATHER_ZIP.into(),
             verbose: DEFAULT_VERBOSE,
+            xmodem_negotiation_timeout: DEFAULT_XMODEM_NEGOTIATION_TIMEOUT,
+            xmodem_block_timeout: DEFAULT_XMODEM_BLOCK_TIMEOUT,
+            xmodem_max_retries: DEFAULT_XMODEM_MAX_RETRIES,
             serial_enabled: DEFAULT_SERIAL_ENABLED,
             serial_port: DEFAULT_SERIAL_PORT.into(),
             serial_baud: DEFAULT_SERIAL_BAUD,
@@ -222,6 +234,18 @@ fn read_config_file(path: &str) -> Config {
             .get("verbose")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(DEFAULT_VERBOSE),
+        xmodem_negotiation_timeout: map
+            .get("xmodem_negotiation_timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_XMODEM_NEGOTIATION_TIMEOUT),
+        xmodem_block_timeout: map
+            .get("xmodem_block_timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_XMODEM_BLOCK_TIMEOUT),
+        xmodem_max_retries: map
+            .get("xmodem_max_retries")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_XMODEM_MAX_RETRIES),
         serial_enabled: map
             .get("serial_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -338,6 +362,11 @@ weather_zip = {}
 # Verbose logging: set to true for detailed XMODEM protocol diagnostics
 verbose = {}
 
+# XMODEM protocol timeouts
+xmodem_negotiation_timeout = {}
+xmodem_block_timeout = {}
+xmodem_max_retries = {}
+
 # Serial modem emulation (Hayes AT commands)
 # Set serial_enabled = true and configure the port to activate.
 serial_enabled = {}
@@ -381,6 +410,9 @@ ssh_password = {}
         sanitize_value(&cfg.browser_homepage),
         sanitize_value(&cfg.weather_zip),
         cfg.verbose,
+        cfg.xmodem_negotiation_timeout,
+        cfg.xmodem_block_timeout,
+        cfg.xmodem_max_retries,
         cfg.serial_enabled,
         sanitize_value(&cfg.serial_port),
         cfg.serial_baud,
@@ -595,6 +627,9 @@ mod tests {
             browser_homepage: "https://example.com".into(),
             weather_zip: "90210".into(),
             verbose: true,
+            xmodem_negotiation_timeout: 120,
+            xmodem_block_timeout: 30,
+            xmodem_max_retries: 15,
             serial_enabled: true,
             serial_port: "/dev/ttyUSB0".into(),
             serial_baud: 115200,
@@ -625,6 +660,9 @@ mod tests {
         assert_eq!(loaded.browser_homepage, original.browser_homepage);
         assert_eq!(loaded.weather_zip, original.weather_zip);
         assert_eq!(loaded.verbose, original.verbose);
+        assert_eq!(loaded.xmodem_negotiation_timeout, original.xmodem_negotiation_timeout);
+        assert_eq!(loaded.xmodem_block_timeout, original.xmodem_block_timeout);
+        assert_eq!(loaded.xmodem_max_retries, original.xmodem_max_retries);
         assert_eq!(loaded.serial_enabled, original.serial_enabled);
         assert_eq!(loaded.serial_port, original.serial_port);
         assert_eq!(loaded.serial_baud, original.serial_baud);
