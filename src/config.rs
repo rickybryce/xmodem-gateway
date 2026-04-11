@@ -31,6 +31,11 @@ const DEFAULT_SERIAL_DATABITS: u8 = 8;
 const DEFAULT_SERIAL_PARITY: &str = "none";
 const DEFAULT_SERIAL_STOPBITS: u8 = 1;
 const DEFAULT_SERIAL_FLOWCONTROL: &str = "none";
+const DEFAULT_SERIAL_ECHO: bool = true;
+const DEFAULT_SERIAL_VERBOSE: bool = true;
+const DEFAULT_SERIAL_QUIET: bool = false;
+/// Default S-register values (S0–S12), comma-separated for config storage.
+const DEFAULT_SERIAL_S_REGS: &str = "5,0,43,13,10,8,2,50,2,6,14,95,50";
 const DEFAULT_SSH_ENABLED: bool = false;
 const DEFAULT_SSH_PORT: u16 = 2222;
 const DEFAULT_SSH_USERNAME: &str = "admin";
@@ -68,6 +73,14 @@ pub struct Config {
     pub serial_stopbits: u8,
     /// Serial flow control: "none", "hardware", or "software".
     pub serial_flowcontrol: String,
+    /// Saved modem echo setting (AT&W persists, ATZ restores).
+    pub serial_echo: bool,
+    /// Saved modem verbose/numeric mode (AT&W persists, ATZ restores).
+    pub serial_verbose: bool,
+    /// Saved modem quiet mode (AT&W persists, ATZ restores).
+    pub serial_quiet: bool,
+    /// Saved S-register values as comma-separated decimal (AT&W persists, ATZ restores).
+    pub serial_s_regs: String,
     /// Enable SSH server interface.
     pub ssh_enabled: bool,
     /// SSH server port.
@@ -99,6 +112,10 @@ impl Default for Config {
             serial_parity: DEFAULT_SERIAL_PARITY.into(),
             serial_stopbits: DEFAULT_SERIAL_STOPBITS,
             serial_flowcontrol: DEFAULT_SERIAL_FLOWCONTROL.into(),
+            serial_echo: DEFAULT_SERIAL_ECHO,
+            serial_verbose: DEFAULT_SERIAL_VERBOSE,
+            serial_quiet: DEFAULT_SERIAL_QUIET,
+            serial_s_regs: DEFAULT_SERIAL_S_REGS.into(),
             ssh_enabled: DEFAULT_SSH_ENABLED,
             ssh_port: DEFAULT_SSH_PORT,
             ssh_username: DEFAULT_SSH_USERNAME.into(),
@@ -237,6 +254,22 @@ fn read_config_file(path: &str) -> Config {
             .filter(|v| matches!(v.as_str(), "none" | "hardware" | "software"))
             .cloned()
             .unwrap_or_else(|| DEFAULT_SERIAL_FLOWCONTROL.into()),
+        serial_echo: map
+            .get("serial_echo")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_SERIAL_ECHO),
+        serial_verbose: map
+            .get("serial_verbose")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_SERIAL_VERBOSE),
+        serial_quiet: map
+            .get("serial_quiet")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_SERIAL_QUIET),
+        serial_s_regs: map
+            .get("serial_s_regs")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SERIAL_S_REGS.into()),
         ssh_enabled: map
             .get("ssh_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -320,6 +353,12 @@ serial_parity = {}
 serial_stopbits = {}
 serial_flowcontrol = {}
 
+# Saved modem settings (written by AT&W, restored by ATZ)
+serial_echo = {}
+serial_verbose = {}
+serial_quiet = {}
+serial_s_regs = {}
+
 # SSH server interface (encrypted access to the gateway)
 # Set ssh_enabled = true to activate. Uses its own credentials.
 ssh_enabled = {}
@@ -349,6 +388,10 @@ ssh_password = {}
         sanitize_value(&cfg.serial_parity),
         cfg.serial_stopbits,
         sanitize_value(&cfg.serial_flowcontrol),
+        cfg.serial_echo,
+        cfg.serial_verbose,
+        cfg.serial_quiet,
+        sanitize_value(&cfg.serial_s_regs),
         cfg.ssh_enabled,
         cfg.ssh_port,
         sanitize_value(&cfg.ssh_username),
@@ -418,6 +461,10 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
                 cfg.serial_flowcontrol = value.to_string();
             }
         }
+        "serial_echo" => cfg.serial_echo = value.eq_ignore_ascii_case("true"),
+        "serial_verbose" => cfg.serial_verbose = value.eq_ignore_ascii_case("true"),
+        "serial_quiet" => cfg.serial_quiet = value.eq_ignore_ascii_case("true"),
+        "serial_s_regs" => cfg.serial_s_regs = value.to_string(),
         "ssh_enabled" => cfg.ssh_enabled = value.eq_ignore_ascii_case("true"),
         "ssh_port" => {
             if let Ok(v) = value.parse() {
@@ -555,6 +602,10 @@ mod tests {
             serial_parity: "even".into(),
             serial_stopbits: 2,
             serial_flowcontrol: "hardware".into(),
+            serial_echo: false,
+            serial_verbose: false,
+            serial_quiet: true,
+            serial_s_regs: "1,0,43,13,10,8,2,50,2,6,14,95,50".into(),
             ssh_enabled: true,
             ssh_port: 2222,
             ssh_username: "sshuser".into(),
@@ -581,6 +632,10 @@ mod tests {
         assert_eq!(loaded.serial_parity, original.serial_parity);
         assert_eq!(loaded.serial_stopbits, original.serial_stopbits);
         assert_eq!(loaded.serial_flowcontrol, original.serial_flowcontrol);
+        assert_eq!(loaded.serial_echo, original.serial_echo);
+        assert_eq!(loaded.serial_verbose, original.serial_verbose);
+        assert_eq!(loaded.serial_quiet, original.serial_quiet);
+        assert_eq!(loaded.serial_s_regs, original.serial_s_regs);
         assert_eq!(loaded.ssh_enabled, original.ssh_enabled);
         assert_eq!(loaded.ssh_port, original.ssh_port);
         assert_eq!(loaded.ssh_username, original.ssh_username);

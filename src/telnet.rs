@@ -3680,6 +3680,13 @@ impl TelnetSession {
                 self.cyan("F")
             ))
             .await?;
+            if !self.is_serial {
+                self.send_line(&format!(
+                    "  {}  Ring emulator",
+                    self.cyan("I")
+                ))
+                .await?;
+            }
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}  {}",
@@ -3722,6 +3729,9 @@ impl TelnetSession {
                 "f" => {
                     self.modem_set_flow().await?;
                 }
+                "i" if !self.is_serial => {
+                    self.modem_ring_emulator().await?;
+                }
                 "h" => {
                     self.modem_show_help().await?;
                 }
@@ -3730,7 +3740,12 @@ impl TelnetSession {
                     return Ok(());
                 }
                 _ => {
-                    self.show_error("Press E, P, B, D, F, H, or Q.").await?;
+                    let msg = if self.is_serial {
+                        "Press E, P, B, D, F, H, or Q."
+                    } else {
+                        "Press E, P, B, D, F, I, H, or Q."
+                    };
+                    self.show_error(msg).await?;
                 }
             }
         }
@@ -4164,6 +4179,116 @@ impl TelnetSession {
         }
     }
 
+    async fn modem_ring_emulator(&mut self) -> Result<(), std::io::Error> {
+        let cfg = config::get_config();
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("RING EMULATOR")))
+            .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+
+        // Check if serial port is enabled
+        if !cfg.serial_enabled || cfg.serial_port.is_empty() {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Serial port is not enabled.")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        // Create progress channel
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(16);
+
+        if !crate::serial::request_ring(tx) {
+            self.send_line(&format!(
+                "  {}",
+                self.red("Ring emulator is not available.")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send("  Press any key to continue.").await?;
+            self.flush().await?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        self.send_line(&format!(
+            "  Calling {}...",
+            self.amber(&cfg.serial_port)
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.flush().await?;
+
+        // Show rings as they happen.  ESC cancels (drops rx which
+        // signals the serial thread to abort).
+        let reader = &mut self.reader;
+        let writer = &self.writer;
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+        let mut answered = false;
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(0) => {
+                            // RING
+                            let mut w = writer.lock().await;
+                            let _ = w.write_all(b"  RING...\r\n").await;
+                            let _ = w.flush().await;
+                        }
+                        Some(1) => {
+                            // Answered
+                            answered = true;
+                            break;
+                        }
+                        _ => break, // channel closed
+                    }
+                }
+                byte = read_byte_iac_filtered(reader, true) => {
+                    match byte {
+                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
+                            break; // ESC cancels
+                        }
+                        Ok(None) | Err(_) => break,
+                        _ => {} // ignore other keys
+                    }
+                }
+            }
+        }
+
+        // Drop the receiver to signal cancellation if we broke out early.
+        drop(rx);
+
+        self.send_line("").await?;
+        if answered {
+            self.send_line(&format!(
+                "  {}",
+                self.green("Remote machine connected.")
+            ))
+            .await?;
+        } else {
+            self.send_line(&format!(
+                "  {}",
+                self.yellow("Ring cancelled.")
+            ))
+            .await?;
+        }
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
     async fn modem_show_help(&mut self) -> Result<(), std::io::Error> {
         let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
             &[
@@ -4176,6 +4301,9 @@ impl TelnetSession {
                 "    Connect to this gateway",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
+                "  ATDL Redial last number",
+                "  AT&V Show settings",
+                "  AT&W Save settings",
                 "  +++  Return to command mode",
                 "  ATO  Return online",
                 "  ATH  Hang up",
@@ -4191,6 +4319,10 @@ impl TelnetSession {
                 "    Connect to this gateway's menus",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
+                "  ATDL   Redial last number",
+                "  AT&V   Show current settings",
+                "  AT&W   Save settings to config",
+                "  ATSn?  Query S-register",
                 "  +++    Return to command mode",
                 "  ATO    Return to online mode",
                 "  ATH    Hang up connection",
@@ -6343,11 +6475,11 @@ mod tests {
         assert!(rows <= 22, "stop bits screen is {} rows, exceeds 22", rows);
     }
 
-    /// Modem help screen (ANSI): header(3) + blank + 12 content lines +
-    /// blank + "Press any key" = 18 rows.
+    /// Modem help screen (ANSI): header(3) + blank + 16 content lines +
+    /// blank + "Press any key" = 22 rows.
     #[test]
     fn test_modem_help_screen_row_count() {
-        let rows = 3 + 1 + 12 + 1 + 1; // 18
+        let rows = 3 + 1 + 16 + 1 + 1; // 22
         assert!(rows <= 22, "modem help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6432,6 +6564,9 @@ mod tests {
             "    Connect to this gateway",
             "  ATDT host:port",
             "    Dial a remote telnet host",
+            "  ATDL Redial last number",
+            "  AT&V Show settings",
+            "  AT&W Save settings",
             "  +++  Return to command mode",
             "  ATO  Return online",
             "  ATH  Hang up",

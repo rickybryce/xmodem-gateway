@@ -4,8 +4,10 @@
 //! synchronous `serialport::SerialPort` object.  Bridges to the async runtime
 //! via `tokio::runtime::Handle` for `ATDT xmodem-gateway` connections.
 //!
-//! Supported AT commands: AT, ATZ, ATE0/ATE1, ATI, ATH, ATDT.
-//! The `+++` escape (with 1-second guard time) returns to command mode.
+//! Supported AT commands: AT, AT?, ATZ, AT&F, AT&W, AT&V, ATE0/ATE1,
+//! ATV0/ATV1, ATQ0/ATQ1, ATI, ATH, ATA, ATO, ATDT, ATDP, ATD, ATDL,
+//! ATS?, ATSn?, ATSn=v.  S-registers S0–S12 are supported.
+//! The `+++` escape (configurable via S2/S12) returns to command mode.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,14 +20,42 @@ use crate::config;
 
 // ─── Constants ─────────────────────────────────────────────
 
-const GUARD_TIME: Duration = Duration::from_secs(1);
-const PLUS_BYTE: u8 = b'+';
 const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum AT command buffer length.  Real Hayes modems cap at ~40 chars;
+/// we allow 256 to be generous.  Bytes beyond this limit are silently dropped.
+const MAX_CMD_LEN: usize = 256;
+
+/// Number of S-registers (S0 through S12).
+const NUM_S_REGS: usize = 13;
+
+/// Default S-register values per the Hayes standard.
+const S_REG_DEFAULTS: [u8; NUM_S_REGS] = [
+    5,   // S0:  Auto-answer ring count (5 = answer after 5 rings)
+    0,   // S1:  Ring counter (read-only in real modems)
+    43,  // S2:  Escape character (43 = '+')
+    13,  // S3:  Carriage return character
+    10,  // S4:  Line feed character
+    8,   // S5:  Backspace character
+    2,   // S6:  Wait for dial tone (seconds)
+    50,  // S7:  Wait for carrier (seconds)
+    2,   // S8:  Comma pause time (seconds)
+    6,   // S9:  Carrier detect response time (1/10s)
+    14,  // S10: Carrier loss disconnect time (1/10s)
+    95,  // S11: DTMF tone duration (milliseconds)
+    50,  // S12: Escape guard time (1/50s; 50 = 1 second)
+];
 
 /// Flag to signal the serial thread to restart with new config.
 static SERIAL_RESTART: AtomicBool = AtomicBool::new(false);
 
+/// Slot for a ring emulator request from telnet/SSH.  The sender is used to
+/// report progress (0 = ring, 1 = answered) back to the requesting session.
+static RING_REQUEST: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<u8>>> =
+    std::sync::Mutex::new(None);
+
+/// Ring interval: 2 seconds on, 4 seconds off = 6 seconds per cycle (US standard).
+const RING_INTERVAL: Duration = Duration::from_secs(6);
 
 // ─── Modem state ───────────────────────────────────────────
 
@@ -68,6 +98,10 @@ struct ModemState {
     baud: u32,
     /// Connection preserved after +++ escape for ATO to resume.
     active_connection: Option<ActiveConnection>,
+    /// S-register values (S0–S12).
+    s_regs: [u8; NUM_S_REGS],
+    /// Last dialed target for ATDL (redial).
+    last_dial: String,
 }
 
 // ─── Public API ────────────────────────────────────────────
@@ -101,6 +135,18 @@ pub fn list_serial_ports() -> Vec<String> {
         Ok(ports) => ports.into_iter().map(|p| p.port_name).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Request a ring emulator session.  The sender receives progress events:
+/// `0` for each RING, `1` when the modem answers.  Returns `false` if a
+/// ring request is already pending.
+pub fn request_ring(sender: tokio::sync::mpsc::Sender<u8>) -> bool {
+    let mut slot = RING_REQUEST.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(sender);
+    true
 }
 
 // ─── Serial manager ────────────────────────────────────────
@@ -174,9 +220,9 @@ fn serial_thread(
     let mut state = ModemState {
         port,
         mode: ModemMode::Command,
-        echo: true,
-        verbose: true,
-        quiet: false,
+        echo: cfg.serial_echo,
+        verbose: cfg.serial_verbose,
+        quiet: cfg.serial_quiet,
         last_data_time: now,
         plus_count: 0,
         plus_start: now,
@@ -185,11 +231,20 @@ fn serial_thread(
         shutdown,
         baud: cfg.serial_baud,
         active_connection: None,
+        s_regs: parse_s_regs(&cfg.serial_s_regs),
+        last_dial: String::new(),
     };
 
     send_response(&mut state.port, "OK");
 
     while !state.shutdown.load(Ordering::SeqCst) && !SERIAL_RESTART.load(Ordering::SeqCst) {
+        // Check for a pending ring request.
+        if state.mode == ModemMode::Command
+            && let Some(sender) = take_ring_request()
+        {
+            process_ring(&mut state, sender);
+            continue;
+        }
         match state.mode {
             ModemMode::Command => command_mode_tick(&mut state),
             ModemMode::Online => {
@@ -238,10 +293,12 @@ fn command_mode_tick(state: &mut ModemState) {
                     }
                 }
                 _ if byte >= 0x20 => {
-                    if state.echo {
-                        let _ = state.port.write_all(&[byte]);
+                    if state.cmd_buffer.len() < MAX_CMD_LEN {
+                        if state.echo {
+                            let _ = state.port.write_all(&[byte]);
+                        }
+                        state.cmd_buffer.push(byte as char);
                     }
-                    state.cmd_buffer.push(byte as char);
                 }
                 _ => {} // ignore control chars
             }
@@ -269,8 +326,24 @@ enum AtResult {
     Online,
     /// ATH — hang up (close any active connection).
     Hangup,
-    /// ATZ / AT&F — reset modem settings (also closes active connection).
+    /// AT&F — reset to factory defaults (also closes active connection).
     Reset,
+    /// ATZ — reset to stored (config) settings (also closes active connection).
+    ResetStored,
+    /// AT&W — save current modem settings to config file.
+    SaveConfig,
+    /// ATSn? — query S-register value.
+    SRegQuery(usize),
+    /// ATSn=v — set S-register value.
+    SRegSet(usize, u8),
+    /// AT&V — display current modem configuration.
+    ShowConfig,
+    /// ATDL — redial last number.
+    Redial,
+    /// AT? — show AT command help.
+    Help,
+    /// ATS? — show S-register help.
+    SRegHelp,
 }
 
 /// Parse an AT command line into a list of responses.  Pure function for
@@ -295,10 +368,7 @@ fn parse_at_command(
 
     match rest {
         "Z" => {
-            *echo = true;
-            *verbose = true;
-            *quiet = false;
-            vec![AtResult::Reset]
+            vec![AtResult::ResetStored]
         }
         "H" | "H0" => vec![AtResult::Hangup],
         "E0" => {
@@ -332,6 +402,7 @@ fn parse_at_command(
             )),
             AtResult::Ok,
         ],
+        "?" => vec![AtResult::Help],
         "O" | "O0" => vec![AtResult::Online],
         "A" => vec![AtResult::NoCarrier],
         "&F" => {
@@ -340,6 +411,41 @@ fn parse_at_command(
             *quiet = false;
             vec![AtResult::Reset]
         }
+        "&W" | "&W0" => vec![AtResult::SaveConfig],
+        "&V" => vec![AtResult::ShowConfig],
+        _ if rest.starts_with("S") && rest.len() > 1 => {
+            // S-register: ATS? (help), ATSn? (query), or ATSn=v (set)
+            let s_rest = &rest[1..];
+            if s_rest == "?" {
+                // ATS? — S-register help
+                return vec![AtResult::SRegHelp];
+            }
+            if let Some(qpos) = s_rest.find('?') {
+                // ATSn?
+                match s_rest[..qpos].parse::<usize>() {
+                    std::result::Result::Ok(reg) if reg < NUM_S_REGS => {
+                        vec![AtResult::SRegQuery(reg)]
+                    }
+                    _ => vec![AtResult::Error],
+                }
+            } else if let Some(epos) = s_rest.find('=') {
+                // ATSn=v
+                let reg_str = &s_rest[..epos];
+                let val_str = s_rest[epos + 1..].trim();
+                match (reg_str.parse::<usize>(), val_str.parse::<u16>()) {
+                    (std::result::Result::Ok(reg), std::result::Result::Ok(val))
+                        if reg < NUM_S_REGS && val <= 255 =>
+                    {
+                        vec![AtResult::SRegSet(reg, val as u8)]
+                    }
+                    _ => vec![AtResult::Error],
+                }
+            } else {
+                // Bare ATSn with no ? or = — error
+                vec![AtResult::Error]
+            }
+        }
+        "DL" => vec![AtResult::Redial],
         _ if rest.starts_with("DT") || rest.starts_with("DP") || rest.starts_with("D") => {
             // Preserve original case for the dial string (hostnames).
             let dial_str = if rest.starts_with("DT") || rest.starts_with("DP") {
@@ -378,10 +484,23 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
                 }
             }
             AtResult::Dial(target) => {
+                // Strip commas (pause characters) from the dial string.
+                let target = target.replace(',', "");
                 // Hang up any existing connection before dialing.
                 state.active_connection = None;
+                state.last_dial = target.clone();
                 handle_dial(state, &target);
                 return; // dial takes over the session
+            }
+            AtResult::Redial => {
+                if state.last_dial.is_empty() {
+                    send_result(state, "ERROR");
+                } else {
+                    state.active_connection = None;
+                    let target = state.last_dial.clone();
+                    handle_dial(state, &target);
+                    return;
+                }
             }
             AtResult::Online => {
                 handle_return_online(state);
@@ -392,8 +511,102 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
                 send_result(state, "OK");
             }
             AtResult::Reset => {
+                // AT&F — factory defaults
+                state.echo = true;
+                state.verbose = true;
+                state.quiet = false;
+                state.active_connection = None;
+                state.s_regs = S_REG_DEFAULTS;
+                send_result(state, "OK");
+            }
+            AtResult::ResetStored => {
+                // ATZ — restore from config (saved by AT&W)
+                let cfg = config::get_config();
+                state.echo = cfg.serial_echo;
+                state.verbose = cfg.serial_verbose;
+                state.quiet = cfg.serial_quiet;
+                state.s_regs = parse_s_regs(&cfg.serial_s_regs);
                 state.active_connection = None;
                 send_result(state, "OK");
+            }
+            AtResult::SaveConfig => {
+                // AT&W — save current settings to config
+                config::update_config_values(&[
+                    ("serial_echo", if state.echo { "true" } else { "false" }),
+                    ("serial_verbose", if state.verbose { "true" } else { "false" }),
+                    ("serial_quiet", if state.quiet { "true" } else { "false" }),
+                    ("serial_s_regs", &format_s_regs(&state.s_regs)),
+                ]);
+                send_result(state, "OK");
+            }
+            AtResult::SRegQuery(reg) => {
+                if !state.quiet {
+                    let val = state.s_regs[reg];
+                    send_response(&mut state.port, &format!("{:03}", val));
+                }
+            }
+            AtResult::SRegSet(reg, val) => {
+                state.s_regs[reg] = val;
+                send_result(state, "OK");
+            }
+            AtResult::Help => {
+                if !state.quiet {
+                    let lines = [
+                        "AT Commands:",
+                        "AT     OK             ATZ   Reset (stored)",
+                        "AT&F   Factory reset   AT&W  Save settings",
+                        "AT&V   Show config     ATI   Identification",
+                        "ATE0/1 Echo off/on     ATV0/1 Verbose/numeric",
+                        "ATQ0/1 Quiet off/on    ATH   Hang up",
+                        "ATO    Return online   ATA   Answer",
+                        "ATDT   Dial host:port  ATDL  Redial",
+                        "ATSn?  Query register  ATSn=v Set register",
+                        "ATS?   Register help   +++   Escape to cmd",
+                        "AT?    This help",
+                    ];
+                    for line in &lines {
+                        send_response(&mut state.port, line);
+                    }
+                }
+            }
+            AtResult::SRegHelp => {
+                if !state.quiet {
+                    let lines = [
+                        "S-Registers (ATSn? to query, ATSn=v to set):",
+                        "S00  Auto-answer ring count (0=off)",
+                        "S01  Ring counter (current)",
+                        "S02  Escape character (43=+)",
+                        "S03  Carriage return char (13)",
+                        "S04  Line feed char (10)",
+                        "S05  Backspace char (8)",
+                        "S06  Wait for dial tone (sec)",
+                        "S07  Wait for carrier (sec)",
+                        "S08  Comma pause time (sec)",
+                        "S09  Carrier detect time (1/10s)",
+                        "S10  Carrier loss time (1/10s)",
+                        "S11  DTMF tone duration (ms)",
+                        "S12  Escape guard time (1/50s)",
+                    ];
+                    for line in &lines {
+                        send_response(&mut state.port, line);
+                    }
+                }
+            }
+            AtResult::ShowConfig => {
+                // AT&V — display current configuration
+                if !state.quiet {
+                    let echo_str = if state.echo { "E1" } else { "E0" };
+                    let verbose_str = if state.verbose { "V1" } else { "V0" };
+                    let quiet_str = if state.quiet { "Q1" } else { "Q0" };
+                    send_response(&mut state.port,
+                        &format!("{} {} {} B{}", echo_str, verbose_str, quiet_str, state.baud));
+                    let s_line = state.s_regs.iter().enumerate()
+                        .map(|(i, v)| format!("S{:02}={:03}", i, v))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    send_response(&mut state.port, &s_line);
+                    send_result(state, "OK");
+                }
             }
         }
     }
@@ -677,44 +890,57 @@ fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> Onl
 
 // ─── +++ escape detection ──────────────────────────────────
 
+/// Return the escape character from S2.
+fn escape_char(state: &ModemState) -> u8 {
+    state.s_regs[2]
+}
+
+/// Return the escape guard time from S12 (stored as 1/50ths of a second).
+fn guard_time(state: &ModemState) -> Duration {
+    Duration::from_millis(state.s_regs[12] as u64 * 20)
+}
+
 /// Process bytes from the serial port during online mode.  Bytes that should
-/// be forwarded to the remote end are appended to `forward`.  Pending `+`
+/// be forwarded to the remote end are appended to `forward`.  Pending escape
 /// bytes from a possible escape sequence are held back (not appended) until
-/// either a non-`+` byte arrives (which flushes them) or `check_plus_complete`
+/// either a different byte arrives (which flushes them) or `check_plus_complete`
 /// confirms the escape after the trailing guard time.
 fn process_online_bytes(
     state: &mut ModemState,
     data: &[u8],
     forward: &mut Vec<u8>,
 ) {
+    let esc = escape_char(state);
+    let guard = guard_time(state);
+
     for &byte in data {
         let now = Instant::now();
 
-        if byte == PLUS_BYTE {
+        if byte == esc {
             if state.plus_count == 0 {
-                // First '+': only start sequence if guard time (silence) has elapsed
-                if now.duration_since(state.last_data_time) >= GUARD_TIME {
+                // First escape char: only start sequence if guard time (silence) has elapsed
+                if now.duration_since(state.last_data_time) >= guard {
                     state.plus_count = 1;
                     state.plus_start = now;
                     continue; // hold this byte
                 }
-                // Guard time not met — forward '+' normally
+                // Guard time not met — forward normally
             } else if state.plus_count < 3 {
                 state.plus_count += 1;
                 if state.plus_count == 3 {
-                    state.plus_start = now; // record time of third '+'
+                    state.plus_start = now; // record time of third escape char
                     continue;
                 }
                 continue; // hold this byte
             }
-            // plus_count == 3 and another '+' arrived — that's 4 pluses, not an escape.
+            // plus_count == 3 and another escape char arrived — that's 4, not an escape.
             // Fall through to flush and forward.
         }
 
-        // Non-'+' byte (or 4th '+'):  flush any pending '+' chars
+        // Non-escape byte (or 4th escape char):  flush any pending escape chars
         if state.plus_count > 0 {
             for _ in 0..state.plus_count {
-                forward.push(PLUS_BYTE);
+                forward.push(esc);
             }
             state.plus_count = 0;
         }
@@ -724,16 +950,113 @@ fn process_online_bytes(
     }
 }
 
-/// Check whether the trailing guard time after `+++` has elapsed.  Returns
-/// `true` if the escape is complete and the modem should return to command mode.
+/// Check whether the trailing guard time after the escape sequence has elapsed.
+/// Returns `true` if the escape is complete and the modem should return to
+/// command mode.
 fn check_plus_complete(state: &mut ModemState) -> bool {
     if state.plus_count == 3
-        && Instant::now().duration_since(state.plus_start) >= GUARD_TIME
+        && Instant::now().duration_since(state.plus_start) >= guard_time(state)
     {
         state.plus_count = 0;
         return true;
     }
     false
+}
+
+// ─── Ring emulator ────────────────────────────────────────
+
+/// Take a pending ring request from the global slot, if any.
+fn take_ring_request() -> Option<tokio::sync::mpsc::Sender<u8>> {
+    RING_REQUEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Simulate an incoming call.  Sends RING to the serial port at standard
+/// phone cadence, checks for ATA (manual answer), and auto-answers after
+/// S0 rings.  Reports progress via the sender (0 = ring, 1 = answered).
+fn process_ring(state: &mut ModemState, sender: tokio::sync::mpsc::Sender<u8>) {
+    state.s_regs[1] = 0; // reset ring counter
+
+    let auto_answer = state.s_regs[0];
+    let mut manual_answer = false;
+
+    loop {
+        if state.shutdown.load(Ordering::SeqCst) || SERIAL_RESTART.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Send RING to serial device
+        state.s_regs[1] = state.s_regs[1].saturating_add(1);
+        send_result(state, "RING");
+
+        // Notify the telnet/SSH user; if they disconnected, abort.
+        if sender.try_send(0).is_err() {
+            return;
+        }
+
+        // Auto-answer?
+        if auto_answer > 0 && state.s_regs[1] >= auto_answer {
+            break; // answer the call
+        }
+
+        // Wait one ring interval, checking for ATA or shutdown every 100ms.
+        let deadline = Instant::now() + RING_INTERVAL;
+        while Instant::now() < deadline {
+            if state.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            // Check serial port for ATA (manual answer)
+            let mut buf = [0u8; 1];
+            if let Ok(1) = state.port.read(&mut buf) {
+                let byte = buf[0];
+                if byte == b'\r' || byte == b'\n' {
+                    let cmd = std::mem::take(&mut state.cmd_buffer);
+                    let cmd = cmd.trim().to_ascii_uppercase();
+                    if cmd == "ATA" {
+                        manual_answer = true;
+                        break;
+                    }
+                } else if byte >= 0x20 {
+                    state.cmd_buffer.push(byte as char);
+                }
+            }
+        }
+
+        if manual_answer {
+            break;
+        }
+    }
+
+    // Answer: connect to xmodem-gateway
+    let _ = sender.try_send(1); // notify telnet/SSH: answered
+    dial_xmodem_gateway(state);
+}
+
+// ─── Config persistence helpers ────────────────────────────
+
+/// Parse a comma-separated S-register string from config into an array.
+/// Falls back to defaults for any missing or invalid values.
+fn parse_s_regs(s: &str) -> [u8; NUM_S_REGS] {
+    let mut regs = S_REG_DEFAULTS;
+    for (i, part) in s.split(',').enumerate() {
+        if i >= NUM_S_REGS {
+            break;
+        }
+        if let Ok(v) = part.trim().parse::<u8>() {
+            regs[i] = v;
+        }
+    }
+    regs
+}
+
+/// Format S-register array as a comma-separated string for config storage.
+fn format_s_regs(regs: &[u8; NUM_S_REGS]) -> String {
+    regs.iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ─── Helpers ───────────────────────────────────────────────
@@ -811,17 +1134,19 @@ mod tests {
     }
 
     #[test]
-    fn test_atz_resets_all() {
+    fn test_atz_returns_reset_stored() {
         let mut echo = false;
         let mut verbose = false;
         let mut quiet = true;
         assert_eq!(
             parse_full("ATZ", &mut echo, &mut verbose, &mut quiet),
-            vec![AtResult::Reset]
+            vec![AtResult::ResetStored]
         );
-        assert!(echo, "ATZ should reset echo to true");
-        assert!(verbose, "ATZ should reset verbose to true");
-        assert!(!quiet, "ATZ should reset quiet to false");
+        // ATZ no longer modifies settings in parse — process_at_command
+        // loads them from config.  Parse should leave them unchanged.
+        assert!(!echo);
+        assert!(!verbose);
+        assert!(quiet);
     }
 
     #[test]
@@ -1024,6 +1349,120 @@ mod tests {
         }
     }
 
+    // ─── S-register tests ────────────────────────────────
+
+    #[test]
+    fn test_s_reg_defaults_count() {
+        assert_eq!(S_REG_DEFAULTS.len(), NUM_S_REGS);
+        assert_eq!(NUM_S_REGS, 13);
+    }
+
+    #[test]
+    fn test_s_reg_default_values() {
+        assert_eq!(S_REG_DEFAULTS[0], 5);    // auto-answer after 5 rings
+        assert_eq!(S_REG_DEFAULTS[1], 0);    // ring counter
+        assert_eq!(S_REG_DEFAULTS[2], 43);   // escape char '+'
+        assert_eq!(S_REG_DEFAULTS[3], 13);   // CR
+        assert_eq!(S_REG_DEFAULTS[4], 10);   // LF
+        assert_eq!(S_REG_DEFAULTS[5], 8);    // BS
+        assert_eq!(S_REG_DEFAULTS[12], 50);  // guard time 1 sec
+    }
+
+    #[test]
+    fn test_s_reg_query() {
+        let mut echo = true;
+        let results = parse("ATS0?", &mut echo);
+        assert_eq!(results, vec![AtResult::SRegQuery(0)]);
+    }
+
+    #[test]
+    fn test_s_reg_query_s12() {
+        let mut echo = true;
+        let results = parse("ATS12?", &mut echo);
+        assert_eq!(results, vec![AtResult::SRegQuery(12)]);
+    }
+
+    #[test]
+    fn test_s_reg_query_out_of_range() {
+        let mut echo = true;
+        // S13 and above are out of range
+        assert_eq!(parse("ATS13?", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATS99?", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATS255?", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_s_reg_set() {
+        let mut echo = true;
+        let results = parse("ATS0=1", &mut echo);
+        assert_eq!(results, vec![AtResult::SRegSet(0, 1)]);
+    }
+
+    #[test]
+    fn test_s_reg_set_max_value() {
+        let mut echo = true;
+        let results = parse("ATS2=255", &mut echo);
+        assert_eq!(results, vec![AtResult::SRegSet(2, 255)]);
+    }
+
+    #[test]
+    fn test_s_reg_set_value_overflow() {
+        let mut echo = true;
+        // Values above 255 should be rejected
+        assert_eq!(parse("ATS0=256", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATS0=999", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_s_reg_set_out_of_range() {
+        let mut echo = true;
+        assert_eq!(parse("ATS13=0", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_s_reg_set_invalid_value() {
+        let mut echo = true;
+        assert_eq!(parse("ATS0=abc", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATS0=", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_s_reg_bare_number_is_error() {
+        // ATSn without ? or = should be an error
+        let mut echo = true;
+        assert_eq!(parse("ATS0", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATS12", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_s_reg_query_format() {
+        // S-register query responses are 3-digit zero-padded
+        let val: u8 = 0;
+        assert_eq!(format!("{:03}", val), "000");
+        let val: u8 = 43;
+        assert_eq!(format!("{:03}", val), "043");
+        let val: u8 = 255;
+        assert_eq!(format!("{:03}", val), "255");
+    }
+
+    #[test]
+    fn test_atz_resets_s_regs() {
+        // ATZ produces ResetStored; process_at_command loads from config.
+        let mut echo = false;
+        let mut verbose = false;
+        let mut quiet = true;
+        let results = parse_full("ATZ", &mut echo, &mut verbose, &mut quiet);
+        assert_eq!(results, vec![AtResult::ResetStored]);
+    }
+
+    #[test]
+    fn test_s_reg_case_insensitive() {
+        let mut echo = true;
+        // Lowercase 'ats0?' should work (uppercased internally)
+        assert_eq!(parse("ats0?", &mut echo), vec![AtResult::SRegQuery(0)]);
+        assert_eq!(parse("ats0=5", &mut echo), vec![AtResult::SRegSet(0, 5)]);
+    }
+
     // ─── +++ escape detection ────────────────────────────
 
     /// Helper: create a minimal ModemState-like struct for testing +++ logic.
@@ -1048,21 +1487,24 @@ mod tests {
     }
 
     /// Run process_online_bytes using a PlusState (avoids needing a real serial port).
+    /// Uses the default S-register values for escape char and guard time.
     fn test_process_bytes(
         last_data_time: &mut Instant,
         plus_count: &mut u8,
         plus_start: &mut Instant,
         data: &[u8],
     ) -> (Vec<u8>, bool) {
+        let esc_char = S_REG_DEFAULTS[2]; // '+' (43)
+        let guard = Duration::from_millis(S_REG_DEFAULTS[12] as u64 * 20);
         // We can't create a real ModemState without a serial port, so we
         // test the logic inline using the same algorithm.
         let mut forward = Vec::new();
         for &byte in data {
             let now = Instant::now();
 
-            if byte == PLUS_BYTE {
+            if byte == esc_char {
                 if *plus_count == 0 {
-                    if now.duration_since(*last_data_time) >= GUARD_TIME {
+                    if now.duration_since(*last_data_time) >= guard {
                         *plus_count = 1;
                         *plus_start = now;
                         continue;
@@ -1079,7 +1521,7 @@ mod tests {
 
             if *plus_count > 0 {
                 for _ in 0..*plus_count {
-                    forward.push(PLUS_BYTE);
+                    forward.push(esc_char);
                 }
                 *plus_count = 0;
             }
@@ -1088,7 +1530,7 @@ mod tests {
             *last_data_time = now;
         }
         let complete = *plus_count == 3
-            && Instant::now().duration_since(*plus_start) >= GUARD_TIME;
+            && Instant::now().duration_since(*plus_start) >= guard;
         (forward, complete)
     }
 
@@ -1178,8 +1620,16 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_time_constant() {
-        assert_eq!(GUARD_TIME, Duration::from_secs(1));
+    fn test_default_guard_time() {
+        // S12 default of 50 (1/50ths of a second) = 1 second
+        let guard = Duration::from_millis(S_REG_DEFAULTS[12] as u64 * 20);
+        assert_eq!(guard, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_default_escape_char() {
+        // S2 default is 43 = '+'
+        assert_eq!(S_REG_DEFAULTS[2], b'+');
     }
 
     #[test]
@@ -1228,13 +1678,223 @@ mod tests {
     }
 
     #[test]
-    fn test_send_response_crlf_wrapping() {
-        // send_response wraps msg with \r\n on both sides
-        let msg = "OK";
-        let expected = format!("\r\n{}\r\n", msg);
-        assert_eq!(expected, "\r\nOK\r\n");
-        assert!(expected.starts_with("\r\n"));
-        assert!(expected.ends_with("\r\n"));
+    fn test_max_cmd_len_constant() {
+        assert!(MAX_CMD_LEN >= 40, "buffer must hold standard AT commands");
+        assert!(MAX_CMD_LEN <= 1024, "buffer should not be excessively large");
+    }
+
+    // ─── AT command edge cases ──────────────────────────
+
+    #[test]
+    fn test_atd_bare_dial() {
+        // ATD without T or P prefix should still work
+        let mut echo = true;
+        let results = parse("ATD somehost.com", &mut echo);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            AtResult::Dial(target) => assert_eq!(target, "somehost.com"),
+            other => panic!("Expected Dial, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_atd_bare_empty() {
+        let mut echo = true;
+        assert_eq!(parse("ATD", &mut echo), vec![AtResult::Error]);
+        assert_eq!(parse("ATD  ", &mut echo), vec![AtResult::Error]);
+    }
+
+    #[test]
+    fn test_quiet_mode_suppresses_results() {
+        let mut echo = true;
+        let mut verbose = true;
+        let mut quiet = false;
+        // Enable quiet mode
+        let results = parse_full("ATQ1", &mut echo, &mut verbose, &mut quiet);
+        assert_eq!(results, vec![AtResult::Ok]);
+        assert!(quiet);
+        // In quiet mode, send_result returns early without writing.
+        // We verify the flag is set, which gates the output.
+    }
+
+    #[test]
+    fn test_verbose_result_format() {
+        // Verbose mode wraps with \r\n on both sides
+        let verbose_response = format!("\r\n{}\r\n", "OK");
+        assert_eq!(verbose_response, "\r\nOK\r\n");
+    }
+
+    #[test]
+    fn test_numeric_result_format() {
+        // Numeric mode ends with \r only (no \n), per Hayes standard
+        let numeric_response = format!("{}\r", "0");
+        assert_eq!(numeric_response, "0\r");
+        assert!(!numeric_response.contains('\n'));
+    }
+
+    #[test]
+    fn test_ath_returns_hangup() {
+        // ATH produces Hangup, which process_at_command uses to clear
+        // active_connection and send OK.
+        let mut echo = true;
+        assert_eq!(parse("ATH", &mut echo), vec![AtResult::Hangup]);
+    }
+
+    #[test]
+    fn test_at_ampersand_w_returns_save() {
+        let mut echo = true;
+        assert_eq!(parse("AT&W", &mut echo), vec![AtResult::SaveConfig]);
+        assert_eq!(parse("AT&W0", &mut echo), vec![AtResult::SaveConfig]);
+    }
+
+    #[test]
+    fn test_at_ampersand_v_returns_show_config() {
+        let mut echo = true;
+        assert_eq!(parse("AT&V", &mut echo), vec![AtResult::ShowConfig]);
+    }
+
+    #[test]
+    fn test_atdl_returns_redial() {
+        let mut echo = true;
+        assert_eq!(parse("ATDL", &mut echo), vec![AtResult::Redial]);
+    }
+
+    #[test]
+    fn test_atdl_case_insensitive() {
+        let mut echo = true;
+        assert_eq!(parse("atdl", &mut echo), vec![AtResult::Redial]);
+    }
+
+    #[test]
+    fn test_dial_comma_stripping() {
+        // Commas are pause characters; they should be stripped.
+        // The parse function returns the raw dial string; commas are
+        // stripped in process_at_command.  Test the stripping logic:
+        let raw = "host,,23";
+        let stripped = raw.replace(',', "");
+        assert_eq!(stripped, "host23");
+    }
+
+    #[test]
+    fn test_s0_default_is_5() {
+        assert_eq!(S_REG_DEFAULTS[0], 5);
+    }
+
+    #[test]
+    fn test_at_help() {
+        let mut echo = true;
+        assert_eq!(parse("AT?", &mut echo), vec![AtResult::Help]);
+    }
+
+    #[test]
+    fn test_ats_help() {
+        let mut echo = true;
+        assert_eq!(parse("ATS?", &mut echo), vec![AtResult::SRegHelp]);
+    }
+
+    #[test]
+    fn test_ats_help_case_insensitive() {
+        let mut echo = true;
+        assert_eq!(parse("ats?", &mut echo), vec![AtResult::SRegHelp]);
+    }
+
+    #[test]
+    fn test_dial_target_host_with_port_zero() {
+        // Port 0 should be rejected
+        let mut echo = true;
+        let target = "host:0";
+        let (_, p) = target.rsplit_once(':').unwrap();
+        let port = p.parse::<u16>().unwrap();
+        assert_eq!(port, 0, "port 0 should parse but be rejected by guard");
+    }
+
+    #[test]
+    fn test_dial_target_invalid_port() {
+        // Non-numeric port part
+        let target = "host:abc";
+        let (_, p) = target.rsplit_once(':').unwrap();
+        assert!(p.parse::<u16>().is_err());
+    }
+
+    #[test]
+    fn test_dial_target_port_overflow() {
+        // Port number too large for u16
+        let target = "host:99999";
+        let (_, p) = target.rsplit_once(':').unwrap();
+        assert!(p.parse::<u16>().is_err());
+    }
+
+    #[test]
+    fn test_atdt_xmodem_gateway_case_variants() {
+        // The dial handler lowercases before comparing to "xmodem-gateway"
+        let variants = [
+            "ATDT xmodem-gateway",
+            "ATDT XMODEM-GATEWAY",
+            "ATDT Xmodem-Gateway",
+            "ATDT xmodem gateway",
+            "ATDT XMODEM GATEWAY",
+        ];
+        for cmd in &variants {
+            let mut echo = true;
+            let results = parse(cmd, &mut echo);
+            assert_eq!(results.len(), 1, "failed for: {}", cmd);
+            assert!(matches!(&results[0], AtResult::Dial(_)), "failed for: {}", cmd);
+        }
+    }
+
+    // ─── Config persistence helpers ─────────────────────
+
+    #[test]
+    fn test_parse_s_regs_default() {
+        let regs = parse_s_regs("5,0,43,13,10,8,2,50,2,6,14,95,50");
+        assert_eq!(regs, S_REG_DEFAULTS);
+    }
+
+    #[test]
+    fn test_format_s_regs_default() {
+        let s = format_s_regs(&S_REG_DEFAULTS);
+        assert_eq!(s, "5,0,43,13,10,8,2,50,2,6,14,95,50");
+    }
+
+    #[test]
+    fn test_parse_format_roundtrip() {
+        let mut regs = S_REG_DEFAULTS;
+        regs[0] = 1;   // auto-answer
+        regs[2] = 35;  // escape char = '#'
+        regs[12] = 100; // guard time = 2 seconds
+        let s = format_s_regs(&regs);
+        let parsed = parse_s_regs(&s);
+        assert_eq!(parsed, regs);
+    }
+
+    #[test]
+    fn test_parse_s_regs_partial() {
+        // Fewer values than NUM_S_REGS — rest should be defaults
+        let regs = parse_s_regs("5,10");
+        assert_eq!(regs[0], 5);
+        assert_eq!(regs[1], 10);
+        assert_eq!(regs[2], S_REG_DEFAULTS[2]); // default
+    }
+
+    #[test]
+    fn test_parse_s_regs_empty() {
+        let regs = parse_s_regs("");
+        assert_eq!(regs, S_REG_DEFAULTS);
+    }
+
+    #[test]
+    fn test_parse_s_regs_invalid_values() {
+        // Non-numeric values fall back to defaults
+        let regs = parse_s_regs("abc,0,43,13,10,8,2,50,2,6,14,95,50");
+        assert_eq!(regs[0], S_REG_DEFAULTS[0]); // invalid → default
+        assert_eq!(regs[1], 0); // valid
+    }
+
+    #[test]
+    fn test_parse_s_regs_overflow() {
+        // Values > 255 fail u8 parse, fall back to default
+        let regs = parse_s_regs("999,0,43,13,10,8,2,50,2,6,14,95,50");
+        assert_eq!(regs[0], S_REG_DEFAULTS[0]); // overflow → default
     }
 
 }

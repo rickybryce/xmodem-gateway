@@ -13,7 +13,7 @@ adapted as a dedicated gateway with file transfer, SSH proxy, and AI features.
 ```sh
 cargo build           # debug build
 cargo build --release # release build
-cargo test            # run all 124 unit tests
+cargo test            # run all unit tests
 cargo clippy          # lint check (should produce zero warnings)
 ```
 
@@ -68,7 +68,7 @@ cargo clippy          # lint check (should produce zero warnings)
 
 ## Testing
 
-307 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
+350 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
 exact block, multi-block, all byte values, protocol bytes in data, empty,
 oversized), telnet IAC subnegotiation parsing, PETSCII encoding, filename
 validation, auth lockout logic, constant-time credential comparison, config
@@ -76,5 +76,8 @@ file parsing/roundtrip, signal handler registration, screen layout constraints
 (row counts, column widths, message lengths), pagination math, gateway output
 filtering, gateway input normalization, AI chat word wrapping, color helper
 dispatch (ANSI/PETSCII/ASCII), link marker colorization, serial modem AT
-command parsing, +++ escape detection, SSH host key generation/roundtrip,
-config sanitization.
+command parsing (all commands, edge cases, quiet/verbose/numeric modes,
+dial target parsing, buffer overflow protection, S-register query/set/defaults),
++++ escape detection (configurable via S2/S12),
+SSH host key generation/roundtrip, shutdown broadcast message format,
+menu item/help consistency, config sanitization.

@@ -372,24 +372,35 @@ Or edit `xmodem.conf` directly and restart the server.
 | Command | Action |
 |---------|--------|
 | `AT`    | OK (attention) |
-| `ATZ`   | Reset modem (echo on, verbose on, quiet off) |
-| `AT&F`  | Factory defaults (same as ATZ) |
+| `AT?`   | Show AT command help |
+| `ATZ`   | Reset modem to stored settings (saved by AT&W) |
+| `AT&F`  | Reset modem to factory defaults |
+| `AT&W`  | Save current settings (echo, verbose, quiet, S-registers) to config |
+| `AT&V`  | Display current modem configuration |
 | `ATE0` / `ATE1` | Echo off / on |
 | `ATV0` / `ATV1` | Numeric / verbose result codes |
 | `ATQ0` / `ATQ1` | Result codes on / quiet mode (suppress results) |
 | `ATI`   | Show modem identification |
 | `ATH`   | Hang up (close any active connection) |
-| `ATA`   | Answer (returns NO CARRIER — no incoming calls) |
+| `ATA`   | Answer incoming ring |
 | `ATO`   | Return to online mode (resume after `+++` escape) |
+| `ATS?`  | Show S-register help |
+| `ATS`*n*`?` | Query S-register *n* (returns 3-digit value) |
+| `ATS`*n*`=`*v* | Set S-register *n* to value *v* (0–255) |
+| `ATDL`  | Redial last number |
 | `ATDT xmodem-gateway` | Connect to this gateway's menus |
-| `ATDT host:port` | Dial a remote telnet host |
-| `+++`   | Return to command mode (with 1-second guard time) |
+| `ATDT host:port` | Dial a remote telnet host (commas in dial string are stripped) |
+| `+++`   | Return to command mode (with guard time from S12) |
 
 **Result codes:** In verbose mode (default), results are text (`OK`, `CONNECT`,
 `NO CARRIER`, `ERROR`). In numeric mode (`ATV0`), results are digits (`0`, `1`,
 `3`, `4`). Quiet mode (`ATQ1`) suppresses all result codes.
 
-### Serial Safety
+**S-registers:** Standard Hayes registers S0–S12 are supported. S2 controls the
+escape character (default 43 = `+`) and S12 controls the escape guard time in
+1/50ths of a second (default 50 = 1 second). `AT&W` saves all registers to
+`xmodem.conf`; `ATZ` restores from saved values; `AT&F` resets to factory
+defaults.
 
 ### Escaping and Resuming
 
@@ -397,6 +408,16 @@ The `+++` escape sequence returns to command mode while keeping the connection
 alive. Type `ATO` to resume the connection, or `ATH` to hang up. This follows
 standard Hayes modem behavior: one second of silence, then `+++`, then another
 second of silence.
+
+### Ring Emulator
+
+Telnet and SSH users can simulate an incoming phone call to the serial device
+from the Modem Emulator menu (**I** — Ring emulator). The modem sends `RING`
+to the serial port at standard US phone cadence (every 6 seconds). After S0
+rings (default 5), the modem auto-answers and the serial device receives the
+XMODEM Gateway main menu, just as if it had dialed in with
+`ATDT xmodem-gateway`. The serial device can also answer manually with `ATA`
+during ringing.
 
 ### Serial Safety
 
