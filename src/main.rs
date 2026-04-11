@@ -71,6 +71,15 @@ fn main() {
         ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone(), session_writers);
         serial::start_serial(shutdown_rt.clone());
 
+        if cfg.launch_terminal && cfg.telnet_enabled {
+            let port = cfg.telnet_port;
+            tokio::spawn(async move {
+                // Brief delay to let the telnet listener start
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                launch_terminal(port);
+            });
+        }
+
         // Wait for shutdown signal
         loop {
             if shutdown_rt.load(Ordering::SeqCst) {
@@ -85,6 +94,54 @@ fn main() {
     });
 
     eprintln!("Server stopped.");
+}
+
+/// Launch a local ANSI terminal connected to the telnet server.
+#[allow(unused_variables)]
+fn launch_terminal(port: u16) {
+    let title = format!("Connected to telnet server on port {}", port);
+
+    #[cfg(unix)]
+    {
+        // xterm with 80x25 geometry and a CJK-capable monospace font.
+        match std::process::Command::new("xterm")
+            .arg("-T")
+            .arg(&title)
+            .arg("-geometry")
+            .arg("80x25")
+            .arg("-fa")
+            .arg("Noto Sans Mono CJK:style=Bold")
+            .arg("-fs")
+            .arg("16")
+            .arg("-e")
+            .arg("telnet")
+            .arg("127.0.0.1")
+            .arg(port.to_string())
+            .spawn()
+        {
+            Ok(_) => {}
+            Err(e) => eprintln!("Could not launch terminal: {}", e),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, set the console to 80x25 then run telnet.
+        match std::process::Command::new("cmd")
+            .arg("/c")
+            .arg(format!(
+                "start \"{}\" cmd /c \"mode con cols=80 lines=25 && telnet 127.0.0.1 {}\"",
+                title, port
+            ))
+            .spawn()
+        {
+            Ok(_) => {}
+            Err(e) => eprintln!("Could not launch terminal: {}", e),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    eprintln!("Terminal launch is not supported on this platform.");
 }
 
 /// Register handlers for SIGINT, SIGTERM, and SIGHUP using signal-hook.

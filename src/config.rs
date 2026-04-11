@@ -15,6 +15,7 @@ pub const CONFIG_FILE: &str = "xmodem.conf";
 // ─── Defaults ──────────────────────────────────────────────
 const DEFAULT_TELNET_ENABLED: bool = true;
 const DEFAULT_TELNET_PORT: u16 = 2323;
+const DEFAULT_LAUNCH_TERMINAL: bool = true;
 const DEFAULT_SECURITY_ENABLED: bool = false;
 const DEFAULT_USERNAME: &str = "admin";
 const DEFAULT_PASSWORD: &str = "changeme";
@@ -51,6 +52,8 @@ pub struct Config {
     /// Enable the telnet server. Set to false for SSH-only access.
     pub telnet_enabled: bool,
     pub telnet_port: u16,
+    /// Launch an ANSI terminal connected to the telnet port on startup.
+    pub launch_terminal: bool,
     pub security_enabled: bool,
     pub username: String,
     pub password: String,
@@ -108,6 +111,7 @@ impl Default for Config {
         Self {
             telnet_enabled: DEFAULT_TELNET_ENABLED,
             telnet_port: DEFAULT_TELNET_PORT,
+            launch_terminal: DEFAULT_LAUNCH_TERMINAL,
             security_enabled: DEFAULT_SECURITY_ENABLED,
             username: DEFAULT_USERNAME.into(),
             password: DEFAULT_PASSWORD.into(),
@@ -199,6 +203,10 @@ fn read_config_file(path: &str) -> Config {
             .get("telnet_port")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TELNET_PORT),
+        launch_terminal: map
+            .get("launch_terminal")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_LAUNCH_TERMINAL),
         security_enabled: map
             .get("security_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -343,6 +351,10 @@ telnet_enabled = {}
 # Telnet server port
 telnet_port = {}
 
+# Launch a local ANSI terminal connected to the telnet port on startup.
+# Set to false when running as a headless service.
+launch_terminal = {}
+
 # Security: set to true to require username/password login
 security_enabled = {}
 
@@ -412,6 +424,7 @@ ssh_password = {}
 ",
         cfg.telnet_enabled,
         cfg.telnet_port,
+        cfg.launch_terminal,
         cfg.security_enabled,
         sanitize_value(&cfg.username),
         sanitize_value(&cfg.password),
@@ -477,6 +490,13 @@ pub fn update_config_values(pairs: &[(&str, &str)]) {
 /// Apply a single key-value pair to a Config struct.
 fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
     match key {
+        "telnet_enabled" => cfg.telnet_enabled = value.eq_ignore_ascii_case("true"),
+        "telnet_port" => {
+            if let Ok(v) = value.parse() {
+                cfg.telnet_port = v;
+            }
+        }
+        "launch_terminal" => cfg.launch_terminal = value.eq_ignore_ascii_case("true"),
         "weather_zip" => cfg.weather_zip = value.to_string(),
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
         "serial_port" => cfg.serial_port = value.to_string(),
@@ -635,6 +655,7 @@ mod tests {
     fn test_default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.telnet_port, 2323);
+        assert!(cfg.launch_terminal);
         assert!(!cfg.security_enabled);
         assert_eq!(cfg.username, "admin");
         assert_eq!(cfg.password, "changeme");
@@ -733,6 +754,7 @@ mod tests {
         let original = Config {
             telnet_enabled: false,
             telnet_port: 1234,
+            launch_terminal: true,
             security_enabled: true,
             username: "bob".into(),
             password: "secret".into(),
@@ -767,6 +789,7 @@ mod tests {
 
         assert_eq!(loaded.telnet_enabled, original.telnet_enabled);
         assert_eq!(loaded.telnet_port, original.telnet_port);
+        assert_eq!(loaded.launch_terminal, original.launch_terminal);
         assert_eq!(loaded.security_enabled, original.security_enabled);
         assert_eq!(loaded.username, original.username);
         assert_eq!(loaded.password, original.password);
@@ -923,6 +946,30 @@ mod tests {
 
         apply_config_key(&mut cfg, "ssh_password", "sshpass");
         assert_eq!(cfg.ssh_password, "sshpass");
+    }
+
+    #[test]
+    fn test_apply_config_key_telnet_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "telnet_enabled", "false");
+        assert!(!cfg.telnet_enabled);
+
+        apply_config_key(&mut cfg, "telnet_enabled", "true");
+        assert!(cfg.telnet_enabled);
+
+        apply_config_key(&mut cfg, "telnet_port", "8080");
+        assert_eq!(cfg.telnet_port, 8080);
+
+        // Invalid port should be ignored
+        apply_config_key(&mut cfg, "telnet_port", "notanumber");
+        assert_eq!(cfg.telnet_port, 8080);
+
+        apply_config_key(&mut cfg, "launch_terminal", "false");
+        assert!(!cfg.launch_terminal);
+
+        apply_config_key(&mut cfg, "launch_terminal", "true");
+        assert!(cfg.launch_terminal);
     }
 
     // ─── sanitize_value ─────────────────────────────────

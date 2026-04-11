@@ -1,9 +1,9 @@
 # XMODEM Gateway
 
-A telnet-based XMODEM file transfer server, SSH gateway, text-mode web browser,
-and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI, and
-ASCII terminals. Designed for local network use with retro and modern terminal
-clients.
+A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible modem
+emulator for serial-attached retro hardware, text-mode web browser, and AI chat
+client written in Rust. Supports PETSCII (Commodore 64), ANSI, and ASCII
+terminals. Designed for local network use with retro and modern terminal clients.
 
 Author: Ricky Bryce
 Co-Author: Claude (Anthropic)
@@ -137,6 +137,7 @@ enabled), the main menu offers:
 ```
   A  AI Chat
   B  Simple Browser
+  C  Configuration
   F  File Transfer
   M  Modem Emulator
   R  Troubleshooting
@@ -156,6 +157,10 @@ telnet_enabled = true
 
 # Telnet server port
 telnet_port = 2323
+
+# Launch a local ANSI terminal connected to the telnet port on startup.
+# Set to false when running as a headless service.
+launch_terminal = true
 
 # Security: set to true to require username/password login
 security_enabled = false
