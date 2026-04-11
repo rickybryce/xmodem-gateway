@@ -68,7 +68,7 @@ cargo clippy          # lint check (should produce zero warnings)
 
 ## Testing
 
-297 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
+307 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
 exact block, multi-block, all byte values, protocol bytes in data, empty,
 oversized), telnet IAC subnegotiation parsing, PETSCII encoding, filename
 validation, auth lockout logic, constant-time credential comparison, config
