@@ -1389,13 +1389,6 @@ impl TelnetSession {
             self.cyan("B")
         ))
         .await?;
-        if !self.is_serial {
-            self.send_line(&format!(
-                "  {}  Serial Monitor",
-                self.cyan("E")
-            ))
-            .await?;
-        }
         self.send_line(&format!(
             "  {}  File Transfer",
             self.cyan("F")
@@ -1441,10 +1434,6 @@ impl TelnetSession {
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
                 ];
-                if !self.is_serial {
-                    lines.push("  E  Serial Monitor: view traffic on");
-                    lines.push("     the serial port");
-                }
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
                     "     files using the XMODEM protocol",
@@ -1491,21 +1480,11 @@ impl TelnetSession {
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
-            "e" if !self.is_serial => {
-                self.monitor_serial().await?;
-            }
             "m" => {
                 self.modem_settings().await?;
             }
             "s" => {
-                if self.is_serial {
-                    crate::serial::set_serial_ssh_active(true);
-                }
-                let result = self.gateway_ssh().await;
-                if self.is_serial {
-                    crate::serial::set_serial_ssh_active(false);
-                }
-                result?;
+                self.gateway_ssh().await?;
             }
             "t" => {
                 self.gateway_telnet().await?;
@@ -1517,12 +1496,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                let msg = if self.is_serial {
-                    "Press A, B, F, M, R, S, T, W, X, or H."
-                } else {
-                    "Press A, B, E, F, M, R, S, T, W, X, or H."
-                };
-                self.show_error(msg).await?;
+                self.show_error("Press A, B, F, M, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -2885,189 +2859,6 @@ impl TelnetSession {
         self.send_line(&format!(
             "  {}",
             self.yellow("Connection closed.")
-        ))
-        .await?;
-        self.send_line("").await?;
-        self.send("  Press any key to continue.").await?;
-        self.flush().await?;
-        if idle_timeout.is_zero() {
-            self.wait_for_key().await?;
-        } else {
-            match tokio::time::timeout(idle_timeout, self.wait_for_key()).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    let _ = self
-                        .send_line("\r\nDisconnected: idle timeout.")
-                        .await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // ─── SERIAL MONITOR ─────────────────────────────────────
-
-    async fn monitor_serial(&mut self) -> Result<(), std::io::Error> {
-        let cfg = config::get_config();
-        let idle_timeout = std::time::Duration::from_secs(cfg.idle_timeout_secs);
-        let esc_label = match self.terminal_type {
-            TerminalType::Petscii => "<-",
-            _ => "ESC",
-        };
-
-        self.clear_screen().await?;
-        let sep = self.separator();
-        self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("SERIAL MONITOR")))
-            .await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-
-        // Check if serial port is enabled
-        if !cfg.serial_enabled || cfg.serial_port.is_empty() {
-            self.send_line(&format!(
-                "  {}",
-                self.red("Serial port is not enabled.")
-            ))
-            .await?;
-            self.send_line("").await?;
-            self.send_line("  Enable it in xmodem.conf or via")
-                .await?;
-            self.send_line("  the Modem Emulator menu.")
-                .await?;
-            self.send_line("").await?;
-            self.send("  Press any key to continue.").await?;
-            self.flush().await?;
-            self.wait_for_key().await?;
-            return Ok(());
-        }
-
-        // Check if serial device is in the SSH gateway
-        if crate::serial::is_serial_ssh_active() {
-            self.send_line(&format!(
-                "  {}",
-                self.red("Serial-SSH gateway is active.")
-            ))
-            .await?;
-            self.send_line("  SSH snooping is not allowed.")
-                .await?;
-            self.send_line("").await?;
-            self.send("  Press any key to continue.").await?;
-            self.flush().await?;
-            self.wait_for_key().await?;
-            return Ok(());
-        }
-
-        // Check if another monitor is already active
-        if crate::serial::is_serial_monitor_active() {
-            self.send_line(&format!(
-                "  {}",
-                self.red("Serial monitor is already in use.")
-            ))
-            .await?;
-            self.send_line("").await?;
-            self.send("  Press any key to continue.").await?;
-            self.flush().await?;
-            self.wait_for_key().await?;
-            return Ok(());
-        }
-
-        // Create duplex bridge
-        let (user_stream, serial_stream) = tokio::io::duplex(4096);
-
-        if !crate::serial::request_serial_monitor(serial_stream) {
-            self.send_line(&format!(
-                "  {}",
-                self.red("Serial monitor is not available.")
-            ))
-            .await?;
-            self.send_line("").await?;
-            self.send("  Press any key to continue.").await?;
-            self.flush().await?;
-            self.wait_for_key().await?;
-            return Ok(());
-        }
-
-        self.send_line(&format!(
-            "  Monitoring {}...",
-            self.amber(&cfg.serial_port)
-        ))
-        .await?;
-        self.flush().await?;
-
-        // Wait briefly for the serial thread to pick up the request.
-        // The serial thread polls every ~100ms (SERIAL_READ_TIMEOUT).
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        self.send_line(&format!(
-            "  {}",
-            self.green("Connected.")
-        ))
-        .await?;
-        self.send_line(&format!(
-            "  Press {} twice to disconnect.",
-            self.cyan(esc_label)
-        ))
-        .await?;
-        self.send_line("").await?;
-        self.flush().await?;
-
-        // Monitor I/O: serial tee data → user display,
-        // user keystrokes → serial port (via duplex bridge)
-        let (mut bridge_reader, mut bridge_writer) = tokio::io::split(user_stream);
-
-        let reader = &mut self.reader;
-        let writer = &self.writer;
-        let is_petscii = self.terminal_type == TerminalType::Petscii;
-
-        let mut bridge_buf = [0u8; 4096];
-        let mut last_was_esc = false;
-
-        loop {
-            tokio::select! {
-                byte = read_byte_iac_filtered(reader, true) => {
-                    match byte {
-                        Ok(Some(b)) if is_esc_key(b, is_petscii) => {
-                            if last_was_esc {
-                                break; // Two consecutive ESC presses — disconnect
-                            }
-                            last_was_esc = true;
-                        }
-                        Ok(Some(b)) => {
-                            if last_was_esc {
-                                last_was_esc = false;
-                                // Forward the previously held ESC
-                                if bridge_writer.write_all(&[0x1B]).await.is_err() { break; }
-                            }
-                            if bridge_writer.write_all(&[b]).await.is_err() { break; }
-                            if bridge_writer.flush().await.is_err() { break; }
-                        }
-                        _ => break,
-                    }
-                }
-                n = bridge_reader.read(&mut bridge_buf) => {
-                    match n {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let mut w = writer.lock().await;
-                            if w.write_all(&bridge_buf[..n]).await.is_err() { break; }
-                            if w.flush().await.is_err() { break; }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-
-        // Clean up — dropping bridge_writer closes the duplex, causing the
-        // serial thread's monitor tee to detach.
-        drop(bridge_writer);
-        drop(bridge_reader);
-
-        self.send_line("").await?;
-        self.send_line(&format!(
-            "  {}",
-            self.yellow("Monitor disconnected.")
         ))
         .await?;
         self.send_line("").await?;
@@ -6336,12 +6127,6 @@ mod tests {
             "Not found.",
             "Invalid number.",
             "Unknown command.",
-            // Serial monitor
-            "Serial port is not enabled.",
-            "Serial-SSH gateway is active.",
-            "SSH snooping is not allowed.",
-            "Serial monitor is already in use.",
-            "Serial monitor is not available.",
         ];
         for msg in &messages {
             // Error messages are displayed as "  {msg}" — 2-char indent
@@ -6363,7 +6148,6 @@ mod tests {
             // Main menu
             "  A  AI Chat",
             "  B  Simple Browser",
-            "  E  Serial Monitor",
             "  F  File Transfer",
             "  M  Modem Emulator",
             "  R  Troubleshooting",
@@ -6403,12 +6187,65 @@ mod tests {
         }
     }
 
-    /// Main menu screen: header(3) + blank + 9 items + blank + help + prompt = 15 rows.
+    /// Main menu screen: header(3) + blank + 9 items + blank + help = 15 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // Non-serial: sep, title, sep, blank, A, B, E, F, M, R, S, T, W, X, blank, H=Help = 16
-        let rows = 16;
+        // sep, title, sep, blank, A, B, F, M, R, S, T, W, X, blank, H=Help = 15
+        let rows = 15;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Main menu items must be exactly A, B, F, M, R, S, T, W, X (9 items).
+    #[test]
+    fn test_main_menu_item_count() {
+        let items = ["A", "B", "F", "M", "R", "S", "T", "W", "X"];
+        assert_eq!(items.len(), 9, "main menu should have exactly 9 items");
+    }
+
+    /// Error hint must list exactly the valid main menu keys.
+    #[test]
+    fn test_main_menu_error_hint() {
+        let hint = "Press A, B, F, M, R, S, T, W, X, or H.";
+        // Must not mention removed keys (E)
+        assert!(!hint.contains(" E,"), "error hint must not mention E");
+        assert!(!hint.contains(" E "), "error hint must not mention E");
+        // Must mention all valid keys
+        for key in ["A", "B", "F", "M", "R", "S", "T", "W", "X", "H"] {
+            assert!(hint.contains(key), "error hint must mention {}", key);
+        }
+        assert!(hint.len() <= PETSCII_WIDTH, "error hint exceeds PETSCII width");
+    }
+
+    /// Main help screen content must have exactly 14 lines (matching row count test).
+    #[test]
+    fn test_main_help_content_line_count() {
+        let lines = [
+            "  A  AI Chat: ask questions to an AI",
+            "  B  Browser: browse the web",
+            "  F  File Transfer: upload/download",
+            "     files using the XMODEM protocol",
+            "  M  Modem Emulator: configure the",
+            "     serial port for modem emulation",
+            "  R  Troubleshooting: diagnose",
+            "     terminal input issues",
+            "  S  SSH Gateway: connect to a",
+            "     remote server via SSH",
+            "  T  Telnet Gateway: connect to a",
+            "     remote server via telnet",
+            "  W  Weather: check weather by zip",
+            "  X  Exit: disconnect from server",
+        ];
+        assert_eq!(lines.len(), 14, "main help should have exactly 14 content lines");
+    }
+
+    /// Shutdown broadcast message must be valid and end with CRLF.
+    #[test]
+    fn test_shutdown_message_format() {
+        let msg = b"\r\n\r\nServer shutting down. Goodbye.\r\n";
+        assert!(msg.ends_with(b"\r\n"), "shutdown message must end with CRLF");
+        // Message must be short enough that it fits any terminal
+        let text = "Server shutting down. Goodbye.";
+        assert!(text.len() <= PETSCII_WIDTH, "shutdown message exceeds PETSCII width");
     }
 
     /// File transfer menu: header(3) + blank + dir + blank + 5 items + blank + footer = 12 rows.
@@ -6515,11 +6352,11 @@ mod tests {
     }
 
     /// Main help screen: header(3) + blank + 14 content lines +
-    /// blank + "Press any key" = 19 rows.
+    /// blank + "Press any key" = 20 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        // Non-serial: 14 base lines + 2 serial monitor lines = 16 content lines
-        let rows = 3 + 1 + 16 + 1 + 1; // 22
+        // 14 base lines
+        let rows = 3 + 1 + 14 + 1 + 1; // 20
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -6530,8 +6367,6 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  E  Serial Monitor: view traffic on",
-            "     the serial port",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
             "  M  Modem Emulator: configure the",

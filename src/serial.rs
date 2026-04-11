@@ -26,21 +26,6 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Flag to signal the serial thread to restart with new config.
 static SERIAL_RESTART: AtomicBool = AtomicBool::new(false);
 
-/// True when the serial device's TelnetSession is inside the SSH gateway.
-/// Checked by the serial monitor to prevent SSH snooping.
-static SERIAL_SSH_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// True when the modem is in online mode.
-static SERIAL_PORT_BUSY: AtomicBool = AtomicBool::new(false);
-
-/// True when a serial monitor session is active.
-static SERIAL_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Slot for a telnet/SSH session to request serial monitor access.
-/// The serial thread checks this on each tick and, when present,
-/// installs the monitor tee alongside the running modem emulator.
-static SERIAL_MONITOR_REQUEST: std::sync::Mutex<Option<tokio::io::DuplexStream>> =
-    std::sync::Mutex::new(None);
 
 // ─── Modem state ───────────────────────────────────────────
 
@@ -83,10 +68,6 @@ struct ModemState {
     baud: u32,
     /// Connection preserved after +++ escape for ATO to resume.
     active_connection: Option<ActiveConnection>,
-    /// Monitor tee: when present, all serial port I/O is copied here.
-    monitor_writer: Option<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    /// Monitor input: bytes from the monitor user to inject into the serial port.
-    monitor_reader: Option<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
 }
 
 // ─── Public API ────────────────────────────────────────────
@@ -120,36 +101,6 @@ pub fn list_serial_ports() -> Vec<String> {
         Ok(ports) => ports.into_iter().map(|p| p.port_name).collect(),
         Err(_) => Vec::new(),
     }
-}
-
-/// True when the serial device's session is inside the SSH gateway.
-pub fn is_serial_ssh_active() -> bool {
-    SERIAL_SSH_ACTIVE.load(Ordering::SeqCst)
-}
-
-/// Set the SSH-gateway-active flag (called by TelnetSession for serial sessions).
-pub fn set_serial_ssh_active(active: bool) {
-    SERIAL_SSH_ACTIVE.store(active, Ordering::SeqCst);
-}
-
-/// True when a serial monitor session is active.
-pub fn is_serial_monitor_active() -> bool {
-    SERIAL_MONITOR_ACTIVE.load(Ordering::SeqCst)
-}
-
-/// Submit a serial monitor request.  The serial thread will pick it up
-/// and install a tee alongside the running modem emulator.  Returns
-/// `false` if a request is already pending or a monitor is active.
-pub fn request_serial_monitor(stream: tokio::io::DuplexStream) -> bool {
-    if SERIAL_MONITOR_ACTIVE.load(Ordering::SeqCst) {
-        return false;
-    }
-    let mut slot = SERIAL_MONITOR_REQUEST.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_some() {
-        return false; // another session already waiting
-    }
-    *slot = Some(stream);
-    true
 }
 
 // ─── Serial manager ────────────────────────────────────────
@@ -234,19 +185,11 @@ fn serial_thread(
         shutdown,
         baud: cfg.serial_baud,
         active_connection: None,
-        monitor_writer: None,
-        monitor_reader: None,
     };
 
-    send_response(&mut state, "OK");
+    send_response(&mut state.port, "OK");
 
     while !state.shutdown.load(Ordering::SeqCst) && !SERIAL_RESTART.load(Ordering::SeqCst) {
-        // Check for a pending serial monitor request.
-        if let Some(stream) = take_monitor_request() {
-            install_monitor(&mut state, stream);
-        }
-        // Poll for monitor user input and inject to serial port.
-        poll_monitor_input(&mut state);
         match state.mode {
             ModemMode::Command => command_mode_tick(&mut state),
             ModemMode::Online => {
@@ -255,9 +198,6 @@ fn serial_thread(
                 state.mode = ModemMode::Command;
             }
         }
-    }
-    if state.monitor_writer.is_some() {
-        close_monitor(&mut state);
     }
     if SERIAL_RESTART.load(Ordering::SeqCst) {
         eprintln!("Serial modem: restarting with new config");
@@ -275,7 +215,6 @@ fn command_mode_tick(state: &mut ModemState) {
     match state.port.read(&mut buf) {
         Ok(1) => {
             let byte = buf[0];
-            tee_to_monitor(state, &buf[..1]);
             state.last_data_time = Instant::now();
             state.plus_count = 0;
 
@@ -283,7 +222,6 @@ fn command_mode_tick(state: &mut ModemState) {
                 b'\r' | b'\n' => {
                     if state.echo {
                         let _ = state.port.write_all(b"\r\n");
-                        tee_to_monitor(state, b"\r\n");
                     }
                     let cmd = std::mem::take(&mut state.cmd_buffer);
                     let cmd = cmd.trim().to_string();
@@ -296,14 +234,12 @@ fn command_mode_tick(state: &mut ModemState) {
                         state.cmd_buffer.pop();
                         if state.echo {
                             let _ = state.port.write_all(b"\x08 \x08");
-                            tee_to_monitor(state, b"\x08 \x08");
                         }
                     }
                 }
                 _ if byte >= 0x20 => {
                     if state.echo {
                         let _ = state.port.write_all(&[byte]);
-                        tee_to_monitor(state, &[byte]);
                     }
                     state.cmd_buffer.push(byte as char);
                 }
@@ -438,7 +374,7 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
             AtResult::NoCarrier => send_result(state, "NO CARRIER"),
             AtResult::Info(msg) => {
                 if !state.quiet {
-                    send_response(state, &msg);
+                    send_response(&mut state.port, &msg);
                 }
             }
             AtResult::Dial(target) => {
@@ -471,12 +407,10 @@ fn handle_return_online(state: &mut ModemState) {
     };
     send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
-    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
     match conn {
         ActiveConnection::Tcp(mut tcp) => {
             let exit = online_mode_tcp(state, &mut tcp);
             state.mode = ModemMode::Command;
-            SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
             match exit {
                 OnlineExit::Escaped => {
                     state.active_connection = Some(ActiveConnection::Tcp(tcp));
@@ -490,7 +424,6 @@ fn handle_return_online(state: &mut ModemState) {
         ActiveConnection::Duplex { mut read, mut write } => {
             let exit = online_mode_duplex(state, &mut read, &mut write);
             state.mode = ModemMode::Command;
-            SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
             match exit {
                 OnlineExit::Escaped => {
                     state.active_connection =
@@ -532,7 +465,6 @@ fn handle_dial(state: &mut ModemState, target: &str) {
 fn dial_xmodem_gateway(state: &mut ModemState) {
     send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
-    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
 
     // Create a duplex pair: one end for TelnetSession, the other for this thread.
     let (async_stream, serial_stream) = tokio::io::duplex(4096);
@@ -553,7 +485,7 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
             shutdown,
         );
         if let Err(e) = session.run().await {
-            eprintln!("Serial modem: gateway session error: {}", e);
+            eprintln!("Serial modem: session error: {}", e);
         }
         let mut w = writer_for_task.lock().await;
         let _ = w.shutdown().await;
@@ -565,7 +497,6 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
     let exit = online_mode_duplex(state, &mut duplex_read, &mut duplex_write);
 
     state.mode = ModemMode::Command;
-    SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
     match exit {
         OnlineExit::Escaped => {
             state.active_connection = Some(ActiveConnection::Duplex {
@@ -612,12 +543,10 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
 
     send_result(state, &format!("CONNECT {}", state.baud));
     state.mode = ModemMode::Online;
-    SERIAL_PORT_BUSY.store(true, Ordering::SeqCst);
 
     let exit = online_mode_tcp(state, &mut stream);
 
     state.mode = ModemMode::Command;
-    SERIAL_PORT_BUSY.store(false, Ordering::SeqCst);
     match exit {
         OnlineExit::Escaped => {
             state.active_connection = Some(ActiveConnection::Tcp(stream));
@@ -654,13 +583,10 @@ fn online_mode_duplex(
             return OnlineExit::Disconnected;
         }
 
-        poll_monitor_input(state);
-
         // Serial → duplex
         match state.port.read(&mut serial_buf) {
             Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
-                tee_to_monitor(state, &serial_buf[..n]);
                 let mut forward = Vec::with_capacity(n);
                 process_online_bytes(state, &serial_buf[..n], &mut forward);
                 if !forward.is_empty() {
@@ -690,7 +616,6 @@ fn online_mode_duplex(
             Ok(Ok(0)) => return OnlineExit::Disconnected,
             Ok(Ok(n)) => {
                 let _ = state.port.write_all(&duplex_buf[..n]);
-                tee_to_monitor(state, &duplex_buf[..n]);
             }
             Ok(Err(_)) => return OnlineExit::Disconnected,
             Err(_) => {} // timeout — no data from duplex
@@ -717,13 +642,10 @@ fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> Onl
             return OnlineExit::Disconnected;
         }
 
-        poll_monitor_input(state);
-
         // Serial → TCP
         match state.port.read(&mut serial_buf) {
             Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
-                tee_to_monitor(state, &serial_buf[..n]);
                 let mut forward = Vec::with_capacity(n);
                 process_online_bytes(state, &serial_buf[..n], &mut forward);
                 if !forward.is_empty() && tcp.write_all(&forward).is_err() {
@@ -739,7 +661,6 @@ fn online_mode_tcp(state: &mut ModemState, tcp: &mut std::net::TcpStream) -> Onl
             Ok(0) => return OnlineExit::Disconnected,
             Ok(n) => {
                 let _ = state.port.write_all(&tcp_buf[..n]);
-                tee_to_monitor(state, &tcp_buf[..n]);
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::TimedOut
@@ -815,84 +736,12 @@ fn check_plus_complete(state: &mut ModemState) -> bool {
     false
 }
 
-// ─── Serial monitor (tee serial I/O to telnet/SSH) ────────
-
-/// Take a pending monitor request from the global slot, if any.
-fn take_monitor_request() -> Option<tokio::io::DuplexStream> {
-    SERIAL_MONITOR_REQUEST
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-}
-
-/// Install a monitor tee alongside the running modem emulator.
-/// All subsequent serial port I/O is copied to the duplex stream.
-fn install_monitor(state: &mut ModemState, stream: tokio::io::DuplexStream) {
-    let (reader, writer) = tokio::io::split(stream);
-    state.monitor_writer = Some(writer);
-    state.monitor_reader = Some(reader);
-    SERIAL_MONITOR_ACTIVE.store(true, Ordering::SeqCst);
-    eprintln!("Serial monitor: session started");
-}
-
-/// Close the monitor tee and clean up.
-fn close_monitor(state: &mut ModemState) {
-    state.monitor_writer = None;
-    state.monitor_reader = None;
-    SERIAL_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
-    eprintln!("Serial monitor: session ended");
-}
-
-/// Copy data to the monitor stream if one is active.
-fn tee_to_monitor(state: &mut ModemState, data: &[u8]) {
-    use tokio::io::AsyncWriteExt;
-    let Some(writer) = state.monitor_writer.as_mut() else {
-        return;
-    };
-    let result = state.handle.block_on(async {
-        tokio::time::timeout(Duration::from_millis(500), async {
-            writer.write_all(data).await?;
-            writer.flush().await
-        })
-        .await
-    });
-    if result.is_err() || matches!(result, Ok(Err(_))) {
-        close_monitor(state);
-    }
-}
-
-/// Poll for monitor user input and inject it into the serial port.
-fn poll_monitor_input(state: &mut ModemState) {
-    use tokio::io::AsyncReadExt;
-    let Some(reader) = state.monitor_reader.as_mut() else {
-        return;
-    };
-    let mut buf = [0u8; 256];
-    let result = state.handle.block_on(async {
-        tokio::time::timeout(Duration::from_millis(1), reader.read(&mut buf)).await
-    });
-    match result {
-        Ok(Ok(0)) | Ok(Err(_)) => {
-            close_monitor(state);
-        }
-        Ok(Ok(n)) => {
-            // Inject monitor user's bytes into the serial port.
-            let _ = state.port.write_all(&buf[..n]);
-            let _ = state.port.flush();
-            // Tee the injected bytes so the monitor user sees their own input.
-            tee_to_monitor(state, &buf[..n]);
-        }
-        Err(_) => {} // timeout — no input
-    }
-}
-
 // ─── Helpers ───────────────────────────────────────────────
 
-fn send_response(state: &mut ModemState, msg: &str) {
+fn send_response(port: &mut Box<dyn serialport::SerialPort>, msg: &str) {
     let response = format!("\r\n{}\r\n", msg);
-    let _ = state.port.write_all(response.as_bytes());
-    let _ = state.port.flush();
-    tee_to_monitor(state, response.as_bytes());
+    let _ = port.write_all(response.as_bytes());
+    let _ = port.flush();
 }
 
 /// Send a result code, respecting verbose/quiet settings.
@@ -903,8 +752,6 @@ fn send_result(state: &mut ModemState, msg: &str) {
     if state.verbose {
         let response = format!("\r\n{}\r\n", msg);
         let _ = state.port.write_all(response.as_bytes());
-        let _ = state.port.flush();
-        tee_to_monitor(state, response.as_bytes());
     } else {
         let code = match msg {
             "OK" => "0",
@@ -919,9 +766,8 @@ fn send_result(state: &mut ModemState, msg: &str) {
         };
         let response = format!("{}\r", code);
         let _ = state.port.write_all(response.as_bytes());
-        let _ = state.port.flush();
-        tee_to_monitor(state, response.as_bytes());
     }
+    let _ = state.port.flush();
 }
 
 // ─── Tests ─────────────────────────────────────────────────
@@ -1381,53 +1227,14 @@ mod tests {
         assert_eq!(TCP_CONNECT_TIMEOUT, Duration::from_secs(15));
     }
 
-    // ─── Serial gateway state ───────────────────────────
-
     #[test]
-    fn test_serial_ssh_active_flag() {
-        set_serial_ssh_active(false);
-        assert!(!is_serial_ssh_active());
-        set_serial_ssh_active(true);
-        assert!(is_serial_ssh_active());
-        set_serial_ssh_active(false);
+    fn test_send_response_crlf_wrapping() {
+        // send_response wraps msg with \r\n on both sides
+        let msg = "OK";
+        let expected = format!("\r\n{}\r\n", msg);
+        assert_eq!(expected, "\r\nOK\r\n");
+        assert!(expected.starts_with("\r\n"));
+        assert!(expected.ends_with("\r\n"));
     }
 
-    #[test]
-    fn test_monitor_request_slot() {
-        // Slot should start empty
-        SERIAL_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
-        assert!(take_monitor_request().is_none());
-
-        // Submit a request
-        let (a, b) = tokio::io::duplex(64);
-        assert!(request_serial_monitor(a));
-        drop(b); // keep the pair valid briefly
-
-        // Second request should be rejected while first is pending
-        let (c, d) = tokio::io::duplex(64);
-        assert!(!request_serial_monitor(c));
-        drop(d);
-
-        // Take the first request
-        assert!(take_monitor_request().is_some());
-
-        // Slot is now empty again
-        assert!(take_monitor_request().is_none());
-    }
-
-    #[test]
-    fn test_monitor_active_flag() {
-        SERIAL_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
-        assert!(!is_serial_monitor_active());
-        SERIAL_MONITOR_ACTIVE.store(true, Ordering::SeqCst);
-        assert!(is_serial_monitor_active());
-        SERIAL_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
-
-        // request_serial_monitor should reject when monitor is active
-        SERIAL_MONITOR_ACTIVE.store(true, Ordering::SeqCst);
-        let (a, b) = tokio::io::duplex(64);
-        assert!(!request_serial_monitor(a));
-        drop(b);
-        SERIAL_MONITOR_ACTIVE.store(false, Ordering::SeqCst);
-    }
 }
