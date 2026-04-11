@@ -117,7 +117,7 @@ enabled), the main menu offers:
 ```
   A  AI Chat
   B  Simple Browser
-  E  Serial Gateway  (telnet/SSH only)
+  E  Serial Monitor  (telnet/SSH only)
   F  File Transfer
   M  Modem Emulator
   R  Troubleshooting
@@ -274,31 +274,36 @@ transferring binary files that may contain 0xFF, enable IAC escaping with the
 must agree on whether IAC escaping is active. For text files or when your client
 handles this automatically, leave it off (the default).
 
-## Serial Gateway
+## Serial Monitor
 
-The Serial Gateway allows telnet and SSH users to interact directly with a
-device connected to the serial port. This is useful for remote access to
-equipment that has a serial console (routers, switches, embedded systems, retro
-hardware, etc.).
+The Serial Monitor allows telnet and SSH users to observe all traffic flowing
+through the serial port in real time. The modem emulator continues running
+normally -- the monitor is a passive tee that copies all serial I/O to your
+terminal. You can also type to inject characters into the serial port.
 
-1. From the main menu, press **E** (Serial Gateway)
-2. The server connects you to the configured serial port
-3. All input and output is proxied between your terminal and the serial device
+This is useful for debugging modem interactions, watching AT command
+exchanges, monitoring connections to remote hosts, or remotely observing a
+retro computer attached to the serial port.
+
+1. From the main menu, press **E** (Serial Monitor)
+2. All data to and from the serial port appears on your terminal
+3. Anything you type is sent to the serial port (and echoed back to you)
 4. Press **ESC** twice (or **<-** twice on PETSCII) to disconnect
+
+The monitor works in all modem modes -- command mode, online mode, and during
+active connections. Only one monitor session can be active at a time.
 
 ### Requirements
 
 - The serial port must be enabled and configured (via `xmodem.conf` or the
   Modem Emulator menu)
-- The modem emulator must not have an active connection (the serial port
-  cannot be shared while the modem is in online mode)
 
 ### Restrictions
 
-- **Serial users** do not see the Serial Gateway option (prevents feedback
+- **Serial users** do not see the Serial Monitor option (prevents feedback
   loops where a serial device would interact with its own port)
 - **SSH snooping blocked**: If the device on the serial port is currently
-  using the SSH Gateway feature, the Serial Gateway is disabled. This
+  using the SSH Gateway feature, the Serial Monitor is disabled. This
   prevents telnet/SSH users from observing encrypted SSH sessions in transit.
 
 ## SSH Server
