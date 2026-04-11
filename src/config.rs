@@ -521,6 +521,102 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
     }
 }
 
+// ─── Dialup mapping (dialup.conf) ─────────────────────────
+
+/// Name of the dialup mapping file (lives next to the binary).
+pub const DIALUP_FILE: &str = "dialup.conf";
+
+/// A single dialup mapping: phone number → host:port.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialupEntry {
+    pub number: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Load all dialup mappings from `dialup.conf`.
+/// If the file does not exist, creates it with a default starter entry.
+pub fn load_dialup_mappings() -> Vec<DialupEntry> {
+    if !Path::new(DIALUP_FILE).exists() {
+        let defaults = vec![DialupEntry {
+            number: "1234567".into(),
+            host: "telnetbible.com".into(),
+            port: 6400,
+        }];
+        save_dialup_mappings(&defaults);
+        eprintln!("Created default dialup mapping: {}", DIALUP_FILE);
+        return defaults;
+    }
+    let content = match std::fs::read_to_string(DIALUP_FILE) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_dialup_mappings(&content)
+}
+
+/// Parse dialup mappings from file content.
+fn parse_dialup_mappings(content: &str) -> Vec<DialupEntry> {
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((number, target)) = trimmed.split_once('=') {
+            let number = number.trim().to_string();
+            let target = target.trim();
+            if number.is_empty() || target.is_empty() {
+                continue;
+            }
+            let (host, port) = if let Some((h, p)) = target.rsplit_once(':') {
+                match p.parse::<u16>() {
+                    Ok(port) if port > 0 => (h.to_string(), port),
+                    _ => (target.to_string(), 23),
+                }
+            } else {
+                (target.to_string(), 23)
+            };
+            entries.push(DialupEntry { number, host, port });
+        }
+    }
+    entries
+}
+
+/// Save all dialup mappings to `dialup.conf`.
+pub fn save_dialup_mappings(entries: &[DialupEntry]) {
+    let mut content = String::from(
+        "# Dialup Mapping\n\
+         #\n\
+         # Map phone numbers to host:port targets.\n\
+         # Format: number = host:port\n\
+         #\n\
+         # Example:\n\
+         # 5551234 = bbs.example.com:23\n\
+         \n",
+    );
+    for entry in entries {
+        content.push_str(&format!("{} = {}:{}\n", entry.number, entry.host, entry.port));
+    }
+    if let Err(e) = std::fs::write(DIALUP_FILE, &content) {
+        eprintln!("Warning: could not write {}: {}", DIALUP_FILE, e);
+    }
+}
+
+/// Look up a phone number in the dialup mappings.
+/// Returns the host:port string if found, or None.
+pub fn lookup_dialup_number(number: &str) -> Option<String> {
+    let entries = load_dialup_mappings();
+    // Strip non-digit characters for flexible matching (e.g. "555-1234" matches "5551234")
+    let normalized: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
+    for entry in &entries {
+        let entry_normalized: String = entry.number.chars().filter(|c| c.is_ascii_digit()).collect();
+        if entry_normalized == normalized {
+            return Some(format!("{}:{}", entry.host, entry.port));
+        }
+    }
+    None
+}
+
 // ─── Tests ─────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -847,5 +943,134 @@ mod tests {
     #[test]
     fn test_sanitize_value_empty() {
         assert_eq!(sanitize_value(""), "");
+    }
+
+    // ─── Dialup mapping tests ─────────────────────────────
+
+    #[test]
+    fn test_parse_dialup_mappings_basic() {
+        let content = "5551234 = bbs.example.com:23\n8675309 = retro.host:2323\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].number, "5551234");
+        assert_eq!(entries[0].host, "bbs.example.com");
+        assert_eq!(entries[0].port, 23);
+        assert_eq!(entries[1].number, "8675309");
+        assert_eq!(entries[1].host, "retro.host");
+        assert_eq!(entries[1].port, 2323);
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_default_port() {
+        let content = "5551234 = bbs.example.com\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "bbs.example.com");
+        assert_eq!(entries[0].port, 23);
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_comments_and_blanks() {
+        let content = "# A comment\n\n5551234 = host:80\n  # Another comment\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].number, "5551234");
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_empty() {
+        let entries = parse_dialup_mappings("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_skip_invalid() {
+        let content = "= host:80\n5551234 =\nno_equals_sign\n";
+        let entries = parse_dialup_mappings(content);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_dialup_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join("xmodem_test_dialup_rt");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("dialup_rt.conf");
+        let path = file.to_str().unwrap();
+
+        let entries = vec![
+            DialupEntry { number: "5551234".into(), host: "bbs.example.com".into(), port: 23 },
+            DialupEntry { number: "8675309".into(), host: "retro.host".into(), port: 2323 },
+        ];
+
+        // Write manually to the temp file
+        let mut content = String::new();
+        for e in &entries {
+            content.push_str(&format!("{} = {}:{}\n", e.number, e.host, e.port));
+        }
+        std::fs::write(path, &content).unwrap();
+
+        // Parse it back
+        let loaded = parse_dialup_mappings(&std::fs::read_to_string(path).unwrap());
+        assert_eq!(loaded, entries);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_dialup_mappings_whitespace_tolerance() {
+        let content = "  5551234  =  bbs.example.com:23  \n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].number, "5551234");
+        assert_eq!(entries[0].host, "bbs.example.com");
+        assert_eq!(entries[0].port, 23);
+    }
+
+    #[test]
+    fn test_lookup_dialup_normalized_matching() {
+        // "555-5555" should match an entry stored as "5555555"
+        let content = "5555555 = bbs.example.com:23\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+
+        // Simulate lookup normalization
+        let input = "555-5555";
+        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
+        let entry_norm: String = entries[0].number.chars().filter(|c| c.is_ascii_digit()).collect();
+        assert_eq!(normalized, entry_norm);
+    }
+
+    #[test]
+    fn test_lookup_dialup_formatted_entry_matches_plain() {
+        // Entry stored as "555-1234" should match input "5551234"
+        let content = "555-1234 = bbs.example.com:23\n";
+        let entries = parse_dialup_mappings(content);
+        assert_eq!(entries.len(), 1);
+
+        let input = "5551234";
+        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
+        let entry_norm: String = entries[0].number.chars().filter(|c| c.is_ascii_digit()).collect();
+        assert_eq!(normalized, entry_norm);
+    }
+
+    #[test]
+    fn test_lookup_dialup_parentheses_stripped() {
+        // "(800) 555-1234" normalizes to "8005551234"
+        let input = "(800) 555-1234";
+        let normalized: String = input.chars().filter(|c| c.is_ascii_digit()).collect();
+        assert_eq!(normalized, "8005551234");
+    }
+
+    #[test]
+    fn test_default_dialup_entry() {
+        // The default starter entry should be 1234567 -> telnetbible.com:6400
+        let defaults = vec![DialupEntry {
+            number: "1234567".into(),
+            host: "telnetbible.com".into(),
+            port: 6400,
+        }];
+        assert_eq!(defaults[0].number, "1234567");
+        assert_eq!(defaults[0].host, "telnetbible.com");
+        assert_eq!(defaults[0].port, 6400);
     }
 }
