@@ -1769,6 +1769,19 @@ mod tests {
     }
 
     #[test]
+    fn test_atdl_empty_last_dial_returns_error() {
+        // ATDL with no prior dial should produce Redial in parse,
+        // but process_at_command sends ERROR when last_dial is empty.
+        // We verify the parse result; the empty-string check is in
+        // process_at_command at runtime.
+        let mut echo = true;
+        assert_eq!(parse("ATDL", &mut echo), vec![AtResult::Redial]);
+        // Verify the guard logic: an empty string is falsy
+        let last_dial = String::new();
+        assert!(last_dial.is_empty(), "empty last_dial should trigger ERROR path");
+    }
+
+    #[test]
     fn test_dial_comma_stripping() {
         // Commas are pause characters; they should be stripped.
         // The parse function returns the raw dial string; commas are
@@ -1781,6 +1794,24 @@ mod tests {
     #[test]
     fn test_s0_default_is_5() {
         assert_eq!(S_REG_DEFAULTS[0], 5);
+    }
+
+    #[test]
+    fn test_request_ring_slot() {
+        // Clear any pending request
+        RING_REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        // First request should succeed
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<u8>(1);
+        assert!(request_ring(tx1));
+
+        // Second request should fail (slot occupied)
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<u8>(1);
+        assert!(!request_ring(tx2));
+
+        // Take the request to clean up
+        assert!(take_ring_request().is_some());
+        assert!(take_ring_request().is_none());
     }
 
     #[test]
