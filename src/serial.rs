@@ -149,6 +149,16 @@ pub fn request_ring(sender: tokio::sync::mpsc::Sender<u8>) -> bool {
     true
 }
 
+/// Cancel a pending ring request.  Clears the slot so a new request can
+/// be made.  This is safe to call even if the serial thread has already
+/// taken the request (the slot will already be None).
+pub fn cancel_ring_request() {
+    RING_REQUEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+}
+
 // ─── Serial manager ────────────────────────────────────────
 
 /// Manager loop: starts/stops the serial modem when config changes.
@@ -477,9 +487,9 @@ fn process_at_command(state: &mut ModemState, cmd: &str) {
     );
     for result in results {
         match result {
-            AtResult::Ok => send_result(state, "OK"),
-            AtResult::Error => send_result(state, "ERROR"),
-            AtResult::NoCarrier => send_result(state, "NO CARRIER"),
+            AtResult::Ok => { send_result(state, "OK"); }
+            AtResult::Error => { send_result(state, "ERROR"); }
+            AtResult::NoCarrier => { send_result(state, "NO CARRIER"); }
             AtResult::Info(msg) => {
                 if !state.quiet {
                     send_response(&mut state.port, &msg);
@@ -1028,7 +1038,8 @@ fn take_ring_request() -> Option<tokio::sync::mpsc::Sender<u8>> {
 
 /// Simulate an incoming call.  Sends RING to the serial port at standard
 /// phone cadence, checks for ATA (manual answer), and auto-answers after
-/// S0 rings.  Reports progress via the sender (0 = ring, 1 = answered).
+/// S0 rings.  Reports progress via the sender (0 = ring, 1 = answered,
+/// 2 = serial port error).
 fn process_ring(state: &mut ModemState, sender: tokio::sync::mpsc::Sender<u8>) {
     state.s_regs[1] = 0; // reset ring counter
 
@@ -1042,7 +1053,10 @@ fn process_ring(state: &mut ModemState, sender: tokio::sync::mpsc::Sender<u8>) {
 
         // Send RING to serial device
         state.s_regs[1] = state.s_regs[1].saturating_add(1);
-        send_result(state, "RING");
+        if !send_result(state, "RING") {
+            let _ = sender.try_send(2); // serial port write failed
+            return;
+        }
 
         // Notify the telnet/SSH user; if they disconnected, abort.
         if sender.try_send(0).is_err() {
@@ -1121,13 +1135,13 @@ fn send_response(port: &mut Box<dyn serialport::SerialPort>, msg: &str) {
 }
 
 /// Send a result code, respecting verbose/quiet settings.
-fn send_result(state: &mut ModemState, msg: &str) {
+fn send_result(state: &mut ModemState, msg: &str) -> bool {
     if state.quiet {
-        return;
+        return true;
     }
-    if state.verbose {
+    let ok = if state.verbose {
         let response = format!("\r\n{}\r\n", msg);
-        let _ = state.port.write_all(response.as_bytes());
+        state.port.write_all(response.as_bytes()).is_ok()
     } else {
         let code = match msg {
             "OK" => "0",
@@ -1141,9 +1155,10 @@ fn send_result(state: &mut ModemState, msg: &str) {
             _ => msg,
         };
         let response = format!("{}\r", code);
-        let _ = state.port.write_all(response.as_bytes());
-    }
-    let _ = state.port.flush();
+        state.port.write_all(response.as_bytes()).is_ok()
+    };
+    let flushed = state.port.flush().is_ok();
+    ok && flushed
 }
 
 // ─── Tests ─────────────────────────────────────────────────
