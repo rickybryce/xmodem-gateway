@@ -21,7 +21,7 @@ const SSH_HOST_KEY_FILE: &str = "xmodem_ssh_host_key";
 // ─── Public API ────────────────────────────────────────────
 
 /// Start the SSH server if enabled in config.
-pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>) {
+pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: telnet::SessionWriters) {
     let cfg = config::get_config();
     if !cfg.ssh_enabled {
         return;
@@ -49,6 +49,7 @@ pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::s
             shutdown: shutdown.clone(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: cfg.max_sessions,
+            session_writers: session_writers.clone(),
         };
 
         let addr = format!("0.0.0.0:{}", port);
@@ -129,6 +130,7 @@ struct SshServer {
     shutdown: Arc<AtomicBool>,
     session_count: Arc<AtomicUsize>,
     max_sessions: usize,
+    session_writers: telnet::SessionWriters,
 }
 
 impl russh::server::Server for SshServer {
@@ -153,6 +155,7 @@ impl russh::server::Server for SshServer {
             ssh_password: cfg.ssh_password.clone(),
             peer_addr: peer_addr.map(|a| a.ip()),
             duplex_writer: None,
+            session_writers: self.session_writers.clone(),
         }
     }
 }
@@ -170,6 +173,7 @@ struct SshHandler {
     /// Set once a shell is opened; prevents duplicate shell requests.
     duplex_writer:
         Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>>,
+    session_writers: telnet::SessionWriters,
 }
 
 impl Drop for SshHandler {
@@ -259,6 +263,11 @@ impl russh::server::Handler for SshHandler {
 
         let shutdown = self.shutdown.clone();
         let peer_addr = self.peer_addr;
+        let session_writers = self.session_writers.clone();
+
+        // Add this SSH session's writer to the shared list so the
+        // shutdown broadcast reaches SSH clients too.
+        session_writers.lock().await.push(writer_arc.clone());
 
         // Spawn the TelnetSession on the gateway side of the duplex.
         let writer_for_task = writer_arc.clone();
@@ -274,6 +283,8 @@ impl russh::server::Handler for SshHandler {
             }
             let mut w = writer_for_task.lock().await;
             let _ = w.shutdown().await;
+            drop(w);
+            session_writers.lock().await.retain(|w| !Arc::ptr_eq(w, &writer_for_task));
         });
 
         // Spawn a reader task: reads TelnetSession output from the duplex

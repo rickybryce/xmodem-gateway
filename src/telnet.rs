@@ -481,6 +481,7 @@ struct WeatherData {
 
 // ─── SharedWriter ───────────────────────────────────────────
 pub(crate) type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>;
+pub(crate) type SessionWriters = Arc<tokio::sync::Mutex<Vec<SharedWriter>>>;
 
 // ─── TelnetSession ──────────────────────────────────────────
 
@@ -5349,7 +5350,7 @@ impl TelnetSession {
 // ─── Server startup ─────────────────────────────────────────
 
 /// Start the telnet server accept loop.
-pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>) {
+pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: SessionWriters) {
     let cfg = config::get_config();
     let port = cfg.telnet_port;
     let max_sessions = cfg.max_sessions;
@@ -5366,8 +5367,6 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
         eprintln!("Telnet server listening on port {}", port);
 
         let session_count = Arc::new(AtomicUsize::new(0));
-        let session_writers: Arc<tokio::sync::Mutex<Vec<SharedWriter>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let lockouts: LockoutMap =
             Arc::new(Mutex::new(HashMap::new()));
 

@@ -54,8 +54,10 @@ fn main() {
     let shutdown_rt = shutdown.clone();
     let notify_rt = shutdown_notify.clone();
     runtime.block_on(async move {
-        telnet::start_server(shutdown_rt.clone(), notify_rt.clone());
-        ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone());
+        let session_writers: telnet::SessionWriters =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        telnet::start_server(shutdown_rt.clone(), notify_rt.clone(), session_writers.clone());
+        ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone(), session_writers);
         serial::start_serial(shutdown_rt.clone());
 
         // Wait for shutdown signal

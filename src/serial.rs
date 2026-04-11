@@ -247,6 +247,8 @@ fn serial_thread(
     if SERIAL_RESTART.load(Ordering::SeqCst) {
         eprintln!("Serial modem: restarting with new config");
     } else {
+        let _ = state.port.write_all(b"\r\nServer shutting down. Goodbye.\r\n");
+        let _ = state.port.flush();
         eprintln!("Serial modem: shutting down");
     }
 }
