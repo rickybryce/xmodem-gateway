@@ -9,13 +9,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::logger::glog;
+
 /// Name of the configuration file (lives next to the binary).
 pub const CONFIG_FILE: &str = "xmodem.conf";
 
 // ─── Defaults ──────────────────────────────────────────────
 const DEFAULT_TELNET_ENABLED: bool = true;
 const DEFAULT_TELNET_PORT: u16 = 2323;
-const DEFAULT_LAUNCH_TERMINAL: bool = true;
+const DEFAULT_ENABLE_CONSOLE: bool = true;
 const DEFAULT_SECURITY_ENABLED: bool = false;
 const DEFAULT_USERNAME: &str = "admin";
 const DEFAULT_PASSWORD: &str = "changeme";
@@ -52,8 +54,8 @@ pub struct Config {
     /// Enable the telnet server. Set to false for SSH-only access.
     pub telnet_enabled: bool,
     pub telnet_port: u16,
-    /// Launch an ANSI terminal connected to the telnet port on startup.
-    pub launch_terminal: bool,
+    /// Show the GUI configuration/console window on startup.
+    pub enable_console: bool,
     pub security_enabled: bool,
     pub username: String,
     pub password: String,
@@ -111,7 +113,7 @@ impl Default for Config {
         Self {
             telnet_enabled: DEFAULT_TELNET_ENABLED,
             telnet_port: DEFAULT_TELNET_PORT,
-            launch_terminal: DEFAULT_LAUNCH_TERMINAL,
+            enable_console: DEFAULT_ENABLE_CONSOLE,
             security_enabled: DEFAULT_SECURITY_ENABLED,
             username: DEFAULT_USERNAME.into(),
             password: DEFAULT_PASSWORD.into(),
@@ -164,7 +166,7 @@ pub fn load_or_create_config() -> Config {
     } else {
         let cfg = Config::default();
         write_config_file(CONFIG_FILE, &cfg);
-        eprintln!("Created default configuration: {}", CONFIG_FILE);
+        glog!("Created default configuration: {}", CONFIG_FILE);
         cfg
     };
 
@@ -178,7 +180,7 @@ fn read_config_file(path: &str) -> Config {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Warning: could not read {}: {}", path, e);
+            glog!("Warning: could not read {}: {}", path, e);
             return Config::default();
         }
     };
@@ -203,10 +205,10 @@ fn read_config_file(path: &str) -> Config {
             .get("telnet_port")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TELNET_PORT),
-        launch_terminal: map
-            .get("launch_terminal")
+        enable_console: map
+            .get("enable_console")
             .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(DEFAULT_LAUNCH_TERMINAL),
+            .unwrap_or(DEFAULT_ENABLE_CONSOLE),
         security_enabled: map
             .get("security_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -336,6 +338,14 @@ fn sanitize_value(s: &str) -> String {
     s.chars().filter(|&c| c != '\n' && c != '\r').collect()
 }
 
+/// Save a full `Config` to disk and update the global singleton.
+/// Used by the GUI save button.
+pub fn save_config(cfg: &Config) {
+    write_config_file(CONFIG_FILE, cfg);
+    let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(cfg.clone());
+}
+
 /// Write the config file with comments.
 fn write_config_file(path: &str, cfg: &Config) {
     let content = format!(
@@ -351,9 +361,9 @@ telnet_enabled = {}
 # Telnet server port
 telnet_port = {}
 
-# Launch a local ANSI terminal connected to the telnet port on startup.
+# Show the GUI configuration/console window on startup.
 # Set to false when running as a headless service.
-launch_terminal = {}
+enable_console = {}
 
 # Security: set to true to require username/password login
 security_enabled = {}
@@ -424,7 +434,7 @@ ssh_password = {}
 ",
         cfg.telnet_enabled,
         cfg.telnet_port,
-        cfg.launch_terminal,
+        cfg.enable_console,
         cfg.security_enabled,
         sanitize_value(&cfg.username),
         sanitize_value(&cfg.password),
@@ -459,7 +469,7 @@ ssh_password = {}
     // writes if the process is interrupted or multiple sessions write concurrently.
     let tmp = format!("{}.tmp", path);
     if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, path)) {
-        eprintln!("Warning: could not write {}: {}", path, e);
+        glog!("Warning: could not write {}: {}", path, e);
         // Clean up the temp file if rename failed
         let _ = std::fs::remove_file(&tmp);
     }
@@ -496,7 +506,7 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
                 cfg.telnet_port = v;
             }
         }
-        "launch_terminal" => cfg.launch_terminal = value.eq_ignore_ascii_case("true"),
+        "enable_console" => cfg.enable_console = value.eq_ignore_ascii_case("true"),
         "weather_zip" => cfg.weather_zip = value.to_string(),
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
         "serial_port" => cfg.serial_port = value.to_string(),
@@ -564,7 +574,7 @@ pub fn load_dialup_mappings() -> Vec<DialupEntry> {
             port: 6400,
         }];
         save_dialup_mappings(&defaults);
-        eprintln!("Created default dialup mapping: {}", DIALUP_FILE);
+        glog!("Created default dialup mapping: {}", DIALUP_FILE);
         return defaults;
     }
     let content = match std::fs::read_to_string(DIALUP_FILE) {
@@ -618,7 +628,7 @@ pub fn save_dialup_mappings(entries: &[DialupEntry]) {
         content.push_str(&format!("{} = {}:{}\n", entry.number, entry.host, entry.port));
     }
     if let Err(e) = std::fs::write(DIALUP_FILE, &content) {
-        eprintln!("Warning: could not write {}: {}", DIALUP_FILE, e);
+        glog!("Warning: could not write {}: {}", DIALUP_FILE, e);
     }
 }
 
@@ -655,7 +665,7 @@ mod tests {
     fn test_default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.telnet_port, 2323);
-        assert!(cfg.launch_terminal);
+        assert!(cfg.enable_console);
         assert!(!cfg.security_enabled);
         assert_eq!(cfg.username, "admin");
         assert_eq!(cfg.password, "changeme");
@@ -754,7 +764,7 @@ mod tests {
         let original = Config {
             telnet_enabled: false,
             telnet_port: 1234,
-            launch_terminal: true,
+            enable_console: true,
             security_enabled: true,
             username: "bob".into(),
             password: "secret".into(),
@@ -789,7 +799,7 @@ mod tests {
 
         assert_eq!(loaded.telnet_enabled, original.telnet_enabled);
         assert_eq!(loaded.telnet_port, original.telnet_port);
-        assert_eq!(loaded.launch_terminal, original.launch_terminal);
+        assert_eq!(loaded.enable_console, original.enable_console);
         assert_eq!(loaded.security_enabled, original.security_enabled);
         assert_eq!(loaded.username, original.username);
         assert_eq!(loaded.password, original.password);
@@ -965,11 +975,11 @@ mod tests {
         apply_config_key(&mut cfg, "telnet_port", "notanumber");
         assert_eq!(cfg.telnet_port, 8080);
 
-        apply_config_key(&mut cfg, "launch_terminal", "false");
-        assert!(!cfg.launch_terminal);
+        apply_config_key(&mut cfg, "enable_console", "false");
+        assert!(!cfg.enable_console);
 
-        apply_config_key(&mut cfg, "launch_terminal", "true");
-        assert!(cfg.launch_terminal);
+        apply_config_key(&mut cfg, "enable_console", "true");
+        assert!(cfg.enable_console);
     }
 
     // ─── sanitize_value ─────────────────────────────────

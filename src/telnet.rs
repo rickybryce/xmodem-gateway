@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::config;
+use crate::logger::glog;
 
 // ─── ANSI escape codes ──────────────────────────────────────
 const ANSI_GREEN: &str = "\x1b[1;32m";
@@ -494,7 +495,7 @@ fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
     }
     content.push_str(&entry);
     if let Err(e) = atomic_write(GATEWAY_HOSTS_FILE, &content) {
-        eprintln!("Warning: could not save gateway host key: {}", e);
+        glog!("Warning: could not save gateway host key: {}", e);
     }
 }
 
@@ -1204,7 +1205,7 @@ impl TelnetSession {
         if let Some(ip) = self.peer_addr
             && is_locked_out(&self.lockouts, ip)
         {
-            eprintln!("Telnet: auth rejected for {} (locked out)", ip);
+            glog!("Telnet: auth rejected for {} (locked out)", ip);
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}",
@@ -1284,7 +1285,7 @@ impl TelnetSession {
             if let Some(ip) = self.peer_addr {
                 let count = record_auth_failure(&self.lockouts, ip);
                 if count >= MAX_AUTH_ATTEMPTS {
-                    eprintln!("Telnet: {} locked out after {} failures", ip, count);
+                    glog!("Telnet: {} locked out after {} failures", ip, count);
                     self.send_line(&format!(
                         "  {}",
                         self.red("Too many failed attempts.")
@@ -1911,7 +1912,7 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        if config::get_config().verbose { eprintln!("XMODEM upload: IAC escaping={}", self.xmodem_iac); }
+        if config::get_config().verbose { glog!("XMODEM upload: IAC escaping={}", self.xmodem_iac); }
         self.drain_input().await;
 
         let start = std::time::Instant::now();
@@ -2180,7 +2181,7 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        if config::get_config().verbose { eprintln!("XMODEM download: IAC escaping={}", self.xmodem_iac); }
+        if config::get_config().verbose { glog!("XMODEM download: IAC escaping={}", self.xmodem_iac); }
         self.drain_input().await;
 
         let start = std::time::Instant::now();
@@ -5958,11 +5959,11 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
         let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Telnet server: failed to bind port {}: {}", port, e);
+                glog!("Telnet server: failed to bind port {}: {}", port, e);
                 return;
             }
         };
-        eprintln!("Telnet server listening on port {}", port);
+        glog!("Telnet server listening on port {}", port);
 
         let session_count = Arc::new(AtomicUsize::new(0));
         let lockouts: LockoutMap =
@@ -5987,7 +5988,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                         Ok((stream, addr)) => {
                             let current = session_count.load(Ordering::SeqCst);
                             if current >= max_sessions {
-                                eprintln!("Telnet: rejected {} (max {} sessions)", addr, max_sessions);
+                                glog!("Telnet: rejected {} (max {} sessions)", addr, max_sessions);
                                 let _ = stream.try_write(b"Too many connections. Try again later.\r\n");
                                 drop(stream);
                                 continue;
@@ -5995,14 +5996,14 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                             if !security_enabled
                                 && let Some(reason) = reject_insecure_ip(addr.ip())
                             {
-                                eprintln!("Telnet: rejected {} ({})", addr, reason);
+                                glog!("Telnet: rejected {} ({})", addr, reason);
                                 let msg = format!("{}\r\n", reason);
                                 let _ = stream.try_write(msg.as_bytes());
                                 drop(stream);
                                 continue;
                             }
                             session_count.fetch_add(1, Ordering::SeqCst);
-                            eprintln!("Telnet: connection from {} ({}/{})", addr, current + 1, max_sessions);
+                            glog!("Telnet: connection from {} ({}/{})", addr, current + 1, max_sessions);
                             let sd = shutdown.clone();
                             let sc = session_count.clone();
                             let sw = session_writers.clone();
@@ -6036,7 +6037,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     is_ssh: false,
                                 };
                                 if let Err(e) = session.run().await {
-                                    eprintln!("Telnet: session error from {}: {}", addr, e);
+                                    glog!("Telnet: session error from {}: {}", addr, e);
                                 }
                                 {
                                     let mut w = writer_arc.lock().await;
@@ -6044,11 +6045,11 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                 }
                                 sw.lock().await.retain(|w| !Arc::ptr_eq(w, &writer_arc));
                                 sc.fetch_sub(1, Ordering::SeqCst);
-                                eprintln!("Telnet: {} disconnected", addr);
+                                glog!("Telnet: {} disconnected", addr);
                             });
                         }
                         Err(e) => {
-                            eprintln!("Telnet: accept error: {}", e);
+                            glog!("Telnet: accept error: {}", e);
                         }
                     }
                 }

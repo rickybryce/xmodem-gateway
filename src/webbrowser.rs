@@ -9,6 +9,8 @@ use html2text::{config, Element, Handle, RcDom};
 use std::io::Read;
 use ureq::ResponseExt;
 
+use crate::logger::glog;
+
 /// Bookmarks file, stored next to the binary.
 const BOOKMARKS_FILE: &str = "bookmarks.txt";
 /// Maximum number of bookmarks.
@@ -702,7 +704,7 @@ fn save_bookmarks(bookmarks: &[Bookmark]) -> bool {
         .collect::<Vec<_>>()
         .join("\n");
     if let Err(e) = std::fs::write(BOOKMARKS_FILE, content) {
-        eprintln!("Warning: could not save bookmarks: {}", e);
+        glog!("Warning: could not save bookmarks: {}", e);
         return false;
     }
     true

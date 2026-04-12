@@ -18,7 +18,6 @@ This should also work with the RC2014 / SC126, etc as well.
 
 
 Author: Ricky Bryce
-Co-Author: Claude (Anthropic)
 
 ## Warning
 
@@ -661,6 +660,9 @@ data loss, security breaches, or damages resulting from the use of this
 software. The user is solely responsible for securing their own network,
 credentials, and data. Telnet is an inherently insecure protocol -- do not use
 this software on untrusted networks.
+
+Portions of this project were developed with the assistance of AI tools 
+including Claude Code.
 
 ## License
 

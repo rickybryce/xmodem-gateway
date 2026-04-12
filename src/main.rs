@@ -8,6 +8,8 @@
 
 mod aichat;
 mod config;
+mod gui;
+mod logger;
 mod serial;
 mod ssh;
 mod telnet;
@@ -17,33 +19,37 @@ mod xmodem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use logger::glog;
+
 fn main() {
-    eprintln!("XMODEM Gateway v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("Author: Ricky Bryce");
-    eprintln!();
+    logger::init();
+
+    glog!("XMODEM Gateway v{}", env!("CARGO_PKG_VERSION"));
+    glog!("Author: Ricky Bryce");
+    glog!();
 
     // Load or create config
     let cfg = config::load_or_create_config();
-    eprintln!("Config: telnet={}, port={}, security={}, transfer_dir={}",
+    glog!("Config: telnet={}, port={}, security={}, transfer_dir={}",
         cfg.telnet_enabled, cfg.telnet_port, cfg.security_enabled, cfg.transfer_dir);
     if !cfg.telnet_enabled && !cfg.ssh_enabled {
-        eprintln!("WARNING: Both telnet and SSH are disabled. No network access is possible.");
-        eprintln!("         Enable at least one service in {}.", config::CONFIG_FILE);
+        glog!("WARNING: Both telnet and SSH are disabled. No network access is possible.");
+        glog!("         Enable at least one service in {}.", config::CONFIG_FILE);
     } else {
         if !cfg.telnet_enabled {
-            eprintln!("Info: Telnet server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
+            glog!("Info: Telnet server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
         }
         if !cfg.ssh_enabled {
-            eprintln!("Info: SSH server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
+            glog!("Info: SSH server is disabled. Enable it in {} if needed.", config::CONFIG_FILE);
         }
     }
     if cfg.security_enabled && cfg.password == "changeme" {
-        eprintln!("WARNING: Security is enabled with the default password. Change it in {}.", config::CONFIG_FILE);
+        glog!("WARNING: Security is enabled with the default password. Change it in {}.", config::CONFIG_FILE);
     }
 
     // Create transfer directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&cfg.transfer_dir) {
-        eprintln!("Error: could not create transfer directory '{}': {}", cfg.transfer_dir, e);
+        glog!("Error: could not create transfer directory '{}': {}", cfg.transfer_dir, e);
         std::process::exit(1);
     }
 
@@ -52,96 +58,62 @@ fn main() {
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
     // Register POSIX signal handlers (SIGINT, SIGTERM, SIGHUP)
-    let shutdown_sig = shutdown.clone();
-    let notify_sig = shutdown_notify.clone();
-    register_signal_handlers(shutdown_sig, notify_sig);
+    register_signal_handlers(shutdown.clone(), shutdown_notify.clone());
 
-    // Start tokio runtime and telnet server
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
-
+    // Start tokio runtime on a worker thread so the main thread is free for the GUI.
     let shutdown_rt = shutdown.clone();
     let notify_rt = shutdown_notify.clone();
-    runtime.block_on(async move {
-        let session_writers: telnet::SessionWriters =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        telnet::start_server(shutdown_rt.clone(), notify_rt.clone(), session_writers.clone());
-        ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone(), session_writers);
-        serial::start_serial(shutdown_rt.clone());
+    let gui_cfg = cfg.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 
-        if cfg.launch_terminal && cfg.telnet_enabled {
-            let port = cfg.telnet_port;
-            tokio::spawn(async move {
-                // Brief delay to let the telnet listener start
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                launch_terminal(port);
-            });
-        }
+        runtime.block_on(async move {
+            let session_writers: telnet::SessionWriters =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            telnet::start_server(shutdown_rt.clone(), notify_rt.clone(), session_writers.clone());
+            ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone(), session_writers);
+            serial::start_serial(shutdown_rt.clone());
 
-        // Wait for shutdown signal
-        loop {
-            if shutdown_rt.load(Ordering::SeqCst) {
-                eprintln!("\nShutdown signal received, stopping server...");
-                break;
+            // Wait for shutdown signal
+            loop {
+                if shutdown_rt.load(Ordering::SeqCst) {
+                    glog!("\nShutdown signal received, stopping server...");
+                    break;
+                }
+                notify_rt.notified().await;
             }
-            notify_rt.notified().await;
-        }
 
-        // Give sessions a moment to receive the shutdown message
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Give sessions a moment to receive the shutdown message
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        });
+
+        glog!("Server stopped.");
     });
 
-    eprintln!("Server stopped.");
-}
-
-/// Launch a local ANSI terminal connected to the telnet server.
-#[allow(unused_variables)]
-fn launch_terminal(port: u16) {
-    let title = format!("Connected to telnet server on port {}", port);
-
-    #[cfg(unix)]
-    {
-        // xterm with 80x25 geometry and a CJK-capable monospace font.
-        match std::process::Command::new("xterm")
-            .arg("-T")
-            .arg(&title)
-            .arg("-geometry")
-            .arg("80x25")
-            .arg("-fa")
-            .arg("Noto Sans Mono CJK:style=Bold")
-            .arg("-fs")
-            .arg("16")
-            .arg("-e")
-            .arg("telnet")
-            .arg("127.0.0.1")
-            .arg(port.to_string())
-            .spawn()
-        {
-            Ok(_) => {}
-            Err(e) => eprintln!("Could not launch terminal: {}", e),
-        }
+    if gui_cfg.enable_console {
+        // GUI blocks the main thread until the window is closed.
+        gui::run(gui_cfg);
+        // Window closed — fall through to headless wait so the server
+        // keeps running in the background until Ctrl-C / SIGTERM.
+        glog!("Console window closed. Server still running (Ctrl-C to stop).");
     }
 
-    #[cfg(windows)]
-    {
-        // On Windows, set the console to 80x25 then run telnet.
-        match std::process::Command::new("cmd")
-            .arg("/c")
-            .arg(format!(
-                "start \"{}\" cmd /c \"mode con cols=80 lines=25 && telnet 127.0.0.1 {}\"",
-                title, port
-            ))
-            .spawn()
-        {
-            Ok(_) => {}
-            Err(e) => eprintln!("Could not launch terminal: {}", e),
+    // Headless mode — park the main thread until shutdown signal.
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    #[cfg(not(any(unix, windows)))]
-    eprintln!("Terminal launch is not supported on this platform.");
+    // Wait for the server thread to finish.
+    shutdown.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    glog!("Server stopped.");
 }
 
 /// Register handlers for SIGINT, SIGTERM, and SIGHUP using signal-hook.

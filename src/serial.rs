@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 use crate::config;
+use crate::logger::glog;
 
 // ─── Constants ─────────────────────────────────────────────
 
@@ -217,11 +218,11 @@ fn serial_thread(
     let port = match builder.open() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Serial modem: failed to open {}: {}", cfg.serial_port, e);
+            glog!("Serial modem: failed to open {}: {}", cfg.serial_port, e);
             return;
         }
     };
-    eprintln!(
+    glog!(
         "Serial modem: opened {} at {} baud",
         cfg.serial_port, cfg.serial_baud
     );
@@ -265,11 +266,11 @@ fn serial_thread(
         }
     }
     if SERIAL_RESTART.load(Ordering::SeqCst) {
-        eprintln!("Serial modem: restarting with new config");
+        glog!("Serial modem: restarting with new config");
     } else {
         let _ = state.port.write_all(b"\r\nServer shutting down. Goodbye.\r\n");
         let _ = state.port.flush();
-        eprintln!("Serial modem: shutting down");
+        glog!("Serial modem: shutting down");
     }
 }
 
@@ -318,7 +319,7 @@ fn command_mode_tick(state: &mut ModemState) {
             if e.kind() == std::io::ErrorKind::TimedOut
                 || e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) => {
-            eprintln!("Serial modem: read error: {}", e);
+            glog!("Serial modem: read error: {}", e);
             std::thread::sleep(Duration::from_millis(500));
         }
     }
@@ -751,7 +752,7 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
             shutdown,
         );
         if let Err(e) = session.run().await {
-            eprintln!("Serial modem: session error: {}", e);
+            glog!("Serial modem: session error: {}", e);
         }
         let mut w = writer_for_task.lock().await;
         let _ = w.shutdown().await;

@@ -9,6 +9,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config;
+use crate::logger::glog;
 use crate::telnet::is_esc_key;
 
 // XMODEM protocol constants
@@ -62,7 +63,7 @@ pub(crate) async fn xmodem_receive(
     let negotiation_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(negotiation_timeout);
 
-    if verbose { eprintln!("XMODEM recv: starting negotiation (is_tcp={}, is_petscii={})", is_tcp, is_petscii); }
+    if verbose { glog!("XMODEM recv: starting negotiation (is_tcp={}, is_petscii={})", is_tcp, is_petscii); }
 
     // Negotiate mode: try CRC first ('C') for 20 attempts (60 seconds),
     // then fall back to checksum (NAK) for the remaining time.  This gives
@@ -85,7 +86,7 @@ pub(crate) async fn xmodem_receive(
         if attempt == crc_attempts {
             mode = TransferMode::Checksum;
         }
-        if verbose { eprintln!("XMODEM recv: attempt {} sending 0x{:02X} ({})",
+        if verbose { glog!("XMODEM recv: attempt {} sending 0x{:02X} ({})",
             attempt, request, if request == CRC_REQUEST { "CRC req" } else { "NAK" }); }
         raw_write_byte(writer, request, is_tcp).await?;
 
@@ -96,12 +97,12 @@ pub(crate) async fn xmodem_receive(
         .await
         {
             Ok(Ok(byte)) => {
-                if verbose { eprintln!("XMODEM recv: got 0x{:02X} during negotiation", byte); }
+                if verbose { glog!("XMODEM recv: got 0x{:02X} during negotiation", byte); }
                 if is_esc_key(byte, is_petscii) {
                     return Err("Transfer cancelled".into());
                 }
                 if byte == SOH {
-                    if verbose { eprintln!("XMODEM recv: SOH received, reading block #1"); }
+                    if verbose { glog!("XMODEM recv: SOH received, reading block #1"); }
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(BLOCK_BODY_TIMEOUT_SECS),
                         receive_block(reader, &mut expected_block, mode, is_tcp, verbose),
@@ -109,16 +110,16 @@ pub(crate) async fn xmodem_receive(
                     .await
                     {
                         Ok(Ok(data)) => {
-                            if verbose { eprintln!("XMODEM recv: block #1 OK"); }
+                            if verbose { glog!("XMODEM recv: block #1 OK"); }
                             file_data.extend_from_slice(&data);
                             raw_write_byte(writer, ACK, is_tcp).await?;
                         }
                         Ok(Err(e)) => {
-                            if verbose { eprintln!("XMODEM recv: block #1 error: {}", e); }
+                            if verbose { glog!("XMODEM recv: block #1 error: {}", e); }
                             raw_write_byte(writer, NAK, is_tcp).await?;
                         }
                         Err(_) => {
-                            if verbose { eprintln!("XMODEM recv: block #1 timeout"); }
+                            if verbose { glog!("XMODEM recv: block #1 timeout"); }
                             raw_write_byte(writer, NAK, is_tcp).await?;
                         }
                     }
@@ -131,11 +132,11 @@ pub(crate) async fn xmodem_receive(
                 if byte == CAN {
                     return Err("Transfer cancelled by sender".into());
                 }
-                if verbose { eprintln!("XMODEM recv: ignoring unexpected byte 0x{:02X}", byte); }
+                if verbose { glog!("XMODEM recv: ignoring unexpected byte 0x{:02X}", byte); }
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                if verbose { eprintln!("XMODEM recv: attempt {} timeout, retrying", attempt); }
+                if verbose { glog!("XMODEM recv: attempt {} timeout, retrying", attempt); }
             }
         }
 
@@ -217,7 +218,7 @@ async fn receive_block(
     let block_num = raw_read_byte(reader, is_tcp).await?;
     let block_complement = raw_read_byte(reader, is_tcp).await?;
 
-    if verbose { eprintln!("XMODEM recv block: num=0x{:02X} complement=0x{:02X} expected=0x{:02X} mode={}",
+    if verbose { glog!("XMODEM recv block: num=0x{:02X} complement=0x{:02X} expected=0x{:02X} mode={}",
         block_num, block_complement, *expected_block,
         match mode { TransferMode::Crc16 => "CRC16", TransferMode::Checksum => "Checksum" }); }
 
@@ -230,7 +231,7 @@ async fn receive_block(
         TransferMode::Checksum => {
             let recv_checksum = raw_read_byte(reader, is_tcp).await?;
             let calc_checksum = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-            if verbose { eprintln!("XMODEM recv block: checksum recv=0x{:02X} calc=0x{:02X}", recv_checksum, calc_checksum); }
+            if verbose { glog!("XMODEM recv block: checksum recv=0x{:02X} calc=0x{:02X}", recv_checksum, calc_checksum); }
             recv_checksum == calc_checksum
         }
         TransferMode::Crc16 => {
@@ -238,13 +239,13 @@ async fn receive_block(
             let crc_lo = raw_read_byte(reader, is_tcp).await?;
             let recv_crc = ((crc_hi as u16) << 8) | crc_lo as u16;
             let calc_crc = crc16_xmodem(&data);
-            if verbose { eprintln!("XMODEM recv block: CRC recv=0x{:04X} calc=0x{:04X}", recv_crc, calc_crc); }
+            if verbose { glog!("XMODEM recv block: CRC recv=0x{:04X} calc=0x{:04X}", recv_crc, calc_crc); }
             recv_crc == calc_crc
         }
     };
 
     if block_complement != !(block_num) {
-        if verbose { eprintln!("XMODEM recv block: FAIL complement mismatch 0x{:02X} != !0x{:02X} (0x{:02X})",
+        if verbose { glog!("XMODEM recv block: FAIL complement mismatch 0x{:02X} != !0x{:02X} (0x{:02X})",
             block_complement, block_num, !(block_num)); }
         return Err("Block complement mismatch".into());
     }
@@ -255,7 +256,7 @@ async fn receive_block(
         return Err("Duplicate block".into());
     }
     if block_num != *expected_block {
-        if verbose { eprintln!("XMODEM recv block: FAIL block number 0x{:02X} != expected 0x{:02X}", block_num, *expected_block); }
+        if verbose { glog!("XMODEM recv block: FAIL block number 0x{:02X} != expected 0x{:02X}", block_num, *expected_block); }
         return Err("Block number mismatch".into());
     }
 
@@ -283,7 +284,7 @@ pub(crate) async fn xmodem_send(
     let negotiation_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(negotiation_timeout);
 
-    if verbose { eprintln!("XMODEM send: starting negotiation (is_tcp={}, is_petscii={}, data_len={})",
+    if verbose { glog!("XMODEM send: starting negotiation (is_tcp={}, is_petscii={}, data_len={})",
         is_tcp, is_petscii, data.len()); }
 
     // Wait for receiver's mode request (C = CRC, NAK = checksum)
@@ -295,24 +296,24 @@ pub(crate) async fn xmodem_send(
 
         match tokio::time::timeout(remaining, raw_read_byte(reader, is_tcp)).await {
             Ok(Ok(byte)) => {
-                if verbose { eprintln!("XMODEM send: negotiation got 0x{:02X}", byte); }
+                if verbose { glog!("XMODEM send: negotiation got 0x{:02X}", byte); }
                 if is_esc_key(byte, is_petscii) {
                     return Err("Transfer cancelled".into());
                 }
                 match byte {
                     CRC_REQUEST => {
-                        if verbose { eprintln!("XMODEM send: receiver requests CRC mode"); }
+                        if verbose { glog!("XMODEM send: receiver requests CRC mode"); }
                         break TransferMode::Crc16;
                     }
                     NAK => {
-                        if verbose { eprintln!("XMODEM send: receiver requests Checksum mode"); }
+                        if verbose { glog!("XMODEM send: receiver requests Checksum mode"); }
                         break TransferMode::Checksum;
                     }
                     CAN => {
                         return Err("Transfer cancelled by receiver".into());
                     }
                     _ => {
-                        if verbose { eprintln!("XMODEM send: ignoring byte 0x{:02X} during negotiation", byte); }
+                        if verbose { glog!("XMODEM send: ignoring byte 0x{:02X} during negotiation", byte); }
                         continue;
                     }
                 }
@@ -334,7 +335,7 @@ pub(crate) async fn xmodem_send(
     )
     .await
     {
-        if verbose { eprintln!("XMODEM send: drained negotiation byte 0x{:02X}", b); }
+        if verbose { glog!("XMODEM send: drained negotiation byte 0x{:02X}", b); }
     }
 
     // Pad data to block boundary
@@ -348,7 +349,7 @@ pub(crate) async fn xmodem_send(
 
     let total_blocks = padded.len() / XMODEM_BLOCK_SIZE;
     let mut block_num: u8 = 1;
-    if verbose { eprintln!("XMODEM send: {} total blocks", total_blocks); }
+    if verbose { glog!("XMODEM send: {} total blocks", total_blocks); }
 
     for block_idx in 0..total_blocks {
         let block_offset = block_idx * XMODEM_BLOCK_SIZE;
@@ -381,9 +382,9 @@ pub(crate) async fn xmodem_send(
             }
 
             if block_idx == 0 && retries == 0 {
-                if verbose { eprintln!("XMODEM send: block #1 header: SOH=0x{:02X} num=0x{:02X} complement=0x{:02X} packet_len={}",
+                if verbose { glog!("XMODEM send: block #1 header: SOH=0x{:02X} num=0x{:02X} complement=0x{:02X} packet_len={}",
                     SOH, block_num, !block_num, packet.len()); }
-                if verbose { eprintln!("XMODEM send: block #1 first 8 data bytes: {:02X?}", &block[..8.min(block.len())]); }
+                if verbose { glog!("XMODEM send: block #1 first 8 data bytes: {:02X?}", &block[..8.min(block.len())]); }
             }
 
             raw_write_bytes(writer, &packet, is_tcp).await?;
@@ -397,28 +398,28 @@ pub(crate) async fn xmodem_send(
             {
                 Ok(Ok(ACK)) => {
                     if verbose && (block_idx < 3 || retries > 0) {
-                        eprintln!("XMODEM send: block #{} ACK (retries={})", block_idx + 1, retries);
+                        glog!("XMODEM send: block #{} ACK (retries={})", block_idx + 1, retries);
                     }
                     break;
                 }
                 Ok(Ok(CAN)) => {
-                    if verbose { eprintln!("XMODEM send: CAN received at block #{}", block_idx + 1); }
+                    if verbose { glog!("XMODEM send: CAN received at block #{}", block_idx + 1); }
                     return Err("Transfer cancelled by receiver".into());
                 }
                 Ok(Ok(NAK)) => {
-                    if verbose { eprintln!("XMODEM send: block #{} NAK (retry {})", block_idx + 1, retries + 1); }
+                    if verbose { glog!("XMODEM send: block #{} NAK (retry {})", block_idx + 1, retries + 1); }
                     retries += 1;
                     continue;
                 }
                 Ok(Ok(byte)) => {
-                    if verbose { eprintln!("XMODEM send: block #{} unexpected response 0x{:02X} (retry {})",
+                    if verbose { glog!("XMODEM send: block #{} unexpected response 0x{:02X} (retry {})",
                         block_idx + 1, byte, retries + 1); }
                     retries += 1;
                     continue;
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    if verbose { eprintln!("XMODEM send: block #{} timeout (retry {})", block_idx + 1, retries + 1); }
+                    if verbose { glog!("XMODEM send: block #{} timeout (retry {})", block_idx + 1, retries + 1); }
                     retries += 1;
                     continue;
                 }
@@ -440,17 +441,17 @@ pub(crate) async fn xmodem_send(
             Ok(Ok(ACK)) => return Ok(()),
             Ok(Ok(NAK)) => continue,
             Ok(Ok(b)) => {
-                if verbose { eprintln!("XMODEM send: unexpected EOT response 0x{:02X}, treating as ACK", b); }
+                if verbose { glog!("XMODEM send: unexpected EOT response 0x{:02X}, treating as ACK", b); }
                 return Ok(());
             }
             Ok(Err(e)) => {
-                if verbose { eprintln!("XMODEM send: read error during EOT: {}", e); }
+                if verbose { glog!("XMODEM send: read error during EOT: {}", e); }
                 return Err(format!("Read error during EOT: {}", e));
             }
             Err(_) => continue,
         }
     }
-    if verbose { eprintln!("XMODEM send: EOT not ACKed after {} retries, assuming success", max_retries); }
+    if verbose { glog!("XMODEM send: EOT not ACKed after {} retries, assuming success", max_retries); }
     Ok(())
 }
 

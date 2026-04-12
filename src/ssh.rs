@@ -14,6 +14,7 @@ use russh::server::Server as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config;
+use crate::logger::glog;
 use crate::telnet;
 
 const SSH_HOST_KEY_FILE: &str = "xmodem_ssh_host_key";
@@ -33,7 +34,7 @@ pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::s
         let key = match load_or_generate_host_key() {
             Ok(k) => k,
             Err(e) => {
-                eprintln!("SSH server: failed to load/generate host key: {}", e);
+                glog!("SSH server: failed to load/generate host key: {}", e);
                 return;
             }
         };
@@ -53,16 +54,16 @@ pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::s
         };
 
         let addr = format!("0.0.0.0:{}", port);
-        eprintln!("SSH server listening on port {}", port);
+        glog!("SSH server listening on port {}", port);
 
         tokio::select! {
             result = server.run_on_address(config, &*addr) => {
                 if let Err(e) = result {
-                    eprintln!("SSH server error: {}", e);
+                    glog!("SSH server error: {}", e);
                 }
             }
             _ = shutdown_notify.notified() => {
-                eprintln!("SSH server: shutting down");
+                glog!("SSH server: shutting down");
             }
         }
     });
@@ -77,11 +78,11 @@ fn load_or_generate_host_key() -> Result<russh::keys::PrivateKey, String> {
     if std::path::Path::new(SSH_HOST_KEY_FILE).exists() {
         match russh::keys::load_secret_key(SSH_HOST_KEY_FILE, None) {
             Ok(key) => {
-                eprintln!("SSH server: loaded host key from {}", SSH_HOST_KEY_FILE);
+                glog!("SSH server: loaded host key from {}", SSH_HOST_KEY_FILE);
                 return Ok(key);
             }
             Err(e) => {
-                eprintln!(
+                glog!(
                     "SSH server: could not read {}: {} (generating new key)",
                     SSH_HOST_KEY_FILE, e
                 );
@@ -101,7 +102,7 @@ fn load_or_generate_host_key() -> Result<russh::keys::PrivateKey, String> {
         .to_openssh(LineEnding::LF)
         .map_err(|e| format!("key encoding failed: {}", e))?;
     if let Err(e) = std::fs::write(SSH_HOST_KEY_FILE, pem.as_bytes()) {
-        eprintln!(
+        glog!(
             "SSH server: warning: could not save host key to {}: {}",
             SSH_HOST_KEY_FILE, e
         );
@@ -115,7 +116,7 @@ fn load_or_generate_host_key() -> Result<russh::keys::PrivateKey, String> {
                 std::fs::Permissions::from_mode(0o600),
             );
         }
-        eprintln!(
+        glog!(
             "SSH server: generated new host key, saved to {}",
             SSH_HOST_KEY_FILE
         );
@@ -140,7 +141,7 @@ impl russh::server::Server for SshServer {
         let cfg = config::get_config();
         let current = self.session_count.fetch_add(1, Ordering::SeqCst);
         if let Some(addr) = peer_addr {
-            eprintln!(
+            glog!(
                 "SSH: connection from {} ({}/{})",
                 addr,
                 current + 1,
@@ -180,7 +181,7 @@ impl Drop for SshHandler {
     fn drop(&mut self) {
         self.session_count.fetch_sub(1, Ordering::SeqCst);
         if let Some(addr) = self.peer_addr {
-            eprintln!("SSH: {} disconnected", addr);
+            glog!("SSH: {} disconnected", addr);
         }
     }
 }
@@ -279,7 +280,7 @@ impl russh::server::Handler for SshHandler {
                 peer_addr,
             );
             if let Err(e) = sess.run().await {
-                eprintln!("SSH: session error: {}", e);
+                glog!("SSH: session error: {}", e);
             }
             let mut w = writer_for_task.lock().await;
             let _ = w.shutdown().await;
