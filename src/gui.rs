@@ -14,7 +14,7 @@ use crate::logger;
 
 // ── Retro amber-on-dark color palette (telnetbible.com inspired) ──
 
-const BG_DARKEST: Color32 = Color32::from_rgb(0x0a, 0x14, 0x2e); // deep navy
+const BG_DARKEST: Color32 = Color32::from_rgb(0x05, 0x0e, 0x1a); // matches logo background
 const BG_DARK: Color32 = Color32::from_rgb(0x10, 0x1c, 0x3a);   // panel/frame bg
 const BG_MID: Color32 = Color32::from_rgb(0x18, 0x28, 0x48);    // input fields
 const BG_LIGHT: Color32 = Color32::from_rgb(0x22, 0x36, 0x5a);  // hover
@@ -26,6 +26,8 @@ const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xd4, 0xc5, 0x90);
 const TEXT_INPUT: Color32 = Color32::from_rgb(0xe8, 0xdc, 0xb0);
 const GREEN: Color32 = Color32::from_rgb(0x33, 0xff, 0x33);
 const CONSOLE_TEXT: Color32 = Color32::from_rgb(0x33, 0xcc, 0x33);
+const SCRIPTURE: Color32 = Color32::from_rgb(0xc0, 0xaa, 0x60);  // lighter amber for verse
+const CONSOLE_BG: Color32 = Color32::from_rgb(0x08, 0x12, 0x28); // deeper blue for console
 const SELECTION: Color32 = Color32::from_rgb(0x26, 0x4f, 0x78);
 
 /// Launch the GUI window.  Blocks the calling thread until the window is closed.
@@ -75,7 +77,7 @@ fn apply_theme(ctx: &egui::Context) {
 
     vis.window_fill = BG_DARKEST;
     vis.panel_fill = BG_DARKEST;
-    vis.faint_bg_color = BG_DARK;
+    vis.faint_bg_color = BG_DARKEST;
     vis.extreme_bg_color = BG_MID; // text input backgrounds
 
     // Non-interactive widgets (labels, frames)
@@ -227,6 +229,10 @@ fn labeled_password(ui: &mut egui::Ui, label: &str, buf: &mut String) {
 const CONSOLE_FONT_SIZE: f32 = 16.0;
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        BG_DARKEST.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Apply theme on first frame (after renderer is fully initialized)
         if !self.theme_applied {
@@ -257,22 +263,25 @@ impl eframe::App for App {
             .min_size(140.0)
             .default_size(240.0)
             .show_inside(ui, |ui| {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Console Output").size(16.0).strong().color(AMBER));
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in &self.console_lines {
-                            ui.label(
-                                egui::RichText::new(line)
-                                    .monospace()
-                                    .size(CONSOLE_FONT_SIZE)
-                                    .color(CONSOLE_TEXT),
-                            );
-                        }
-                    });
+                egui::Frame::NONE.fill(CONSOLE_BG).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Console Output").size(16.0).strong().color(AMBER));
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for line in &self.console_lines {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(CONSOLE_FONT_SIZE)
+                                        .color(CONSOLE_TEXT),
+                                );
+                            }
+                        });
+                });
             });
 
         // ── Config editor (remaining space) ───────────────────
@@ -396,7 +405,7 @@ impl eframe::App for App {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
-                                ui.label(egui::RichText::new("AI Chat & Browser").strong().color(AMBER));
+                                ui.label(egui::RichText::new("AI Chat, Browser, and Weather").strong().color(AMBER));
                                 ui.horizontal(|ui| {
                                     ui.label("API Key:");
                                     ui.add(egui::TextEdit::singleline(&mut self.cfg.groq_api_key).password(true));
@@ -506,7 +515,7 @@ impl eframe::App for App {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
                                 ui.label(egui::RichText::new("General").strong().color(AMBER));
-                                ui.checkbox(&mut self.cfg.verbose, "Verbose Logging");
+                                ui.checkbox(&mut self.cfg.verbose, "Verbose XMODEM Logging");
                                 ui.checkbox(&mut self.cfg.enable_console, "Show GUI on Startup");
                             });
                         },
@@ -578,11 +587,11 @@ impl eframe::App for App {
                 });
                 ui.add_space(20.0);
                 // ── Scripture (left) + Logo (right) ──────────
-                // Logo source is 432px tall; scale to 35% for the GUI.
+                // Logo source is 432px tall; scale to 42.35% for the GUI.
                 // The 1.6 aspect ratio matches the original image proportions.
-                // The +48 / -48 offset on the right column shifts the logo
-                // upward by ~½ inch without affecting the left column layout.
-                let logo_h = 432.0 * 0.35;
+                // The +84 / -84 offset on the right column shifts the logo
+                // upward without affecting the left column layout.
+                let logo_h = 432.0 * 0.4235;
                 let logo_w = logo_h * 1.6;
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
@@ -598,23 +607,23 @@ impl eframe::App for App {
                                 .italics()
                                 .strong()
                                 .size(17.0)
-                                .color(AMBER_DIM),
+                                .color(SCRIPTURE),
                             );
                             ui.label(
                                 egui::RichText::new("\u{2014} John 3:16, KJV")
                                     .italics()
                                     .strong()
                                     .size(15.0)
-                                    .color(AMBER_DIM),
+                                    .color(SCRIPTURE),
                             );
                         },
                     );
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(half, logo_h + 48.0),
+                        egui::vec2(half, logo_h + 84.0),
                         egui::Layout::top_down(egui::Align::Max),
                         |ui| {
-                            ui.add_space(-48.0);
+                            ui.add_space(-84.0);
                             ui.add(
                                 egui::Image::new(egui::include_image!("../xmodemlogo.png"))
                                     .fit_to_exact_size(egui::vec2(logo_w, logo_h)),
@@ -817,7 +826,7 @@ mod tests {
             BG_DARKEST, BG_DARK, BG_MID, BG_LIGHT, BORDER,
             AMBER, AMBER_BRIGHT, AMBER_DIM,
             TEXT_PRIMARY, TEXT_INPUT,
-            GREEN, CONSOLE_TEXT, SELECTION,
+            GREEN, CONSOLE_TEXT, SCRIPTURE, CONSOLE_BG, SELECTION,
         ];
         for (i, color) in colors.iter().enumerate() {
             assert_eq!(color.a(), 255, "Color index {} is not fully opaque", i);
@@ -875,7 +884,7 @@ mod tests {
 
     #[test]
     fn test_logo_dimensions_are_reasonable() {
-        let logo_h = 432.0_f32 * 0.35;
+        let logo_h = 432.0_f32 * 0.4235;
         let logo_w = logo_h * 1.6;
         // Logo should fit within a reasonable GUI panel
         assert!(logo_h > 50.0 && logo_h < 400.0);
