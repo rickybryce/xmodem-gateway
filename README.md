@@ -174,7 +174,6 @@ enabled), the main menu offers:
   B  Simple Browser
   C  Configuration
   F  File Transfer
-  M  Modem Emulator
   R  Troubleshooting
   S  SSH Gateway
   T  Telnet Gateway
@@ -184,7 +183,19 @@ enabled), the main menu offers:
 
 ## Configuration
 
-Edit `xmodem.conf` in the same directory as the binary. All options:
+Most settings can be changed from within a telnet or SSH session using the
+**C** (Configuration) menu, which provides submenus for:
+
+- **E** Security -- toggle login requirement, set telnet/SSH credentials
+- **M** Modem Emulator -- serial port selection and parameters
+- **S** Server Configuration -- enable/disable telnet and SSH, set ports
+- **X** XMODEM Settings -- transfer directory, timeouts, retry limit
+- **O** Other Settings -- AI API key, browser homepage, weather zip, verbose
+  logging, GUI on startup
+- **R** Reset Defaults -- restore all settings to factory defaults
+
+All settings are persisted to `xmodem.conf` automatically. You can also edit
+`xmodem.conf` by hand. All options:
 
 ```ini
 # Telnet server: set to false to disable (SSH-only mode)
@@ -267,7 +278,8 @@ ssh_password = changeme
 
 ### Setting Up Authentication
 
-To require a username and password:
+To require a username and password, either use the in-app Configuration menu
+(**C** > **E** Security) or edit `xmodem.conf` by hand:
 
 1. Open `xmodem.conf` in a text editor
 2. Set `security_enabled = true`
@@ -291,7 +303,8 @@ access to fast LLM inference. To enable it:
 
 1. Go to https://console.groq.com and create a free account
 2. Navigate to **API Keys** and generate a new key (starts with `gsk_`)
-3. Open `xmodem.conf` and set: `groq_api_key = gsk_your_key_here`
+3. Set the key via Configuration > Other Settings > **A** (Set AI API key), or
+   open `xmodem.conf` and set: `groq_api_key = gsk_your_key_here`
 4. Restart the server
 
 If no API key is configured, selecting AI Chat from the menu will display
@@ -299,7 +312,9 @@ instructions on how to obtain one.
 
 ### Setting Up the Browser Homepage
 
-The browser loads `http://telnetbible.com` by default. To change it:
+The browser loads `http://telnetbible.com` by default. To change it, use
+Configuration > Other Settings > **B** (Set browser homepage), or edit
+`xmodem.conf`:
 
 1. Open `xmodem.conf`
 2. Set `browser_homepage` to a URL, e.g.: `browser_homepage = example.com`
@@ -371,11 +386,13 @@ encryption is preferred over plaintext telnet.
 
 ### Enabling the SSH Server
 
-1. Open `xmodem.conf`
-2. Set `ssh_enabled = true`
-3. Change `ssh_username` and `ssh_password` to your desired credentials
-4. Optionally change `ssh_port` (default 2222)
-5. Restart the server
+Use Configuration > Server Configuration to toggle SSH and set the port, and
+Configuration > Security to set SSH credentials. Or edit `xmodem.conf` by hand:
+
+1. Set `ssh_enabled = true`
+2. Change `ssh_username` and `ssh_password` to your desired credentials
+3. Optionally change `ssh_port` (default 2222)
+4. Restart the server
 
 On first start with SSH enabled, the server generates an Ed25519 host key and
 saves it to `xmodem_ssh_host_key` in the working directory. This key is reused
@@ -449,11 +466,12 @@ modem commands.
 
 ### Setting Up
 
-1. From the main menu on a telnet session, press **M** (Modem Emulator)
-2. Press **E** to enable the emulator
-3. Press **S** to select a serial port (auto-detected)
-4. Configure baud rate, data bits, parity, stop bits, and flow control as needed
-5. Press **Q** to apply -- settings take effect immediately (no restart needed)
+1. From the main menu, press **C** (Configuration)
+2. Press **M** (Modem Emulator)
+3. Press **E** to enable the emulator
+4. Press **S** to select a serial port (auto-detected)
+5. Configure baud rate, data bits, parity, stop bits, and flow control as needed
+6. Press **Q** to apply -- settings take effect immediately (no restart needed)
 
 Or edit `xmodem.conf` directly and restart the server.
 
