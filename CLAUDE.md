@@ -27,6 +27,7 @@ cargo clippy          # lint check (should produce zero warnings)
 | `src/xmodem.rs` | XMODEM protocol (CRC-16 + checksum), send/receive, telnet IAC-aware raw I/O |
 | `src/aichat.rs` | Groq API client (llama-3.3-70b-versatile), word-wrap for terminal display |
 | `src/ssh.rs` | SSH server interface (russh server, Ed25519 host key, duplex bridge to TelnetSession) |
+| `src/gui.rs` | eframe/egui configuration editor, live console output, serial port detection, shutdown coordination |
 
 ## Key Design Decisions
 
@@ -68,7 +69,7 @@ cargo clippy          # lint check (should produce zero warnings)
 
 ## Testing
 
-352 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
+401 tests covering: CRC-16 computation, XMODEM round-trip transfers (small,
 exact block, multi-block, all byte values, protocol bytes in data, empty,
 oversized), telnet IAC subnegotiation parsing, PETSCII encoding, filename
 validation, auth lockout logic, constant-time credential comparison, config
@@ -80,4 +81,6 @@ command parsing (all commands, edge cases, quiet/verbose/numeric modes,
 dial target parsing, buffer overflow protection, S-register query/set/defaults),
 +++ escape detection (configurable via S2/S12),
 SSH host key generation/roundtrip, shutdown broadcast message format,
-menu item/help consistency, config sanitization.
+menu item/help consistency, config sanitization, GUI numeric field sync
+(valid/invalid/boundary/overflow), App initialization, console log buffer cap,
+local IP detection, serial port enumeration, color palette consistency.

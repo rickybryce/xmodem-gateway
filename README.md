@@ -140,6 +140,30 @@ Or, if the SSH interface is enabled, connect with any SSH client:
 ssh <ssh-user>@<server-ip> -p 2222
 ```
 
+## GUI Configuration Editor
+
+When `enable_console = true` (the default), a graphical configuration window
+opens on startup. The GUI provides:
+
+- **Live console output** -- server log messages stream in the bottom panel
+- **Configuration editing** -- all `xmodem.conf` settings can be changed and
+  saved without editing the file by hand
+- **Serial port auto-detection** -- the Serial Modem section lists detected
+  serial ports in a dropdown; click the refresh button to re-scan
+- **User Manual button** -- opens the PDF user manual on GitHub in your browser
+- **Save Configuration** -- writes changes to `xmodem.conf`
+- **Restart Server** -- saves configuration and restarts the server so all
+  changes (including security, ports, and credentials) take effect immediately
+
+The GUI window closes automatically when the server receives a shutdown signal
+(Ctrl+C, SIGTERM, SIGHUP) or when the Restart Server button is clicked (the
+GUI reopens after the restart completes). Closing the GUI window does **not**
+stop the server -- it continues running headless until a shutdown signal is
+received.
+
+To disable the GUI, set `enable_console = false` in `xmodem.conf` or uncheck
+"Show GUI on Startup" in the General section and save.
+
 ## Main Menu
 
 After connecting and completing terminal detection (and login, if security is
@@ -169,9 +193,8 @@ telnet_enabled = true
 # Telnet server port
 telnet_port = 2323
 
-# Launch a local ANSI terminal connected to the telnet port on startup.
-# Set to false when running as a headless service.
-launch_terminal = true
+# Show the GUI configuration editor on startup
+enable_console = true
 
 # Security: set to true to require username/password login
 security_enabled = false
@@ -192,8 +215,11 @@ idle_timeout_secs = 900
 # Groq API key for AI Chat (leave empty to disable)
 groq_api_key =
 
-# URL to load automatically when entering the browser (leave empty for none)
-browser_homepage =
+# URL to load automatically when entering the browser
+browser_homepage = http://telnetbible.com
+
+# US zip code for weather (saved automatically after first use)
+weather_zip =
 
 # Enable verbose XMODEM protocol logging to stderr
 verbose = false
@@ -253,7 +279,7 @@ instructions on how to obtain one.
 
 ### Setting Up the Browser Homepage
 
-To have the browser automatically load a page when opened:
+The browser loads `http://telnetbible.com` by default. To change it:
 
 1. Open `xmodem.conf`
 2. Set `browser_homepage` to a URL, e.g.: `browser_homepage = example.com`
