@@ -539,6 +539,7 @@ pub(crate) struct TelnetSession {
     reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     writer: SharedWriter,
     shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
     current_menu: Menu,
     terminal_type: TerminalType,
     erase_char: u8,
@@ -569,11 +570,13 @@ impl TelnetSession {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: SharedWriter,
         shutdown: Arc<AtomicBool>,
+        restart: Arc<AtomicBool>,
     ) -> Self {
         Self {
             reader,
             writer,
             shutdown,
+            restart,
             current_menu: Menu::Main,
             terminal_type: TerminalType::Ascii,
             erase_char: 0x7F,
@@ -601,12 +604,14 @@ impl TelnetSession {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: SharedWriter,
         shutdown: Arc<AtomicBool>,
+        restart: Arc<AtomicBool>,
         peer_addr: Option<IpAddr>,
     ) -> Self {
         Self {
             reader,
             writer,
             shutdown,
+            restart,
             current_menu: Menu::Main,
             terminal_type: TerminalType::Ansi,
             erase_char: 0x7F,
@@ -1450,11 +1455,6 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&format!(
-            "  {}  Modem Emulator",
-            self.cyan("M")
-        ))
-        .await?;
-        self.send_line(&format!(
             "  {}  Troubleshooting",
             self.cyan("R")
         ))
@@ -1488,14 +1488,12 @@ impl TelnetSession {
                 let mut lines = vec![
                     "  A  AI Chat: ask questions to an AI",
                     "  B  Browser: browse the web",
-                    "  C  Configuration: enable/disable",
-                    "     services and set port numbers",
+                    "  C  Configuration: server settings",
+                    "     and other options",
                 ];
                 lines.extend_from_slice(&[
                     "  F  File Transfer: upload/download",
                     "     files using the XMODEM protocol",
-                    "  M  Modem Emulator: configure the",
-                    "     serial port for modem emulation",
                     "  R  Troubleshooting: diagnose",
                     "     terminal input issues",
                     "  S  SSH Gateway: connect to a",
@@ -1523,9 +1521,8 @@ impl TelnetSession {
                         "1. Visit https://console.groq.com",
                         "2. Create a free account",
                         "3. Generate an API key",
-                        "4. Add to xmodem.conf:",
-                        "   groq_api_key = gsk_...",
-                        "5. Restart the server",
+                        "4. Configuration > Other Settings",
+                        "   and set the AI API key",
                     ]).await?;
                 } else {
                     self.ai_chat(&cfg.groq_api_key).await?;
@@ -1540,9 +1537,6 @@ impl TelnetSession {
             "f" => {
                 self.current_menu = Menu::FileTransfer;
             }
-            "m" => {
-                self.modem_settings().await?;
-            }
             "s" => {
                 self.gateway_ssh().await?;
             }
@@ -1556,7 +1550,7 @@ impl TelnetSession {
                 return Ok(false);
             }
             _ => {
-                self.show_error("Press A-C, F, M, R, S, T, W, X, or H.").await?;
+                self.show_error("Press A-C, F, R, S, T, W, X, or H.").await?;
             }
         }
         Ok(true)
@@ -4769,6 +4763,583 @@ impl TelnetSession {
 
     async fn configuration(&mut self) -> Result<(), std::io::Error> {
         loop {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("CONFIGURATION")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Security",
+                self.cyan("E")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Modem Emulator",
+                self.cyan("M")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Server Configuration",
+                self.cyan("S")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  XMODEM Settings",
+                self.cyan("X")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Other Settings",
+                self.cyan("O")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Reset Defaults",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "e" => {
+                    self.security_settings().await?;
+                }
+                "m" => {
+                    self.modem_settings().await?;
+                }
+                "o" => {
+                    self.other_settings().await?;
+                }
+                "s" => {
+                    self.server_configuration().await?;
+                }
+                "x" => {
+                    self.xmodem_settings().await?;
+                }
+                "r" => {
+                    self.config_reset_defaults().await?;
+                }
+                "h" => {
+                    let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+                        &[
+                            "  E  Security: require login,",
+                            "     set usernames and passwords",
+                            "  M  Modem: configure the serial",
+                            "     port for modem emulation",
+                            "  S  Server: enable/disable",
+                            "     services, set ports, and",
+                            "     restart the server",
+                            "  X  XMODEM: set transfer dir,",
+                            "     timeouts, and retry limit",
+                            "  O  Other: AI key, logging,",
+                            "     and general settings",
+                            "  R  Reset all settings to their",
+                            "     default values",
+                        ]
+                    } else {
+                        &[
+                            "  E  Security: require login, set",
+                            "     usernames and passwords",
+                            "  M  Modem: configure the serial port",
+                            "     for modem emulation",
+                            "  S  Server: enable/disable services,",
+                            "     set ports, and restart the server",
+                            "  X  XMODEM: set transfer directory,",
+                            "     timeouts, and retry limit",
+                            "  O  Other: AI key, logging, and",
+                            "     general settings",
+                            "  R  Reset all settings to their",
+                            "     default values",
+                        ]
+                    };
+                    self.show_help_page("CONFIGURATION HELP", lines).await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press E, M, O, S, X, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    // ─── OTHER SETTINGS ──────────────────────────────────────
+
+    async fn other_settings(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("OTHER SETTINGS")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            let key_display = if cfg.groq_api_key.is_empty() {
+                self.red("(not set)")
+            } else {
+                self.green("(set)")
+            };
+            self.send_line(&format!("  AI API key:  {}", key_display))
+                .await?;
+            self.send_line(&format!(
+                "  Homepage:    {}",
+                self.amber(&cfg.browser_homepage)
+            ))
+            .await?;
+            let zip_display = if cfg.weather_zip.is_empty() {
+                self.dim("(not set)")
+            } else {
+                self.amber(&cfg.weather_zip)
+            };
+            self.send_line(&format!("  Weather zip: {}", zip_display))
+                .await?;
+
+            let verbose_status = if cfg.verbose {
+                self.green("ON")
+            } else {
+                self.dim("off")
+            };
+            self.send_line(&format!("  Verbose log: {}", verbose_status))
+                .await?;
+
+            let gui_status = if cfg.enable_console {
+                self.green("ON")
+            } else {
+                self.dim("off")
+            };
+            self.send_line(&format!("  GUI startup: {}", gui_status))
+                .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Set AI API key (Groq)",
+                self.cyan("A")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set browser homepage",
+                self.cyan("B")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set weather zip code",
+                self.cyan("W")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle verbose XMODEM logging",
+                self.cyan("V")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle GUI on startup",
+                self.cyan("G")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/other"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "a" => {
+                    self.other_set_field(
+                        "AI API key",
+                        "groq_api_key",
+                        if cfg.groq_api_key.is_empty() { "(not set)" } else { "(hidden)" },
+                        true,
+                    )
+                    .await?;
+                }
+                "b" => {
+                    self.other_set_field(
+                        "Browser homepage",
+                        "browser_homepage",
+                        &cfg.browser_homepage,
+                        false,
+                    )
+                    .await?;
+                }
+                "w" => {
+                    self.other_set_field(
+                        "Weather zip code",
+                        "weather_zip",
+                        &cfg.weather_zip,
+                        false,
+                    )
+                    .await?;
+                }
+                "v" => {
+                    let new_val = if cfg.verbose { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("verbose", &v);
+                    })
+                    .await
+                    .ok();
+                }
+                "g" => {
+                    let new_val = if cfg.enable_console { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("enable_console", &v);
+                    })
+                    .await
+                    .ok();
+                    self.config_restart_notice().await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.other_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press A, B, W, V, G, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn other_set_field(
+        &mut self,
+        label: &str,
+        key: &str,
+        current_display: &str,
+        is_secret: bool,
+    ) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Current {}: {}",
+            label.to_lowercase(),
+            if is_secret {
+                self.dim(current_display)
+            } else {
+                self.amber(current_display)
+            }
+        ))
+        .await?;
+        self.send(&format!("  New {}: ", label.to_lowercase())).await?;
+        self.flush().await?;
+
+        let input = if is_secret {
+            self.get_password_input().await?
+        } else {
+            self.get_line_input().await?
+        };
+
+        let input = match input {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        let k = key.to_string();
+        let v = input;
+        let saved_label = label.to_string();
+        tokio::task::spawn_blocking(move || {
+            config::update_config_value(&k, &v);
+        })
+        .await
+        .ok();
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.green(&format!("{} updated.", saved_label))
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    async fn other_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  A  Groq API key for AI Chat",
+                "     (get one free at groq.com)",
+                "  B  Default homepage URL for",
+                "     the built-in web browser",
+                "  W  Default zip code for the",
+                "     weather feature",
+                "  V  Toggle verbose XMODEM log",
+                "  G  Toggle GUI on startup",
+                "     (requires restart)",
+                "  R  Restart the server",
+            ]
+        } else {
+            &[
+                "  A  Groq API key for AI Chat (get one",
+                "     free at console.groq.com)",
+                "  B  Default homepage URL for the",
+                "     built-in web browser",
+                "  W  Default zip code for weather",
+                "  V  Toggle verbose XMODEM logging",
+                "  G  Toggle GUI on startup (requires",
+                "     a server restart)",
+                "  R  Restart the server",
+            ]
+        };
+        self.show_help_page("OTHER SETTINGS HELP", lines).await
+    }
+
+    // ─── SECURITY SETTINGS ───────────────────────────────────
+
+    async fn security_settings(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("SECURITY")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            let login_status = if cfg.security_enabled {
+                self.green("ENABLED")
+            } else {
+                self.red("Disabled")
+            };
+            self.send_line(&format!("  Require login: {}", login_status))
+                .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  Telnet user: {}",
+                self.amber(&cfg.username)
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Telnet pass: {}",
+                self.dim("(hidden)")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  SSH user:    {}",
+                self.amber(&cfg.ssh_username)
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  SSH pass:    {}",
+                self.dim("(hidden)")
+            ))
+            .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Toggle require login",
+                self.cyan("L")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set telnet username",
+                self.cyan("U")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set telnet password",
+                self.cyan("P")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set SSH username",
+                self.cyan("S")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set SSH password",
+                self.cyan("W")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/security"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "l" => {
+                    let new_val = if cfg.security_enabled { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("security_enabled", &v);
+                    })
+                    .await
+                    .ok();
+                    self.config_restart_notice().await?;
+                }
+                "u" => {
+                    self.security_set_field("Telnet username", "username", &cfg.username, false).await?;
+                }
+                "p" => {
+                    self.security_set_field("Telnet password", "password", &cfg.password, true).await?;
+                }
+                "s" => {
+                    self.security_set_field("SSH username", "ssh_username", &cfg.ssh_username, false).await?;
+                }
+                "w" => {
+                    self.security_set_field("SSH password", "ssh_password", &cfg.ssh_password, true).await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.security_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press L, U, P, S, W, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn security_set_field(
+        &mut self,
+        label: &str,
+        key: &str,
+        current: &str,
+        is_password: bool,
+    ) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        if is_password {
+            self.send_line(&format!(
+                "  Current {}: {}",
+                label.to_lowercase(),
+                self.dim("(hidden)")
+            ))
+            .await?;
+        } else {
+            self.send_line(&format!(
+                "  Current {}: {}",
+                label.to_lowercase(),
+                self.amber(current)
+            ))
+            .await?;
+        }
+        self.send(&format!("  New {}: ", label.to_lowercase())).await?;
+        self.flush().await?;
+
+        let input = if is_password {
+            self.get_password_input().await?
+        } else {
+            self.get_line_input().await?
+        };
+
+        let input = match input {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        let k = key.to_string();
+        let v = input;
+        tokio::task::spawn_blocking(move || {
+            config::update_config_value(&k, &v);
+        })
+        .await
+        .ok();
+        self.config_restart_notice().await?;
+        Ok(())
+    }
+
+    async fn security_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure login security.",
+                "",
+                "  L  Toggle whether a login is",
+                "     required to access server",
+                "  U  Set the telnet username",
+                "  P  Set the telnet password",
+                "  S  Set the SSH username",
+                "  W  Set the SSH password",
+                "  R  Restart the server",
+                "",
+                "  Telnet and SSH have separate",
+                "  credentials. Changes require",
+                "  a server restart.",
+            ]
+        } else {
+            &[
+                "  Configure login security.",
+                "",
+                "  L  Toggle whether a login is required",
+                "  U  Set the telnet login username",
+                "  P  Set the telnet login password",
+                "  S  Set the SSH login username",
+                "  W  Set the SSH login password",
+                "  R  Restart the server",
+                "",
+                "  Telnet and SSH have separate",
+                "  credentials. Changes are saved",
+                "  immediately but require a server",
+                "  restart to take effect.",
+            ]
+        };
+        self.show_help_page("SECURITY HELP", lines).await
+    }
+
+    // ─── SERVER CONFIGURATION ───────────────────────────────
+
+    async fn server_configuration(&mut self) -> Result<(), std::io::Error> {
+        loop {
             let cfg = config::get_config();
 
             self.clear_screen().await?;
@@ -4852,6 +5423,11 @@ impl TelnetSession {
                 self.cyan("O")
             ))
             .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
             self.send_line("").await?;
             self.send_line(&format!(
                 "  {}  {}",
@@ -4860,7 +5436,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config"));
+            let prompt = format!("{}> ", self.cyan("xmodem/config/server"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -4896,12 +5472,15 @@ impl TelnetSession {
                 "o" => {
                     self.config_set_port("SSH", "ssh_port", cfg.ssh_port).await?;
                 }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
                 "h" => {
                     self.config_show_help().await?;
                 }
                 "q" => return Ok(()),
                 _ => {
-                    self.show_error("Press T, P, S, O, H, or Q.").await?;
+                    self.show_error("Press T, P, S, O, R, H, or Q.").await?;
                 }
             }
         }
@@ -4966,6 +5545,85 @@ impl TelnetSession {
         Ok(())
     }
 
+    async fn config_restart_server(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.red("WARNING: All active sessions")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}",
+            self.red("will be disconnected.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Restart the server? (Y/N) ").await?;
+        self.flush().await?;
+
+        let input = match self.get_menu_input(false).await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if input == "y" {
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}",
+                self.yellow("Restarting server...")
+            ))
+            .await?;
+            self.flush().await?;
+            self.restart.store(true, Ordering::SeqCst);
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn config_reset_defaults(&mut self) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.red("WARNING: This will reset ALL")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}",
+            self.red("settings to factory defaults.")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}",
+            self.red("The API key will be cleared.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Reset all settings? (Y/N) ").await?;
+        self.flush().await?;
+
+        let input = match self.get_menu_input(false).await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if input == "y" {
+            let defaults = config::Config::default();
+            tokio::task::spawn_blocking(move || {
+                config::save_config(&defaults);
+            })
+            .await
+            .ok();
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}",
+                self.green("All settings reset to defaults.")
+            ))
+            .await?;
+            self.config_restart_notice().await?;
+        }
+        Ok(())
+    }
+
     async fn config_show_help(&mut self) -> Result<(), std::io::Error> {
         let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
             &[
@@ -4980,6 +5638,7 @@ impl TelnetSession {
                 "  S  Enable or disable the SSH",
                 "     server listener",
                 "  O  Change the SSH port",
+                "  R  Restart the server",
                 "",
                 "  Changes are saved immediately",
                 "  but require a server restart.",
@@ -4996,6 +5655,7 @@ impl TelnetSession {
                 "  P  Change the telnet listening port",
                 "  S  Enable or disable the SSH server",
                 "  O  Change the SSH listening port",
+                "  R  Restart the server now",
                 "",
                 "  Changes are saved to the config file",
                 "  immediately but require a server restart",
@@ -5003,6 +5663,261 @@ impl TelnetSession {
             ]
         };
         self.show_help_page("SERVER CONFIGURATION HELP", lines).await
+    }
+
+    // ─── XMODEM SETTINGS ────────────────────────────────────
+
+    async fn xmodem_settings(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("XMODEM SETTINGS")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  Transfer dir:  {}",
+                self.amber(&cfg.transfer_dir)
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Negotiate:     {} s",
+                self.amber(&cfg.xmodem_negotiation_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Block timeout: {} s",
+                self.amber(&cfg.xmodem_block_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Max retries:   {}",
+                self.amber(&cfg.xmodem_max_retries.to_string())
+            ))
+            .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Change transfer directory",
+                self.cyan("D")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set negotiation timeout",
+                self.cyan("N")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set block timeout",
+                self.cyan("B")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set max retries",
+                self.cyan("M")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/xmodem"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "d" => {
+                    self.xmodem_set_dir(&cfg.transfer_dir).await?;
+                }
+                "n" => {
+                    self.xmodem_set_numeric(
+                        "Negotiation timeout",
+                        "xmodem_negotiation_timeout",
+                        cfg.xmodem_negotiation_timeout,
+                        1,
+                        300,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "b" => {
+                    self.xmodem_set_numeric(
+                        "Block timeout",
+                        "xmodem_block_timeout",
+                        cfg.xmodem_block_timeout,
+                        1,
+                        120,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "m" => {
+                    self.xmodem_set_numeric(
+                        "Max retries",
+                        "xmodem_max_retries",
+                        cfg.xmodem_max_retries as u64,
+                        1,
+                        100,
+                        "retries",
+                    )
+                    .await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.xmodem_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press D, N, B, M, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn xmodem_set_dir(&mut self, current: &str) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Current directory: {}",
+            self.amber(current)
+        ))
+        .await?;
+        self.send("  New directory: ").await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        let v = input.clone();
+        tokio::task::spawn_blocking(move || {
+            config::update_config_value("transfer_dir", &v);
+        })
+        .await
+        .ok();
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.green(&format!("Transfer dir set to: {}", input))
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    async fn xmodem_set_numeric(
+        &mut self,
+        label: &str,
+        key: &str,
+        current: u64,
+        min: u64,
+        max: u64,
+        unit: &str,
+    ) -> Result<(), std::io::Error> {
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Current {}: {}",
+            label.to_lowercase(),
+            self.amber(&current.to_string())
+        ))
+        .await?;
+        self.send(&format!("  New value ({}-{}): ", min, max)).await?;
+        self.flush().await?;
+
+        let input = match self.get_line_input().await? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        if let Ok(val) = input.parse::<u64>() {
+            if val >= min && val <= max {
+                let k = key.to_string();
+                let v = val.to_string();
+                tokio::task::spawn_blocking(move || {
+                    config::update_config_value(&k, &v);
+                })
+                .await
+                .ok();
+                self.send_line("").await?;
+                self.send_line(&format!(
+                    "  {}",
+                    self.green(&format!("{} set to {} {}.", label, val, unit))
+                ))
+                .await?;
+                self.send_line("").await?;
+                self.send("  Press any key to continue.").await?;
+                self.flush().await?;
+                self.wait_for_key().await?;
+            } else {
+                self.show_error(&format!("Value must be {}-{}.", min, max)).await?;
+            }
+        } else {
+            self.show_error("Invalid number.").await?;
+        }
+        Ok(())
+    }
+
+    async fn xmodem_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure XMODEM file transfer",
+                "  settings.",
+                "",
+                "  D  Transfer directory where",
+                "     files are stored",
+                "  N  Negotiation timeout: how",
+                "     long to wait for transfer",
+                "     to begin",
+                "  B  Block timeout: how long to",
+                "     wait for each block",
+                "  M  Max retries per block",
+                "  R  Restart the server",
+                "",
+                "  Changes take effect on the",
+                "  next file transfer.",
+            ]
+        } else {
+            &[
+                "  Configure XMODEM file transfer",
+                "  settings.",
+                "",
+                "  D  Transfer directory where files",
+                "     are stored on the server",
+                "  N  Negotiation timeout: how long to",
+                "     wait for a transfer to begin",
+                "  B  Block timeout: how long to wait",
+                "     for each data block",
+                "  M  Max retries: retry limit per block",
+                "  R  Restart the server",
+                "",
+                "  Changes take effect on the next file",
+                "  transfer (no restart required).",
+            ]
+        };
+        self.show_help_page("XMODEM SETTINGS HELP", lines).await
     }
 
     // ─── TROUBLESHOOTING ────────────────────────────────────
@@ -5946,7 +6861,7 @@ impl TelnetSession {
 // ─── Server startup ─────────────────────────────────────────
 
 /// Start the telnet server accept loop.
-pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: SessionWriters) {
+pub fn start_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: SessionWriters) {
     let cfg = config::get_config();
     if !cfg.telnet_enabled {
         return;
@@ -6005,6 +6920,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                             session_count.fetch_add(1, Ordering::SeqCst);
                             glog!("Telnet: connection from {} ({}/{})", addr, current + 1, max_sessions);
                             let sd = shutdown.clone();
+                            let rs = restart.clone();
                             let sc = session_count.clone();
                             let sw = session_writers.clone();
                             let lo = lockouts.clone();
@@ -6018,6 +6934,7 @@ pub fn start_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync:
                                     reader: Box::new(read_half),
                                     writer: writer_arc.clone(),
                                     shutdown: sd,
+                                    restart: rs,
                                     current_menu: Menu::Main,
                                     terminal_type: TerminalType::Ansi,
                                     erase_char: 0x7F,
@@ -6395,6 +7312,7 @@ mod tests {
             reader: Box::new(server),
             writer,
             shutdown: Arc::new(AtomicBool::new(false)),
+            restart: Arc::new(AtomicBool::new(false)),
             current_menu: Menu::Main,
             terminal_type,
             erase_char: 0x7F,
@@ -6891,7 +7809,7 @@ mod tests {
     fn test_all_error_messages_fit_petscii() {
         let messages = [
             "Input too long.",
-            "Press A-C, F, M, R, S, T, W, X, or H.",
+            "Press A-C, F, R, S, T, W, X, or H.",
             // Non-serial prompt includes E but is only shown to
             // ANSI/SSH users (80 cols), so it is not tested here.
             "Press U, D, X, C, I, R, Q, or H.",
@@ -6944,7 +7862,14 @@ mod tests {
             "Mapping saved.",
             "No other mappings defined.",
             // Configuration
-            "Press T, P, S, O, H, or Q.",
+            "Press E, M, O, S, X, R, H, or Q.",
+            // Other settings
+            "Press A, B, W, V, G, R, H, or Q.",
+            // Security
+            "Press L, U, P, S, W, R, H, or Q.",
+            // XMODEM settings
+            "Press D, N, B, M, R, H, or Q.",
+            "Press T, P, S, O, R, H, or Q.",
             "Invalid port number.",
         ];
         for msg in &messages {
@@ -6969,7 +7894,6 @@ mod tests {
             "  B  Simple Browser",
             "  C  Configuration",
             "  F  File Transfer",
-            "  M  Modem Emulator",
             "  R  Troubleshooting",
             "  S  SSH Gateway",
             "  T  Telnet Gateway",
@@ -6986,11 +7910,37 @@ mod tests {
             "  R  Refresh port list",
             "  N  None (clear port)",
             "  Enter #, R, N, or type a path.",
-            // Configuration menu
+            // Configuration submenu
+            "  E  Security",
+            "  M  Modem Emulator",
+            "  S  Server Configuration",
+            "  X  XMODEM Settings",
+            "  O  Other Settings",
+            "  R  Reset Defaults",
+            // Other settings menu
+            "  A  Set AI API key (Groq)",
+            "  B  Set browser homepage",
+            "  W  Set weather zip code",
+            "  V  Toggle verbose XMODEM logging",
+            "  G  Toggle GUI on startup",
+            // Security menu
+            "  L  Toggle require login",
+            "  U  Set telnet username",
+            "  P  Set telnet password",
+            "  S  Set SSH username",
+            "  W  Set SSH password",
+            // XMODEM settings menu
+            "  D  Change transfer directory",
+            "  N  Set negotiation timeout",
+            "  B  Set block timeout",
+            "  M  Set max retries",
+            "  R  Restart server",
+            // Server configuration menu
             "  T  Toggle telnet",
             "  P  Set telnet port",
             "  S  Toggle SSH",
             "  O  Set SSH port",
+            "  R  Restart server",
             // Dialup mapping menu
             "  A  Add mapping",
             "  D  Delete mapping",
@@ -7023,45 +7973,44 @@ mod tests {
     /// Main menu screen: header(3) + blank + 10 items + blank + help = 16 rows.
     #[test]
     fn test_main_menu_row_count() {
-        // sep, title, sep, blank, A, B, C, F, M, R, S, T, W, X, blank, H=Help = 16
-        let rows = 16;
+        // sep, title, sep, blank, A, B, C, F, R, S, T, W, X, blank, H=Help = 15
+        let rows = 15;
         assert!(rows <= 22, "main menu is {} rows, exceeds 22", rows);
     }
 
-    /// Main menu items must be exactly A, B, C, F, M, R, S, T, W, X (10 items).
+    /// Main menu items must be exactly A, B, C, F, R, S, T, W, X (9 items).
     #[test]
     fn test_main_menu_item_count() {
-        let items = ["A", "B", "C", "F", "M", "R", "S", "T", "W", "X"];
-        assert_eq!(items.len(), 10, "main menu should have exactly 10 items");
+        let items = ["A", "B", "C", "F", "R", "S", "T", "W", "X"];
+        assert_eq!(items.len(), 9, "main menu should have exactly 9 items");
     }
 
     /// Error hint must list exactly the valid main menu keys.
     #[test]
     fn test_main_menu_error_hint() {
-        let hint = "Press A-C, F, M, R, S, T, W, X, or H.";
-        // Must not mention removed keys (D, E)
+        let hint = "Press A-C, F, R, S, T, W, X, or H.";
+        // Must not mention removed keys (D, E, M)
         assert!(!hint.contains(" D,"), "error hint must not mention D");
         assert!(!hint.contains(" E,"), "error hint must not mention E");
         assert!(!hint.contains(" E "), "error hint must not mention E");
+        assert!(!hint.contains(" M,"), "error hint must not mention M");
         // Must mention all valid keys
-        for key in ["A", "C", "F", "M", "R", "S", "T", "W", "X", "H"] {
+        for key in ["A", "C", "F", "R", "S", "T", "W", "X", "H"] {
             assert!(hint.contains(key), "error hint must mention {}", key);
         }
         assert!(hint.len() <= PETSCII_WIDTH, "error hint exceeds PETSCII width");
     }
 
-    /// Main help screen content must have exactly 16 lines (matching row count test).
+    /// Main help screen content must have exactly 14 lines (matching row count test).
     #[test]
     fn test_main_help_content_line_count() {
         let lines = [
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  C  Configuration: enable/disable",
-            "     services and set port numbers",
+            "  C  Configuration: server settings",
+            "     and other options",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
-            "  M  Modem Emulator: configure the",
-            "     serial port for modem emulation",
             "  R  Troubleshooting: diagnose",
             "     terminal input issues",
             "  S  SSH Gateway: connect to a",
@@ -7071,7 +8020,7 @@ mod tests {
             "  W  Weather: check weather by zip",
             "  X  Exit: disconnect from server",
         ];
-        assert_eq!(lines.len(), 16, "main help should have exactly 16 content lines");
+        assert_eq!(lines.len(), 14, "main help should have exactly 14 content lines");
     }
 
     /// Shutdown broadcast message must be valid and end with CRLF.
@@ -7252,18 +8201,22 @@ mod tests {
     /// Typical machines have 1-3 addresses, fitting well within 22.
     #[test]
     fn test_config_menu_row_count() {
-        let static_rows = 3 + 1 + 2 + 1 + 4 + 1 + 1 + 1; // 14
-        assert!(static_rows <= 22, "config menu static is {} rows, exceeds 22", static_rows);
-        // With address list: +1 label +3 addrs +1 blank = 5 extra → 19
-        let with_addrs = static_rows + 1 + 3 + 1; // 19
-        assert!(with_addrs <= 22, "config menu with 3 addrs is {} rows, exceeds 22", with_addrs);
+        // Configuration submenu: header(3) + blank + 6 items + blank + Q/H + prompt = 13
+        let submenu_rows = 3 + 1 + 6 + 1 + 1 + 1; // 13
+        assert!(submenu_rows <= 22, "config submenu is {} rows, exceeds 22", submenu_rows);
+        // Server configuration: header(3) + blank + 2 status + blank + 5 items + blank + Q/H + prompt = 15
+        let static_rows = 3 + 1 + 2 + 1 + 5 + 1 + 1 + 1; // 15
+        assert!(static_rows <= 22, "server config menu static is {} rows, exceeds 22", static_rows);
+        // With address list: +1 label +3 addrs +1 blank = 5 extra → 20
+        let with_addrs = static_rows + 1 + 3 + 1; // 20
+        assert!(with_addrs <= 22, "server config menu with 3 addrs is {} rows, exceeds 22", with_addrs);
     }
 
-    /// Configuration help screen (ANSI): header(3) + blank + 14 content lines +
-    /// blank + "Press any key" = 20 rows.
+    /// Configuration help screen (ANSI): header(3) + blank + 15 content lines +
+    /// blank + "Press any key" = 21 rows.
     #[test]
     fn test_config_help_screen_row_count() {
-        let rows = 3 + 1 + 14 + 1 + 1; // 20
+        let rows = 3 + 1 + 15 + 1 + 1; // 21
         assert!(rows <= 22, "config help screen is {} rows, exceeds 22", rows);
     }
 
@@ -7281,6 +8234,7 @@ mod tests {
             "  S  Enable or disable the SSH",
             "     server listener",
             "  O  Change the SSH port",
+            "  R  Restart the server",
             "  Changes are saved immediately",
             "  but require a server restart.",
         ];
@@ -7295,6 +8249,136 @@ mod tests {
         }
     }
 
+    /// Security menu row count:
+    /// header(3) + blank + status + blank + 4 creds + blank + 6 items + blank + Q/H + prompt = 20
+    #[test]
+    fn test_security_menu_row_count() {
+        let rows = 3 + 1 + 1 + 1 + 4 + 1 + 6 + 1 + 1 + 1; // 20
+        assert!(rows <= 22, "security menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Security help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_security_help_lines_fit_petscii() {
+        let lines = [
+            "  Configure login security.",
+            "  L  Toggle whether a login is",
+            "     required to access server",
+            "  U  Set the telnet username",
+            "  P  Set the telnet password",
+            "  S  Set the SSH username",
+            "  W  Set the SSH password",
+            "  R  Restart the server",
+            "  Telnet and SSH have separate",
+            "  credentials. Changes require",
+            "  a server restart.",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "security help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Security help screen (PETSCII): header(3) + blank + 13 content +
+    /// blank + "Press any key" = 19 rows.
+    #[test]
+    fn test_security_help_screen_row_count() {
+        let rows = 3 + 1 + 13 + 1 + 1; // 19
+        assert!(rows <= 22, "security help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// Other settings menu row count:
+    /// header(3) + blank + 5 values + blank + 6 items + blank + Q/H + prompt = 19
+    #[test]
+    fn test_other_settings_menu_row_count() {
+        let rows = 3 + 1 + 5 + 1 + 6 + 1 + 1 + 1; // 19
+        assert!(rows <= 22, "other settings menu is {} rows, exceeds 22", rows);
+    }
+
+    /// Other settings help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_other_help_lines_fit_petscii() {
+        let lines = [
+            "  A  Groq API key for AI Chat",
+            "     (get one free at groq.com)",
+            "  B  Default homepage URL for",
+            "     the built-in web browser",
+            "  W  Default zip code for the",
+            "     weather feature",
+            "  V  Toggle verbose XMODEM log",
+            "  G  Toggle GUI on startup",
+            "     (requires restart)",
+            "  R  Restart the server",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "other help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Other settings help screen (PETSCII): header(3) + blank + 10 content +
+    /// blank + "Press any key" = 16 rows.
+    #[test]
+    fn test_other_help_screen_row_count() {
+        let rows = 3 + 1 + 10 + 1 + 1; // 16
+        assert!(rows <= 22, "other help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// XMODEM settings menu row count:
+    /// header(3) + blank + 4 values + blank + 5 items + blank + Q/H + prompt = 17
+    #[test]
+    fn test_xmodem_settings_menu_row_count() {
+        let rows = 3 + 1 + 4 + 1 + 5 + 1 + 1 + 1; // 17
+        assert!(rows <= 22, "xmodem settings menu is {} rows, exceeds 22", rows);
+    }
+
+    /// XMODEM settings help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_xmodem_help_lines_fit_petscii() {
+        let lines = [
+            "  Configure XMODEM file transfer",
+            "  settings.",
+            "  D  Transfer directory where",
+            "     files are stored",
+            "  N  Negotiation timeout: how",
+            "     long to wait for transfer",
+            "     to begin",
+            "  B  Block timeout: how long to",
+            "     wait for each block",
+            "  M  Max retries per block",
+            "  R  Restart the server",
+            "  Changes take effect on the",
+            "  next file transfer.",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "xmodem help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// XMODEM help screen (PETSCII): header(3) + blank + 15 content +
+    /// blank + "Press any key" = 21 rows.
+    #[test]
+    fn test_xmodem_help_screen_row_count() {
+        let rows = 3 + 1 + 15 + 1 + 1; // 21
+        assert!(rows <= 22, "xmodem help screen is {} rows, exceeds 22", rows);
+    }
+
     /// Modem help screen (ANSI): header(3) + blank + 16 content lines +
     /// blank + "Press any key" = 22 rows.
     #[test]
@@ -7303,11 +8387,11 @@ mod tests {
         assert!(rows <= 22, "modem help screen is {} rows, exceeds 22", rows);
     }
 
-    /// Main help screen: header(3) + blank + 16 content lines +
-    /// blank + "Press any key" = 22 rows.
+    /// Main help screen: header(3) + blank + 14 content lines +
+    /// blank + "Press any key" = 20 rows.
     #[test]
     fn test_main_help_screen_row_count() {
-        let rows = 3 + 1 + 16 + 1 + 1; // 22
+        let rows = 3 + 1 + 14 + 1 + 1; // 20
         assert!(rows <= 22, "main help screen is {} rows, exceeds 22", rows);
     }
 
@@ -7318,12 +8402,10 @@ mod tests {
             // Main menu help
             "  A  AI Chat: ask questions to an AI",
             "  B  Browser: browse the web",
-            "  C  Configuration: enable/disable",
-            "     services and set port numbers",
+            "  C  Configuration: server settings",
+            "     and other options",
             "  F  File Transfer: upload/download",
             "     files using the XMODEM protocol",
-            "  M  Modem Emulator: configure the",
-            "     serial port for modem emulation",
             "  R  Troubleshooting: diagnose",
             "     terminal input issues",
             "  S  SSH Gateway: connect to a",
@@ -7332,6 +8414,57 @@ mod tests {
             "     remote server via telnet",
             "  W  Weather: check weather by zip",
             "  X  Exit: disconnect from server",
+            // Configuration submenu help
+            "  E  Security: require login,",
+            "     set usernames and passwords",
+            "  M  Modem: configure the serial",
+            "     port for modem emulation",
+            "  S  Server: enable/disable",
+            "     services, set ports, and",
+            "     restart the server",
+            "  X  XMODEM: set transfer dir,",
+            "     timeouts, and retry limit",
+            "  O  Other: AI key, logging,",
+            "     and general settings",
+            "  R  Reset all settings to their",
+            "     default values",
+            // Other settings help
+            "  A  Groq API key for AI Chat",
+            "     (get one free at groq.com)",
+            "  B  Default homepage URL for",
+            "     the built-in web browser",
+            "  W  Default zip code for the",
+            "     weather feature",
+            "  V  Toggle verbose XMODEM log",
+            "  G  Toggle GUI on startup",
+            "     (requires restart)",
+            "  R  Restart the server",
+            // Security help
+            "  Configure login security.",
+            "  L  Toggle whether a login is",
+            "     required to access server",
+            "  U  Set the telnet username",
+            "  P  Set the telnet password",
+            "  S  Set the SSH username",
+            "  W  Set the SSH password",
+            "  R  Restart the server",
+            "  Telnet and SSH have separate",
+            "  credentials. Changes require",
+            "  a server restart.",
+            // XMODEM settings help
+            "  Configure XMODEM file transfer",
+            "  settings.",
+            "  D  Transfer directory where",
+            "     files are stored",
+            "  N  Negotiation timeout: how",
+            "     long to wait for transfer",
+            "     to begin",
+            "  B  Block timeout: how long to",
+            "     wait for each block",
+            "  M  Max retries per block",
+            "  R  Restart the server",
+            "  Changes take effect on the",
+            "  next file transfer.",
             // File transfer help
             "  U  Upload a file to the server",
             "  D  Download a file from server",

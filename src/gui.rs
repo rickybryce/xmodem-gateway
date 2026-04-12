@@ -24,6 +24,7 @@ const AMBER_BRIGHT: Color32 = Color32::from_rgb(0xff, 0xd7, 0x00);
 const AMBER_DIM: Color32 = Color32::from_rgb(0x8b, 0x7a, 0x3a);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xd4, 0xc5, 0x90);
 const TEXT_INPUT: Color32 = Color32::from_rgb(0xe8, 0xdc, 0xb0);
+#[cfg(test)]
 const GREEN: Color32 = Color32::from_rgb(0x33, 0xff, 0x33);
 const CONSOLE_TEXT: Color32 = Color32::from_rgb(0x33, 0xcc, 0x33);
 const SCRIPTURE: Color32 = Color32::from_rgb(0xc0, 0xaa, 0x60);  // lighter amber for verse
@@ -139,9 +140,11 @@ fn detect_serial_ports() -> Vec<String> {
 
 struct App {
     cfg: Config,
+    /// Snapshot of the global config at last sync.  When the global singleton
+    /// diverges from this (e.g. a telnet session changed a setting), we know
+    /// an external update happened and refresh the GUI fields.
+    last_synced_cfg: Config,
     console_lines: Vec<String>,
-    status_msg: String,
-    status_timer: f64,
     theme_applied: bool,
     local_ip: String,
     shutdown: Arc<AtomicBool>,
@@ -170,11 +173,11 @@ impl App {
         let max_retries_buf = cfg.xmodem_max_retries.to_string();
         let serial_baud_buf = cfg.serial_baud.to_string();
         let serial_ports = detect_serial_ports();
+        let last_synced_cfg = cfg.clone();
         Self {
             cfg,
+            last_synced_cfg,
             console_lines: Vec::new(),
-            status_msg: String::new(),
-            status_timer: 0.0,
             theme_applied: false,
             local_ip: local_ip(),
             shutdown,
@@ -212,6 +215,27 @@ impl App {
             }
         }
     }
+
+    /// Pull the global config singleton and, if it changed since our last
+    /// sync (i.e. a telnet/SSH session persisted a setting), refresh every
+    /// GUI field to match.
+    fn refresh_from_global(&mut self) {
+        let global = config::get_config();
+        if global == self.last_synced_cfg {
+            return;
+        }
+        self.cfg = global.clone();
+        self.last_synced_cfg = global;
+        // Rebuild the string buffers that back numeric text fields.
+        self.telnet_port_buf = self.cfg.telnet_port.to_string();
+        self.ssh_port_buf = self.cfg.ssh_port.to_string();
+        self.max_sessions_buf = self.cfg.max_sessions.to_string();
+        self.idle_timeout_buf = self.cfg.idle_timeout_secs.to_string();
+        self.negotiation_timeout_buf = self.cfg.xmodem_negotiation_timeout.to_string();
+        self.block_timeout_buf = self.cfg.xmodem_block_timeout.to_string();
+        self.max_retries_buf = self.cfg.xmodem_max_retries.to_string();
+        self.serial_baud_buf = self.cfg.serial_baud.to_string();
+    }
 }
 
 /// Helper: labeled text field in a horizontal row.
@@ -246,14 +270,7 @@ impl eframe::App for App {
         }
 
         self.poll_logs();
-
-        // Fade status message
-        if !self.status_msg.is_empty() {
-            self.status_timer -= ui.ctx().input(|i| i.unstable_dt) as f64;
-            if self.status_timer <= 0.0 {
-                self.status_msg.clear();
-            }
-        }
+        self.refresh_from_global();
 
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
 
@@ -523,11 +540,11 @@ impl eframe::App for App {
                 });
                 ui.add_space(6.0);
 
-                // ── Save / Restart buttons ────────────────────
+                // ── Save & Restart button ─────────────────────
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("Save Configuration")
+                            egui::RichText::new("Save and Restart Server")
                                 .strong()
                                 .size(16.0)
                                 .color(AMBER_BRIGHT),
@@ -536,35 +553,16 @@ impl eframe::App for App {
                     {
                         self.sync_numeric_fields();
                         config::save_config(&self.cfg);
-                        self.status_msg = "Saved!".into();
-                        self.status_timer = 3.0;
-                        logger::log("Configuration saved to xmodem.conf".into());
-                    }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("Restart Server")
-                                .strong()
-                                .size(16.0)
-                                .color(AMBER_BRIGHT),
-                        ))
-                        .clicked()
-                    {
-                        self.sync_numeric_fields();
-                        config::save_config(&self.cfg);
+                        self.last_synced_cfg = self.cfg.clone();
                         logger::log("Configuration saved — restarting server...".into());
                         // Set restart BEFORE shutdown so main loop sees the
                         // intent to restart when it checks after join().
                         self.restart.store(true, Ordering::SeqCst);
                         self.shutdown.store(true, Ordering::SeqCst);
                     }
-                    if !self.status_msg.is_empty() {
-                        ui.add_space(12.0);
-                        ui.colored_label(GREEN, egui::RichText::new(&self.status_msg).size(15.0));
-                    }
                 });
                 ui.label(
-                    egui::RichText::new("Changes take effect after restarting the server.")
+                    egui::RichText::new("Saves configuration and restarts the server.")
                         .weak()
                         .italics()
                         .small(),
@@ -670,8 +668,6 @@ mod tests {
     fn test_app_new_defaults() {
         let app = test_app();
         assert!(app.console_lines.is_empty());
-        assert!(app.status_msg.is_empty());
-        assert_eq!(app.status_timer, 0.0);
         assert!(!app.theme_applied);
         assert!(!app.shutdown.load(Ordering::SeqCst));
         assert!(!app.restart.load(Ordering::SeqCst));

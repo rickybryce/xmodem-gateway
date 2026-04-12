@@ -96,6 +96,7 @@ struct ModemState {
     cmd_buffer: String,
     handle: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
     baud: u32,
     /// Connection preserved after +++ escape for ATO to resume.
     active_connection: Option<ActiveConnection>,
@@ -112,14 +113,15 @@ struct ModemState {
 /// Returns immediately.  The manager thread loops: if serial is enabled and
 /// configured it opens the port and runs the modem; when `restart_serial()`
 /// is called it re-reads config and re-opens the port (or stops if disabled).
-pub fn start_serial(shutdown: Arc<AtomicBool>) {
+pub fn start_serial(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
     let handle = tokio::runtime::Handle::current();
     let sd = shutdown;
+    let rs = restart;
 
     std::thread::Builder::new()
         .name("serial-modem".into())
         .spawn(move || {
-            serial_manager(handle, sd);
+            serial_manager(handle, sd, rs);
         })
         .expect("Failed to spawn serial modem thread");
 }
@@ -163,12 +165,12 @@ pub fn cancel_ring_request() {
 // ─── Serial manager ────────────────────────────────────────
 
 /// Manager loop: starts/stops the serial modem when config changes.
-fn serial_manager(handle: tokio::runtime::Handle, shutdown: Arc<AtomicBool>) {
+fn serial_manager(handle: tokio::runtime::Handle, shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
     loop {
         SERIAL_RESTART.store(false, Ordering::SeqCst);
         let cfg = config::get_config();
         if cfg.serial_enabled && !cfg.serial_port.is_empty() {
-            serial_thread(cfg, handle.clone(), shutdown.clone());
+            serial_thread(cfg, handle.clone(), shutdown.clone(), restart.clone());
         }
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -191,6 +193,7 @@ fn serial_thread(
     cfg: config::Config,
     handle: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
 ) {
     let builder = serialport::new(&cfg.serial_port, cfg.serial_baud)
         .data_bits(match cfg.serial_databits {
@@ -240,6 +243,7 @@ fn serial_thread(
         cmd_buffer: String::new(),
         handle,
         shutdown,
+        restart,
         baud: cfg.serial_baud,
         active_connection: None,
         s_regs: parse_s_regs(&cfg.serial_s_regs),
@@ -742,6 +746,7 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
         Arc::new(tokio::sync::Mutex::new(writer_box));
 
     let shutdown = state.shutdown.clone();
+    let restart = state.restart.clone();
 
     // Spawn TelnetSession on the tokio runtime.
     let writer_for_task = writer_arc.clone();
@@ -750,6 +755,7 @@ fn dial_xmodem_gateway(state: &mut ModemState) {
             Box::new(async_read),
             writer_for_task.clone(),
             shutdown,
+            restart,
         );
         if let Err(e) = session.run().await {
             glog!("Serial modem: session error: {}", e);

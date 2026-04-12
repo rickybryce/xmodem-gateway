@@ -49,7 +49,7 @@ const DEFAULT_SSH_USERNAME: &str = "admin";
 const DEFAULT_SSH_PASSWORD: &str = "changeme";
 
 /// Runtime configuration loaded from `xmodem.conf`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Enable the telnet server. Set to false for SSH-only access.
     pub telnet_enabled: bool,
@@ -507,7 +507,39 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
             }
         }
         "enable_console" => cfg.enable_console = value.eq_ignore_ascii_case("true"),
+        "security_enabled" => cfg.security_enabled = value.eq_ignore_ascii_case("true"),
+        "username" => cfg.username = value.to_string(),
+        "password" => cfg.password = value.to_string(),
+        "transfer_dir" => cfg.transfer_dir = value.to_string(),
+        "max_sessions" => {
+            if let Ok(v) = value.parse() {
+                cfg.max_sessions = v;
+            }
+        }
+        "idle_timeout_secs" => {
+            if let Ok(v) = value.parse() {
+                cfg.idle_timeout_secs = v;
+            }
+        }
+        "groq_api_key" => cfg.groq_api_key = value.to_string(),
+        "browser_homepage" => cfg.browser_homepage = value.to_string(),
         "weather_zip" => cfg.weather_zip = value.to_string(),
+        "verbose" => cfg.verbose = value.eq_ignore_ascii_case("true"),
+        "xmodem_negotiation_timeout" => {
+            if let Ok(v) = value.parse() {
+                cfg.xmodem_negotiation_timeout = v;
+            }
+        }
+        "xmodem_block_timeout" => {
+            if let Ok(v) = value.parse() {
+                cfg.xmodem_block_timeout = v;
+            }
+        }
+        "xmodem_max_retries" => {
+            if let Ok(v) = value.parse() {
+                cfg.xmodem_max_retries = v;
+            }
+        }
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
         "serial_port" => cfg.serial_port = value.to_string(),
         "serial_baud" => {
@@ -980,6 +1012,65 @@ mod tests {
 
         apply_config_key(&mut cfg, "enable_console", "true");
         assert!(cfg.enable_console);
+    }
+
+    #[test]
+    fn test_apply_config_key_security_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "security_enabled", "true");
+        assert!(cfg.security_enabled);
+        apply_config_key(&mut cfg, "security_enabled", "false");
+        assert!(!cfg.security_enabled);
+
+        apply_config_key(&mut cfg, "username", "myuser");
+        assert_eq!(cfg.username, "myuser");
+
+        apply_config_key(&mut cfg, "password", "mypass");
+        assert_eq!(cfg.password, "mypass");
+    }
+
+    #[test]
+    fn test_apply_config_key_xmodem_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "transfer_dir", "/tmp/files");
+        assert_eq!(cfg.transfer_dir, "/tmp/files");
+
+        apply_config_key(&mut cfg, "xmodem_negotiation_timeout", "60");
+        assert_eq!(cfg.xmodem_negotiation_timeout, 60);
+
+        apply_config_key(&mut cfg, "xmodem_block_timeout", "30");
+        assert_eq!(cfg.xmodem_block_timeout, 30);
+
+        apply_config_key(&mut cfg, "xmodem_max_retries", "15");
+        assert_eq!(cfg.xmodem_max_retries, 15);
+
+        // Invalid values should be ignored
+        apply_config_key(&mut cfg, "xmodem_negotiation_timeout", "notanumber");
+        assert_eq!(cfg.xmodem_negotiation_timeout, 60);
+    }
+
+    #[test]
+    fn test_apply_config_key_other_fields() {
+        let mut cfg = Config::default();
+
+        apply_config_key(&mut cfg, "groq_api_key", "gsk_test123");
+        assert_eq!(cfg.groq_api_key, "gsk_test123");
+
+        apply_config_key(&mut cfg, "browser_homepage", "http://example.com");
+        assert_eq!(cfg.browser_homepage, "http://example.com");
+
+        apply_config_key(&mut cfg, "verbose", "true");
+        assert!(cfg.verbose);
+        apply_config_key(&mut cfg, "verbose", "false");
+        assert!(!cfg.verbose);
+
+        apply_config_key(&mut cfg, "max_sessions", "100");
+        assert_eq!(cfg.max_sessions, 100);
+
+        apply_config_key(&mut cfg, "idle_timeout_secs", "1800");
+        assert_eq!(cfg.idle_timeout_secs, 1800);
     }
 
     // ─── sanitize_value ─────────────────────────────────

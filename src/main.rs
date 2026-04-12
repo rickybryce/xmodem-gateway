@@ -64,6 +64,7 @@ fn main() {
 
         // Start tokio runtime on a worker thread so the main thread is free for the GUI.
         let shutdown_rt = shutdown.clone();
+        let restart_rt = restart.clone();
         let notify_rt = shutdown_notify.clone();
         let gui_cfg = cfg.clone();
         let server_handle = std::thread::spawn(move || {
@@ -75,9 +76,9 @@ fn main() {
             runtime.block_on(async move {
                 let session_writers: telnet::SessionWriters =
                     Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                telnet::start_server(shutdown_rt.clone(), notify_rt.clone(), session_writers.clone());
-                ssh::start_ssh_server(shutdown_rt.clone(), notify_rt.clone(), session_writers);
-                serial::start_serial(shutdown_rt.clone());
+                telnet::start_server(shutdown_rt.clone(), restart_rt.clone(), notify_rt.clone(), session_writers.clone());
+                ssh::start_ssh_server(shutdown_rt.clone(), restart_rt.clone(), notify_rt.clone(), session_writers);
+                serial::start_serial(shutdown_rt.clone(), restart_rt.clone());
 
                 // Wait for shutdown signal
                 loop {

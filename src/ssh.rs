@@ -22,7 +22,7 @@ const SSH_HOST_KEY_FILE: &str = "xmodem_ssh_host_key";
 // ─── Public API ────────────────────────────────────────────
 
 /// Start the SSH server if enabled in config.
-pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: telnet::SessionWriters) {
+pub fn start_ssh_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: telnet::SessionWriters) {
     let cfg = config::get_config();
     if !cfg.ssh_enabled {
         return;
@@ -48,6 +48,7 @@ pub fn start_ssh_server(shutdown: Arc<AtomicBool>, shutdown_notify: Arc<tokio::s
 
         let mut server = SshServer {
             shutdown: shutdown.clone(),
+            restart: restart.clone(),
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: cfg.max_sessions,
             session_writers: session_writers.clone(),
@@ -129,6 +130,7 @@ fn load_or_generate_host_key() -> Result<russh::keys::PrivateKey, String> {
 
 struct SshServer {
     shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
     session_count: Arc<AtomicUsize>,
     max_sessions: usize,
     session_writers: telnet::SessionWriters,
@@ -150,6 +152,7 @@ impl russh::server::Server for SshServer {
         }
         SshHandler {
             shutdown: self.shutdown.clone(),
+            restart: self.restart.clone(),
             session_count: self.session_count.clone(),
             max_sessions: self.max_sessions,
             ssh_username: cfg.ssh_username.clone(),
@@ -165,6 +168,7 @@ impl russh::server::Server for SshServer {
 
 struct SshHandler {
     shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
     session_count: Arc<AtomicUsize>,
     max_sessions: usize,
     ssh_username: String,
@@ -263,6 +267,7 @@ impl russh::server::Handler for SshHandler {
             Arc::new(tokio::sync::Mutex::new(writer_box));
 
         let shutdown = self.shutdown.clone();
+        let restart = self.restart.clone();
         let peer_addr = self.peer_addr;
         let session_writers = self.session_writers.clone();
 
@@ -277,6 +282,7 @@ impl russh::server::Handler for SshHandler {
                 Box::new(gateway_read),
                 writer_for_task.clone(),
                 shutdown,
+                restart,
                 peer_addr,
             );
             if let Err(e) = sess.run().await {
