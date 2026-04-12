@@ -25,7 +25,7 @@ const DEFAULT_TRANSFER_DIR: &str = "transfer";
 const DEFAULT_MAX_SESSIONS: usize = 50;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900; // 15 minutes
 const DEFAULT_GROQ_API_KEY: &str = "";
-const DEFAULT_BROWSER_HOMEPAGE: &str = "";
+const DEFAULT_BROWSER_HOMEPAGE: &str = "http://telnetbible.com";
 const DEFAULT_WEATHER_ZIP: &str = "";
 const DEFAULT_VERBOSE: bool = false;
 const DEFAULT_SERIAL_ENABLED: bool = false;
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(cfg.max_sessions, 50);
         assert_eq!(cfg.idle_timeout_secs, 900);
         assert_eq!(cfg.groq_api_key, "");
-        assert_eq!(cfg.browser_homepage, "");
+        assert_eq!(cfg.browser_homepage, "http://telnetbible.com");
         assert_eq!(cfg.weather_zip, "");
         assert!(!cfg.serial_enabled);
         assert_eq!(cfg.serial_port, "");
