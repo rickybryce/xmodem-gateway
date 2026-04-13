@@ -5,6 +5,8 @@ emulator for serial-attached retro hardware, text-mode web browser, and AI chat
 client written in Rust. Supports PETSCII (Commodore 64), ANSI, and ASCII
 terminals. Designed for local network use with retro and modern terminal clients.
 
+**[User Manual](http://telnetbible.com/xmodem-gateway/index.html)**
+
 Once you run the server on your PC, you can telnet to that server from anywhere 
 on your network (allow firewall port 2323).  Example:  ATDT 192.168.1.160:2323
 

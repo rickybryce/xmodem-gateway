@@ -1,0 +1,1443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XMODEM Gateway v0.3.1 &mdash; User Manual</title>
+    <meta name="description" content="Complete user manual for XMODEM Gateway — a telnet/SSH gateway server with XMODEM file transfer, AI chat, web browser, weather, and serial modem emulation.">
+    <style>
+        :root {
+            --green: #33ff33;
+            --cyan: #00ffff;
+            --yellow: #ffff00;
+            --white: #f0f0f0;
+            --amber: #ffcc00;
+            --magenta: #ff66ff;
+            --red: #ff4444;
+            --dim: #888888;
+            --bg: #0a0a2e;
+            --bg-dark: #060620;
+            --bg-light: #101040;
+            --border: #3333aa;
+            --border-bright: #5555ff;
+            --link: #00ccff;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+            background: var(--bg);
+            color: var(--white);
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 19px;
+            line-height: 1.6;
+        }
+
+        /* ---- Page shell (25% wider than telnetbible.com) ---- */
+        .page {
+            max-width: 1100px;
+            margin: 0 auto;
+            border-left: 2px solid var(--border);
+            border-right: 2px solid var(--border);
+            background: var(--bg-dark);
+        }
+
+        /* ---- Header ---- */
+        .site-header {
+            background: var(--bg-dark);
+            padding: 36px 32px 24px;
+            text-align: center;
+            border-bottom: 2px dashed var(--border);
+        }
+
+        .header-photos {
+            display: inline-flex;
+            justify-content: center;
+            align-items: flex-end;
+            gap: 0;
+            margin-bottom: 14px;
+            border: 1px solid var(--cyan);
+            box-shadow: 0 0 12px rgba(0, 255, 255, 0.3);
+        }
+
+        .logo-photo {
+            height: 180px;
+            width: auto;
+            display: block;
+        }
+
+        .sysop-photo {
+            height: 180px;
+            width: auto;
+            image-rendering: pixelated;
+            display: block;
+        }
+
+        .site-header h1 {
+            font-size: 2.4em;
+            color: var(--yellow);
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            text-shadow: 0 0 10px rgba(255, 255, 0, 0.4);
+            line-height: 1.1;
+        }
+
+        .hdr-tagline {
+            color: var(--green);
+            font-size: 0.95em;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+
+        .hdr-version {
+            display: inline-block;
+            font-size: 0.8em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 3px 12px;
+            border: 1px solid var(--green);
+            color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+            margin-top: 14px;
+        }
+
+        .hdr-badges {
+            margin-top: 10px;
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .hdr-badge {
+            font-size: 0.8em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 3px 12px;
+            border: 1px solid var(--green);
+            color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+        }
+
+        /* ---- Nav ---- */
+        .site-nav {
+            background: var(--bg-light);
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            border-bottom: 1px solid var(--border);
+            padding: 2px 0;
+        }
+
+        .site-nav a {
+            color: var(--cyan);
+            text-decoration: none;
+            padding: 10px 14px;
+            font-size: 0.85em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .site-nav a:hover {
+            color: var(--yellow);
+            background: rgba(255, 255, 0, 0.08);
+        }
+
+        /* ---- Divider ---- */
+        .divider {
+            border: none;
+            border-top: 1px dashed var(--border);
+            margin: 0;
+        }
+
+        /* ---- Content area ---- */
+        .body-content {
+            padding: 0 32px 36px;
+        }
+
+        /* ---- Section ---- */
+        .section {
+            margin-top: 28px;
+        }
+
+        .section-title {
+            color: var(--yellow);
+            font-size: 1.2em;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            text-align: center;
+            padding: 8px 0;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .section > .intro {
+            font-size: 0.95em;
+            color: var(--dim);
+            margin-bottom: 16px;
+            text-align: center;
+        }
+
+        /* ---- Category headers ---- */
+        .cat {
+            font-size: 0.95em;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--bg-dark);
+            background: var(--cyan);
+            display: inline-block;
+            padding: 2px 14px;
+            margin: 20px 0 10px;
+        }
+
+        .cat:first-of-type { margin-top: 0; }
+
+        /* ---- Paragraphs ---- */
+        p {
+            font-size: 0.95em;
+            color: var(--white);
+            margin-bottom: 12px;
+        }
+
+        .dim-text {
+            color: var(--dim);
+        }
+
+        /* ---- Feature table ---- */
+        .feature-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 6px;
+            margin-bottom: 4px;
+        }
+
+        .feature-table td {
+            padding: 8px 10px;
+            vertical-align: top;
+            font-size: 0.95em;
+            border-bottom: 1px solid rgba(51, 51, 170, 0.4);
+        }
+
+        .feature-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .feature-table .key-col {
+            width: 50px;
+            text-align: center;
+            color: var(--yellow);
+            font-weight: bold;
+            white-space: nowrap;
+        }
+
+        .feature-table .name-col {
+            color: var(--green);
+            white-space: nowrap;
+            width: 1%;
+            padding-right: 16px;
+        }
+
+        .feature-table .desc-col {
+            color: var(--dim);
+        }
+
+        /* ---- Data tables ---- */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0 16px;
+            font-size: 0.9em;
+        }
+
+        .data-table th {
+            background: var(--bg-light);
+            color: var(--yellow);
+            text-align: left;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+
+        .data-table td {
+            padding: 8px 14px;
+            border: 1px solid rgba(51, 51, 170, 0.4);
+            color: var(--white);
+        }
+
+        .data-table tr:hover td {
+            background: rgba(255, 255, 0, 0.03);
+        }
+
+        .data-table code {
+            color: var(--green);
+            background: none;
+            border: none;
+            padding: 0;
+        }
+
+        /* ---- Instruction blocks ---- */
+        .instructions {
+            border: 1px solid var(--border);
+            padding: 18px 22px;
+            margin-bottom: 12px;
+            background: rgba(0, 0, 0, 0.3);
+        }
+
+        .instructions h3 {
+            font-size: 1em;
+            color: var(--cyan);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+            padding-bottom: 6px;
+            border-bottom: 1px dashed var(--border);
+        }
+
+        .instructions ol, .instructions ul {
+            margin-left: 22px;
+            font-size: 0.95em;
+            color: var(--white);
+        }
+
+        .instructions ol li, .instructions ul li {
+            margin-bottom: 3px;
+            padding-left: 2px;
+        }
+
+        .instructions p {
+            font-size: 0.95em;
+            color: var(--dim);
+        }
+
+        /* ---- Code ---- */
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.95em;
+            color: var(--green);
+            background: rgba(0, 0, 0, 0.4);
+            padding: 1px 6px;
+            border: 1px solid var(--border);
+        }
+
+        pre {
+            background: #000000;
+            border: 1px solid var(--border);
+            padding: 16px 20px;
+            overflow-x: auto;
+            margin: 10px 0 16px;
+            line-height: 1.5;
+        }
+
+        pre code {
+            background: none;
+            border: none;
+            padding: 0;
+            color: var(--green);
+        }
+
+        .prompt-char { color: var(--amber); }
+        .output-text { color: var(--dim); }
+
+        /* ---- Callout boxes ---- */
+        .callout {
+            border: 1px solid var(--amber);
+            background: rgba(255, 204, 0, 0.05);
+            padding: 14px 22px;
+            margin: 12px 0;
+            font-size: 0.95em;
+            color: var(--dim);
+        }
+
+        .callout strong { color: var(--amber); }
+
+        .callout-info {
+            border-color: var(--cyan);
+            background: rgba(0, 255, 255, 0.03);
+        }
+
+        .callout-info strong { color: var(--cyan); }
+
+        .callout-warn {
+            border-color: var(--red);
+            background: rgba(255, 68, 68, 0.05);
+        }
+
+        .callout-warn strong { color: var(--red); }
+
+        .callout-tip {
+            border-color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+        }
+
+        .callout-tip strong { color: var(--green); }
+
+        /* ---- Menu rendering ---- */
+        .menu-block {
+            background: #000000;
+            border: 1px solid var(--green);
+            padding: 20px 28px;
+            margin: 14px 0 18px;
+            line-height: 1.8;
+        }
+
+        .menu-block .sep { color: var(--dim); }
+        .menu-block .title { color: var(--yellow); font-weight: bold; }
+        .menu-block .key { color: var(--cyan); font-weight: bold; }
+        .menu-block .label { color: var(--white); }
+        .menu-block .menu-dim { color: var(--dim); }
+        .menu-block .val { color: var(--amber); }
+
+        /* ---- Lists ---- */
+        ul, ol {
+            margin: 8px 0 14px 28px;
+            font-size: 0.95em;
+        }
+
+        li {
+            margin-bottom: 4px;
+        }
+
+        /* ---- Links ---- */
+        .body-content a {
+            color: var(--link);
+            text-decoration: none;
+        }
+
+        .body-content a:hover {
+            color: var(--yellow);
+            text-decoration: underline;
+        }
+
+        /* ---- Compat cards ---- */
+        .compat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .compat-card {
+            border: 1px solid var(--border);
+            padding: 18px 20px;
+            background: rgba(0, 0, 0, 0.3);
+        }
+
+        .compat-card h3 {
+            font-size: 1em;
+            color: var(--cyan);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 6px;
+        }
+
+        .compat-card p {
+            font-size: 0.9em;
+            color: var(--dim);
+            line-height: 1.5;
+            margin-bottom: 0;
+        }
+
+        /* ---- Author ---- */
+        .author-block {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            border: 1px solid var(--border);
+            padding: 20px 24px;
+            background: rgba(0, 0, 0, 0.3);
+            margin-top: 12px;
+        }
+
+        .author-block img {
+            width: 180px;
+            height: auto;
+            image-rendering: pixelated;
+            border: 1px solid var(--cyan);
+            box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
+        }
+
+        .author-block .author-info h3 {
+            color: var(--cyan);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .author-block .author-info p {
+            color: var(--dim);
+        }
+
+        /* ---- Footer ---- */
+        .site-footer {
+            background: var(--bg-dark);
+            color: var(--dim);
+            text-align: center;
+            padding: 22px 32px;
+            font-size: 0.85em;
+            border-top: 2px dashed var(--border);
+        }
+
+        .site-footer a {
+            color: var(--cyan);
+            text-decoration: none;
+        }
+
+        .site-footer a:hover { color: var(--yellow); }
+
+        /* ---- Responsive ---- */
+        @media (max-width: 900px) {
+            body { font-size: 17px; }
+            .site-header { padding: 24px 16px 16px; }
+            .site-header h1 { font-size: 1.6em; letter-spacing: 2px; }
+            .hdr-tagline { letter-spacing: 2px; font-size: 0.85em; }
+            .body-content { padding: 0 16px 28px; }
+            .site-nav a { padding: 8px 10px; font-size: 0.78em; }
+            .compat-grid { grid-template-columns: 1fr; }
+            .section-title { font-size: 1em; letter-spacing: 2px; }
+            .feature-table .desc-col { display: none; }
+            .logo-photo { height: 120px; }
+            .sysop-photo { height: 120px; }
+            .author-block { flex-direction: column; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+
+        <!-- ══════════════════════════════════════════════════ -->
+        <!-- HEADER                                            -->
+        <!-- ══════════════════════════════════════════════════ -->
+        <header class="site-header">
+            <div class="header-photos">
+                <img src="ricky.png" alt="Author: Ricky Bryce" class="sysop-photo">
+                <img src="xmodemlogo.png" alt="XMODEM Gateway" class="logo-photo">
+            </div>
+            <h1>XMODEM Gateway</h1>
+            <p class="hdr-tagline">User Manual</p>
+            <div class="hdr-version">v0.3.1</div>
+            <div class="hdr-badges">
+                <span class="hdr-badge">Telnet</span>
+                <span class="hdr-badge">SSH</span>
+                <span class="hdr-badge">XMODEM</span>
+                <span class="hdr-badge">Serial Modem</span>
+                <span class="hdr-badge">Commodore 64</span>
+                <span class="hdr-badge">ANSI</span>
+            </div>
+        </header>
+
+        <!-- ══════════════════════════════════════════════════ -->
+        <!-- NAV                                               -->
+        <!-- ══════════════════════════════════════════════════ -->
+        <nav class="site-nav">
+            <a href="#overview">Overview</a>
+            <a href="#getting-started">Setup</a>
+            <a href="#terminals">Terminals</a>
+            <a href="#main-menu">Menus</a>
+            <a href="#file-transfer">XMODEM</a>
+            <a href="#gateways">Gateways</a>
+            <a href="#ai-chat">AI Chat</a>
+            <a href="#web-browser">Browser</a>
+            <a href="#configuration">Config</a>
+            <a href="#serial-modem">Modem</a>
+            <a href="#gui-console">GUI</a>
+            <a href="#security">Security</a>
+            <a href="#troubleshooting">Help</a>
+        </nav>
+
+        <div class="body-content">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- OVERVIEW                                      -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="overview">
+                <div class="section-title">Overview</div>
+                <p>
+                    XMODEM Gateway is a standalone, retro-themed server written in Rust
+                    that bridges vintage and modern computing. It provides telnet and
+                    SSH access to a full-featured gateway with XMODEM file transfer,
+                    SSH and telnet proxying, an AI chat client, a text-mode web browser,
+                    weather reports, and Hayes-compatible serial modem emulation.
+                </p>
+                <p class="dim-text">
+                    Designed to work with hardware as old as the Commodore 64 and CP/M
+                    machines while remaining fully functional on modern ANSI terminals,
+                    XMODEM Gateway adapts its display automatically to the capabilities
+                    of each connected client.
+                </p>
+
+                <div class="cat">Features</div>
+                <table class="feature-table">
+                    <tr>
+                        <td class="key-col">[F]</td>
+                        <td class="name-col">File Transfer</td>
+                        <td class="desc-col">Upload, download, and delete files via the XMODEM protocol with CRC-16 and checksum support.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[S]</td>
+                        <td class="name-col">SSH Gateway</td>
+                        <td class="desc-col">Proxy connections to remote SSH servers with host key verification.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[T]</td>
+                        <td class="name-col">Telnet Gateway</td>
+                        <td class="desc-col">Proxy connections to remote telnet servers.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[A]</td>
+                        <td class="name-col">AI Chat</td>
+                        <td class="desc-col">Conversational AI powered by Groq (llama-3.3-70b-versatile). Free API key.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[B]</td>
+                        <td class="name-col">Simple Browser</td>
+                        <td class="desc-col">Text-mode web browser supporting HTTP, HTTPS, and Gopher with forms and bookmarks.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[W]</td>
+                        <td class="name-col">Weather</td>
+                        <td class="desc-col">Current conditions and 3-day forecast by US zip code via Open-Meteo.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[C]</td>
+                        <td class="name-col">Configuration</td>
+                        <td class="desc-col">Full server configuration from the terminal. Changes are saved immediately.</td>
+                    </tr>
+                </table>
+
+                <div class="callout callout-info">
+                    <strong>Additional Features:</strong>
+                    GUI configuration console with live log output, Hayes AT-compatible
+                    serial modem emulation, optional authentication with per-IP lockout,
+                    Ed25519 SSH server, and POSIX signal handling for graceful shutdown.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- GETTING STARTED                               -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="getting-started">
+                <div class="section-title">Getting Started</div>
+
+                <div class="cat">Build from Source</div>
+                <div class="instructions">
+                    <h3>Compiling</h3>
+                    <ol>
+                        <li>Install Rust: <a href="https://rustup.rs">rustup.rs</a></li>
+                        <li>Clone the repository</li>
+                        <li>Build a release binary: <code>cargo build --release</code></li>
+                        <li>The binary is at <code>target/release/xmodem-gateway</code></li>
+                    </ol>
+                    <p style="margin-top: 8px;">An AppImage is also available for x86_64 Linux systems.</p>
+                </div>
+
+                <div class="cat">First Run</div>
+                <p class="dim-text">
+                    When launched for the first time, XMODEM Gateway creates a configuration
+                    file (<code>xmodem.conf</code>) and the <code>transfer/</code> directory
+                    automatically.
+                </p>
+                <pre><code><span class="prompt-char">$</span> ./xmodem-gateway
+<span class="output-text">XMODEM Gateway v0.3.1
+Author: Ricky Bryce
+
+Created default configuration: xmodem.conf
+Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></code></pre>
+
+                <div class="callout callout-tip">
+                    <strong>Tip:</strong> The GUI console window opens by default. Closing
+                    it does not stop the server &mdash; press <code>Ctrl-C</code> to stop.
+                    Set <code>enable_console = false</code> for headless operation.
+                </div>
+
+                <div class="cat">Connecting</div>
+                <div class="instructions">
+                    <h3>Telnet (default port 2323)</h3>
+                    <ol>
+                        <li>Ensure telnet is installed on your system</li>
+                        <li>Connect: <code>telnet localhost 2323</code></li>
+                        <li>Press backspace when prompted (terminal auto-detection)</li>
+                        <li>Answer the color prompt (Y/N)</li>
+                    </ol>
+                </div>
+                <div class="instructions">
+                    <h3>SSH (default port 2222, disabled by default)</h3>
+                    <ol>
+                        <li>Enable SSH in the configuration</li>
+                        <li>Connect: <code>ssh -p 2222 admin@localhost</code></li>
+                        <li>Enter the SSH password (default: <code>changeme</code>)</li>
+                    </ol>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- TERMINAL TYPES                                -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="terminals">
+                <div class="section-title">Terminal Types</div>
+                <p class="intro">Terminal type is auto-detected by examining the byte sent when the user presses backspace.</p>
+
+                <div class="compat-grid">
+                    <div class="compat-card">
+                        <h3>PETSCII</h3>
+                        <p>Commodore 64/128. 40 columns, 25 rows. Backspace = 0x14. Escape: <strong>&larr;</strong> or <strong>_</strong> key. Automatic case-swapping for the PETSCII charset.</p>
+                    </div>
+                    <div class="compat-card">
+                        <h3>ANSI</h3>
+                        <p>Modern terminals. 80 columns, 24 rows. Backspace = 0x08 or 0x7F. Full ANSI color and formatting. Escape: <strong>Esc</strong> key.</p>
+                    </div>
+                    <div class="compat-card">
+                        <h3>ASCII</h3>
+                        <p>Generic terminals. 80 columns, 24 rows. Any other backspace byte. No color output. Escape: <strong>Esc</strong> key.</p>
+                    </div>
+                </div>
+
+                <div class="callout callout-info">
+                    <strong>Color:</strong> After terminal detection, you are asked whether
+                    your terminal supports color. No default is assumed &mdash; you must
+                    answer Y or N. All menus and text fit within the 40-column limit for
+                    PETSCII terminals.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- MAIN MENU                                     -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="main-menu">
+                <div class="section-title">Main Menu</div>
+                <p class="intro">After terminal detection and optional authentication, the main menu is displayed.</p>
+
+                <div class="menu-block">
+                    <div class="sep">========================================</div>
+                    <div>&nbsp;&nbsp;<span class="title">XMODEM GATEWAY</span></div>
+                    <div class="sep">========================================</div>
+                    <br>
+                    <div>&nbsp;&nbsp;<span class="key">A</span>&nbsp;&nbsp;<span class="label">AI Chat</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">B</span>&nbsp;&nbsp;<span class="label">Simple Browser</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">C</span>&nbsp;&nbsp;<span class="label">Configuration</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">F</span>&nbsp;&nbsp;<span class="label">File Transfer</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">R</span>&nbsp;&nbsp;<span class="label">Troubleshooting</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">S</span>&nbsp;&nbsp;<span class="label">SSH Gateway</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">T</span>&nbsp;&nbsp;<span class="label">Telnet Gateway</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">W</span>&nbsp;&nbsp;<span class="label">Weather</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">X</span>&nbsp;&nbsp;<span class="label">Exit</span></div>
+                    <br>
+                    <div>&nbsp;&nbsp;<span class="menu-dim">[H] Help</span></div>
+                </div>
+
+                <p class="dim-text">
+                    Press the highlighted letter to select a feature. Press <strong>H</strong>
+                    at any menu for context-sensitive help. Press <strong>Esc</strong> (or
+                    <strong>&larr;</strong> on PETSCII) to return to the main menu from any
+                    submenu.
+                </p>
+
+                <div class="instructions">
+                    <h3>Help Screen</h3>
+                    <ul>
+                        <li><strong>A</strong> &mdash; AI Chat: ask questions to an AI</li>
+                        <li><strong>B</strong> &mdash; Browser: browse the web</li>
+                        <li><strong>C</strong> &mdash; Configuration: server settings and other options</li>
+                        <li><strong>F</strong> &mdash; File Transfer: upload/download files using the XMODEM protocol</li>
+                        <li><strong>R</strong> &mdash; Troubleshooting: diagnose terminal input issues</li>
+                        <li><strong>S</strong> &mdash; SSH Gateway: connect to a remote server via SSH</li>
+                        <li><strong>T</strong> &mdash; Telnet Gateway: connect to a remote server via telnet</li>
+                        <li><strong>W</strong> &mdash; Weather: check weather by zip code</li>
+                        <li><strong>X</strong> &mdash; Exit: disconnect from server</li>
+                    </ul>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- FILE TRANSFER                                 -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="file-transfer">
+                <div class="section-title">File Transfer</div>
+                <p class="intro">Upload, download, and manage files on the server using the XMODEM protocol.</p>
+
+                <div class="menu-block">
+                    <div class="sep">========================================</div>
+                    <div>&nbsp;&nbsp;<span class="title">FILE TRANSFER</span></div>
+                    <div class="sep">========================================</div>
+                    <br>
+                    <div>&nbsp;&nbsp;Dir: <span class="val">transfer/</span></div>
+                    <br>
+                    <div>&nbsp;&nbsp;<span class="key">U</span>&nbsp;&nbsp;<span class="label">Upload a file</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">D</span>&nbsp;&nbsp;<span class="label">Download a file</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">X</span>&nbsp;&nbsp;<span class="label">Delete a file</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">C</span>&nbsp;&nbsp;<span class="label">Change directory</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">I</span>&nbsp;&nbsp;<span class="label">IAC escaping [<span style="color:var(--red)">OFF</span>]</span></div>
+                    <br>
+                    <div>&nbsp;&nbsp;<span class="menu-dim">[R] Refresh &nbsp; [Q] Back &nbsp; [H] Help</span></div>
+                </div>
+
+                <div class="cat">Uploading a File</div>
+                <div class="instructions">
+                    <h3>Steps</h3>
+                    <ol>
+                        <li>Press <strong>U</strong> to begin an upload</li>
+                        <li>Enter the filename when prompted (max 255 characters, no path separators)</li>
+                        <li>The server waits for your terminal to begin the XMODEM transfer</li>
+                        <li>Start the XMODEM send in your terminal program</li>
+                        <li>Progress is shown as blocks are received</li>
+                    </ol>
+                </div>
+
+                <div class="cat">Downloading a File</div>
+                <div class="instructions">
+                    <h3>Steps</h3>
+                    <ol>
+                        <li>Press <strong>D</strong> to begin a download</li>
+                        <li>A numbered list of files is displayed &mdash; enter the file number</li>
+                        <li>Start the XMODEM receive in your terminal program</li>
+                        <li>The file is sent block by block</li>
+                    </ol>
+                </div>
+
+                <div class="cat">Directory Navigation</div>
+                <p class="dim-text">
+                    Press <strong>C</strong> to change directories. Subdirectories within the
+                    configured transfer directory are listed. Enter <code>..</code> to go up
+                    one level. All paths are canonicalized to prevent symlink escapes.
+                </p>
+
+                <div class="cat">XMODEM Protocol Details</div>
+                <table class="data-table">
+                    <tr><th>Parameter</th><th>Value</th></tr>
+                    <tr><td>Block size</td><td>128 bytes</td></tr>
+                    <tr><td>Error detection</td><td>CRC-16 (preferred) with checksum fallback</td></tr>
+                    <tr><td>CRC polynomial</td><td>CCITT 0x1021</td></tr>
+                    <tr><td>Maximum file size</td><td>8 MB</td></tr>
+                    <tr><td>Negotiation timeout</td><td>45 seconds (configurable, 1&ndash;300s)</td></tr>
+                    <tr><td>Block timeout</td><td>20 seconds (configurable, 1&ndash;120s)</td></tr>
+                    <tr><td>Max retries per block</td><td>10 (configurable, 1&ndash;100)</td></tr>
+                    <tr><td>Padding byte</td><td>0x1A (SUB), stripped on receive</td></tr>
+                </table>
+
+                <div class="cat">IAC Escaping</div>
+                <p class="dim-text">
+                    Telnet uses byte 0xFF (IAC &mdash; Interpret As Command) as a control
+                    character. When transferring binary files containing 0xFF bytes, the
+                    telnet protocol can misinterpret them. Toggle IAC escaping with
+                    <strong>I</strong> to enable safe binary transfers.
+                </p>
+                <div class="callout callout-warn">
+                    <strong>Warning:</strong> IAC escaping is off by default. Enable it
+                    if binary file transfers are corrupted over telnet. SSH connections
+                    do not need IAC escaping.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- GATEWAYS                                      -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="gateways">
+                <div class="section-title">SSH &amp; Telnet Gateways</div>
+
+                <div class="cat">SSH Gateway</div>
+                <p class="dim-text">
+                    Connect to remote SSH servers through XMODEM Gateway. Press
+                    <strong>S</strong> from the main menu.
+                </p>
+                <div class="instructions">
+                    <h3>Connecting</h3>
+                    <ol>
+                        <li>Enter the remote server hostname or IP address</li>
+                        <li>Enter the port (default: 22)</li>
+                        <li>Enter your username and password for the remote server</li>
+                        <li>If the host key is unknown, confirm the SHA-256 fingerprint</li>
+                        <li>You now have a full interactive shell on the remote server</li>
+                        <li>Press <strong>Esc</strong> to disconnect and return to the main menu</li>
+                    </ol>
+                </div>
+
+                <div class="callout callout-info">
+                    <strong>Host Key Verification:</strong> Known host keys are stored in
+                    <code>~/.ssh/known_hosts</code> (standard OpenSSH format). If a server's
+                    key changes, a security warning is displayed with the option to update
+                    the stored key.
+                </div>
+
+                <p class="dim-text">
+                    ANSI escape sequences from the remote server are automatically
+                    stripped when connected from a PETSCII or ASCII terminal, ensuring
+                    readable output on vintage hardware.
+                </p>
+
+                <div class="cat">Telnet Gateway</div>
+                <p class="dim-text">
+                    Connect to remote telnet servers through XMODEM Gateway. Press
+                    <strong>T</strong> from the main menu. Enter the hostname and port
+                    of the remote server. The gateway bridges your session with
+                    terminal-appropriate I/O handling.
+                </p>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- AI CHAT                                       -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="ai-chat">
+                <div class="section-title">AI Chat</div>
+                <p class="intro">Conversational AI powered by Groq's llama-3.3-70b-versatile model.</p>
+
+                <div class="cat">Setup</div>
+                <div class="instructions">
+                    <h3>Getting an API Key</h3>
+                    <ol>
+                        <li>Visit <a href="https://console.groq.com">console.groq.com</a> and create a free account</li>
+                        <li>Generate an API key from the Groq dashboard</li>
+                        <li>In XMODEM Gateway, go to <strong>Configuration &gt; Other Settings</strong></li>
+                        <li>Enter your API key when prompted</li>
+                    </ol>
+                </div>
+
+                <div class="cat">Usage</div>
+                <div class="instructions">
+                    <h3>Chatting</h3>
+                    <ol>
+                        <li>Press <strong>A</strong> from the main menu</li>
+                        <li>Type your question and press Enter</li>
+                        <li>The response is displayed with pagination</li>
+                        <li>Use <strong>P</strong>/<strong>N</strong> to page through long responses</li>
+                        <li>Ask follow-up questions or press <strong>Q</strong> to exit</li>
+                    </ol>
+                </div>
+
+                <div class="callout callout-info">
+                    <strong>Details:</strong> Responses are word-wrapped to fit your
+                    terminal width (40 columns for PETSCII, 80 for ANSI/ASCII). The API
+                    timeout is 30 seconds per request. Maximum response size is 1 MB.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- WEB BROWSER                                   -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="web-browser">
+                <div class="section-title">Simple Browser</div>
+                <p class="intro">Text-mode web browser supporting HTTP, HTTPS, and Gopher.</p>
+
+                <table class="feature-table">
+                    <tr>
+                        <td class="key-col">[G]</td>
+                        <td class="name-col">Go / Search</td>
+                        <td class="desc-col">Enter a URL or search term to navigate.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[P/N]</td>
+                        <td class="name-col">Page Nav</td>
+                        <td class="desc-col">Previous / Next page of the current document.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[T]</td>
+                        <td class="name-col">Top</td>
+                        <td class="desc-col">Jump to the top of the current page.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[E]</td>
+                        <td class="name-col">End</td>
+                        <td class="desc-col">Jump to the end of the current page.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[S]</td>
+                        <td class="name-col">Find</td>
+                        <td class="desc-col">Search within the current page.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[L]</td>
+                        <td class="name-col">Links</td>
+                        <td class="desc-col">List numbered links on the page and follow one by number.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[F]</td>
+                        <td class="name-col">Forms</td>
+                        <td class="desc-col">Interact with HTML forms (text, dropdown, checkbox, radio, textarea).</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[K]</td>
+                        <td class="name-col">Bookmarks</td>
+                        <td class="desc-col">Save and load bookmarks (up to 100, stored in bookmarks.txt).</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[B]</td>
+                        <td class="name-col">Back</td>
+                        <td class="desc-col">Navigate back through browsing history.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[H]</td>
+                        <td class="name-col">Help</td>
+                        <td class="desc-col">Display browser help.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">[Q]</td>
+                        <td class="name-col">Quit</td>
+                        <td class="desc-col">Exit the browser and return to the main menu.</td>
+                    </tr>
+                </table>
+
+                <div class="callout callout-info">
+                    <strong>Limits:</strong> Maximum response body is 1 MB. HTTP timeout
+                    is 15 seconds. Maximum rendered lines per page is 5000. Page width
+                    adapts to terminal (33 columns for PETSCII, 73+ for ANSI/ASCII). HTTPS
+                    falls back to HTTP automatically if TLS fails.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- WEATHER                                       -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="weather">
+                <div class="section-title">Weather</div>
+                <p class="intro">Current conditions and 3-day forecast for any US zip code.</p>
+
+                <p class="dim-text">
+                    Press <strong>W</strong> from the main menu. Weather data is provided by
+                    the Open-Meteo API (free, no API key required). Your last-used zip code
+                    is saved for convenience.
+                </p>
+
+                <div class="instructions">
+                    <h3>Display Includes</h3>
+                    <ul>
+                        <li><strong>Current:</strong> Temperature (&deg;F), "feels like", humidity %, wind speed and 16-point compass direction</li>
+                        <li><strong>Forecast:</strong> 3-day outlook with daily high/low temperatures and conditions</li>
+                    </ul>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- CONFIGURATION                                 -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="configuration">
+                <div class="section-title">Configuration</div>
+                <p class="intro">Press C from the main menu. Changes are saved to xmodem.conf immediately.</p>
+
+                <div class="cat">Security Settings</div>
+                <p class="dim-text">
+                    Authentication is disabled by default. When disabled, only private/loopback
+                    IPs are allowed, and gateway addresses (*.*.*.1) are rejected.
+                </p>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Description</th></tr>
+                    <tr><td>Security enabled</td><td>false</td><td>Require login authentication</td></tr>
+                    <tr><td>Telnet username</td><td><code>admin</code></td><td>Telnet login username</td></tr>
+                    <tr><td>Telnet password</td><td><code>changeme</code></td><td>Telnet login password</td></tr>
+                    <tr><td>SSH username</td><td><code>admin</code></td><td>SSH login username (independent)</td></tr>
+                    <tr><td>SSH password</td><td><code>changeme</code></td><td>SSH login password (independent)</td></tr>
+                </table>
+                <div class="callout callout-warn">
+                    <strong>Important:</strong> The default password is <code>changeme</code>.
+                    If you enable security, change the password immediately. After 3 failed
+                    login attempts from the same IP, that address is locked out for 5 minutes.
+                </div>
+
+                <div class="cat">Server Configuration</div>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Description</th></tr>
+                    <tr><td>Telnet enabled</td><td>true</td><td>Enable/disable the telnet server</td></tr>
+                    <tr><td>Telnet port</td><td>2323</td><td>TCP port for telnet connections</td></tr>
+                    <tr><td>SSH enabled</td><td>false</td><td>Enable/disable the SSH server</td></tr>
+                    <tr><td>SSH port</td><td>2222</td><td>TCP port for SSH connections</td></tr>
+                    <tr><td>Max sessions</td><td>50</td><td>Maximum concurrent connections</td></tr>
+                    <tr><td>Idle timeout</td><td>900s (15 min)</td><td>Disconnect after inactivity (0 = disabled)</td></tr>
+                </table>
+
+                <div class="cat">XMODEM Settings</div>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Range</th></tr>
+                    <tr><td>Transfer directory</td><td><code>transfer</code></td><td>&mdash;</td></tr>
+                    <tr><td>Negotiation timeout</td><td>45s</td><td>1&ndash;300 seconds</td></tr>
+                    <tr><td>Block timeout</td><td>20s</td><td>1&ndash;120 seconds</td></tr>
+                    <tr><td>Max retries</td><td>10</td><td>1&ndash;100</td></tr>
+                </table>
+
+                <div class="cat">Modem Emulator Settings</div>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Description</th></tr>
+                    <tr><td>Serial port</td><td><em>(none)</em></td><td>Device path (e.g. <code>/dev/ttyUSB0</code>, <code>COM3</code>)</td></tr>
+                    <tr><td>Baud rate</td><td>9600</td><td>Serial line speed</td></tr>
+                    <tr><td>Data bits</td><td>8</td><td>5, 6, 7, or 8</td></tr>
+                    <tr><td>Parity</td><td>None</td><td>None, Odd, or Even</td></tr>
+                    <tr><td>Stop bits</td><td>1</td><td>1 or 2</td></tr>
+                    <tr><td>Flow control</td><td>None</td><td>None, Software, or Hardware</td></tr>
+                </table>
+
+                <div class="cat">Other Settings</div>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Description</th></tr>
+                    <tr><td>Groq API key</td><td><em>(empty)</em></td><td>API key for AI Chat (free at console.groq.com)</td></tr>
+                    <tr><td>Browser homepage</td><td>http://telnetbible.com</td><td>Default URL for the Simple Browser</td></tr>
+                    <tr><td>Weather zip code</td><td><em>(empty)</em></td><td>5-digit US zip code for weather</td></tr>
+                    <tr><td>Verbose logging</td><td>false</td><td>Enable detailed XMODEM protocol logging</td></tr>
+                    <tr><td>GUI console</td><td>true</td><td>Show the GUI window on startup</td></tr>
+                </table>
+
+                <div class="cat">Configuration File</div>
+                <p class="dim-text">
+                    The file <code>xmodem.conf</code> uses a simple <code>key = value</code>
+                    format. Lines beginning with <code>#</code> are comments. The file is
+                    auto-created if missing and rewritten to ensure all keys are present.
+                </p>
+                <pre><code><span class="output-text"># XMODEM Gateway Configuration
+telnet_enabled = true
+telnet_port = 2323
+security_enabled = false
+username = admin
+password = changeme
+transfer_dir = transfer
+max_sessions = 50
+idle_timeout_secs = 900
+ssh_enabled = false
+ssh_port = 2222
+ssh_username = admin
+ssh_password = changeme
+groq_api_key =
+browser_homepage = http://telnetbible.com
+weather_zip =
+verbose = false
+enable_console = true
+serial_enabled = false
+serial_port =
+serial_baud = 9600
+serial_databits = 8
+serial_parity = none
+serial_stopbits = 1
+serial_flowcontrol = none
+xmodem_negotiation_timeout = 45
+xmodem_block_timeout = 20
+xmodem_max_retries = 10</span></code></pre>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SSH SERVER                                    -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="ssh-server">
+                <div class="section-title">SSH Server</div>
+                <p class="intro">Optional encrypted access providing the same features as the telnet interface.</p>
+
+                <table class="data-table">
+                    <tr><th>Detail</th><th>Value</th></tr>
+                    <tr><td>Default port</td><td>2222</td></tr>
+                    <tr><td>Host key algorithm</td><td>Ed25519</td></tr>
+                    <tr><td>Host key file</td><td><code>xmodem_ssh_host_key</code></td></tr>
+                    <tr><td>Key format</td><td>OpenSSH</td></tr>
+                    <tr><td>File permissions</td><td>0600 (Unix)</td></tr>
+                    <tr><td>Authentication</td><td>Password only</td></tr>
+                    <tr><td>Credentials</td><td>Independent from telnet</td></tr>
+                </table>
+
+                <p class="dim-text">
+                    The Ed25519 host key is automatically generated on first use. The SSH
+                    server has its own username and password, configured separately from
+                    the telnet credentials.
+                </p>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SERIAL MODEM                                  -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="serial-modem">
+                <div class="section-title">Serial Modem Emulator</div>
+                <p class="intro">Hayes AT-compatible modem emulation on a physical serial port.</p>
+
+                <p class="dim-text">
+                    Connect vintage computers with serial interfaces to XMODEM Gateway.
+                    The emulator accepts standard AT commands and "dials" TCP connections
+                    to remote hosts. Enable it in <strong>Configuration &gt; Modem
+                    Emulator Settings</strong>.
+                </p>
+
+                <div class="cat" id="at-commands">AT Command Reference</div>
+                <table class="data-table">
+                    <tr><th>Command</th><th>Description</th></tr>
+                    <tr><td><code>AT</code></td><td>Connection test (returns OK)</td></tr>
+                    <tr><td><code>ATZ</code></td><td>Reset to stored configuration</td></tr>
+                    <tr><td><code>AT&amp;F</code></td><td>Factory reset (restore all defaults)</td></tr>
+                    <tr><td><code>AT&amp;W</code></td><td>Save current settings to config file</td></tr>
+                    <tr><td><code>AT&amp;V</code></td><td>Display current modem configuration</td></tr>
+                    <tr><td><code>ATI</code></td><td>Display modem identification / version</td></tr>
+                    <tr><td><code>ATE0</code> / <code>ATE1</code></td><td>Disable / enable command echo</td></tr>
+                    <tr><td><code>ATV0</code> / <code>ATV1</code></td><td>Numeric / verbose result codes</td></tr>
+                    <tr><td><code>ATQ0</code> / <code>ATQ1</code></td><td>Enable / suppress result codes (quiet mode)</td></tr>
+                    <tr><td><code>ATH</code></td><td>Hang up / close connection</td></tr>
+                    <tr><td><code>ATO</code></td><td>Return to online mode (after +++ escape)</td></tr>
+                    <tr><td><code>ATA</code></td><td>Answer incoming call</td></tr>
+                    <tr><td><code>ATDT host:port</code></td><td>Dial (tone) &mdash; TCP connect to host</td></tr>
+                    <tr><td><code>ATDP host:port</code></td><td>Dial (pulse) &mdash; TCP connect to host</td></tr>
+                    <tr><td><code>ATD host:port</code></td><td>Dial (generic) &mdash; TCP connect to host</td></tr>
+                    <tr><td><code>ATDL</code></td><td>Redial last number</td></tr>
+                    <tr><td><code>AT?</code></td><td>Show AT command help</td></tr>
+                    <tr><td><code>ATS?</code></td><td>Show S-register help</td></tr>
+                    <tr><td><code>ATS<em>n</em>?</code></td><td>Query S-register <em>n</em></td></tr>
+                    <tr><td><code>ATS<em>n</em>=<em>v</em></code></td><td>Set S-register <em>n</em> to value <em>v</em></td></tr>
+                </table>
+
+                <div class="callout">
+                    <strong>Escape Sequence:</strong> While connected (online mode), send
+                    <code>+++</code> with appropriate guard time pauses to return to
+                    command mode without disconnecting. The escape character and guard time
+                    are configurable via S-registers S2 and S12. Use <code>ATO</code> to
+                    return to online mode.
+                </div>
+
+                <div class="cat" id="s-registers">S-Register Reference</div>
+                <table class="data-table">
+                    <tr><th>Reg</th><th>Default</th><th>Description</th></tr>
+                    <tr><td>S0</td><td>5</td><td>Auto-answer ring count (0 = disabled)</td></tr>
+                    <tr><td>S1</td><td>0</td><td>Ring counter (read-only)</td></tr>
+                    <tr><td>S2</td><td>43</td><td>Escape character (ASCII 43 = '+')</td></tr>
+                    <tr><td>S3</td><td>13</td><td>Carriage return character</td></tr>
+                    <tr><td>S4</td><td>10</td><td>Line feed character</td></tr>
+                    <tr><td>S5</td><td>8</td><td>Backspace character</td></tr>
+                    <tr><td>S6</td><td>2</td><td>Wait for dial tone (seconds)</td></tr>
+                    <tr><td>S7</td><td>50</td><td>Wait for carrier (seconds)</td></tr>
+                    <tr><td>S8</td><td>2</td><td>Comma pause time (seconds)</td></tr>
+                    <tr><td>S9</td><td>6</td><td>Carrier detect response (1/10 sec)</td></tr>
+                    <tr><td>S10</td><td>14</td><td>Carrier loss disconnect (1/10 sec)</td></tr>
+                    <tr><td>S11</td><td>95</td><td>DTMF tone duration (milliseconds)</td></tr>
+                    <tr><td>S12</td><td>50</td><td>Escape guard time (1/50 sec; 50 = 1 second)</td></tr>
+                </table>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- GUI CONSOLE                                   -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="gui-console">
+                <div class="section-title">GUI Console</div>
+                <p class="intro">Graphical configuration and monitoring window built with egui.</p>
+
+                <p class="dim-text">
+                    When <code>enable_console = true</code>, the GUI window opens
+                    automatically on startup. It provides a retro amber-on-dark theme
+                    with real-time server management.
+                </p>
+
+                <table class="feature-table">
+                    <tr>
+                        <td class="name-col">Configuration Editor</td>
+                        <td class="desc-col">Modify all server settings in real time with immediate save to xmodem.conf.</td>
+                    </tr>
+                    <tr>
+                        <td class="name-col">Console Output</td>
+                        <td class="desc-col">Scrolling log display (up to 2000 lines) showing connections, transfers, and server activity.</td>
+                    </tr>
+                    <tr>
+                        <td class="name-col">Serial Port Detection</td>
+                        <td class="desc-col">Automatically discovers available serial ports on the system.</td>
+                    </tr>
+                    <tr>
+                        <td class="name-col">Server Info</td>
+                        <td class="desc-col">Displays local IP addresses and active services.</td>
+                    </tr>
+                    <tr>
+                        <td class="name-col">Settings Sync</td>
+                        <td class="desc-col">Configuration changes from telnet/SSH sessions are reflected in the GUI.</td>
+                    </tr>
+                </table>
+
+                <div class="callout callout-tip">
+                    <strong>Tip:</strong> Closing the GUI window does <strong>not</strong>
+                    stop the server. It continues running in headless mode. Press
+                    <code>Ctrl-C</code> in the terminal to stop.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SECURITY                                      -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="security">
+                <div class="section-title">Security &amp; Networking</div>
+
+                <div class="cat">IP Restrictions (Security Disabled)</div>
+                <p class="dim-text">
+                    When security is disabled (the default), XMODEM Gateway restricts
+                    access to private and loopback IP ranges only:
+                </p>
+                <div class="instructions">
+                    <h3>Allowed IP Ranges</h3>
+                    <ul>
+                        <li><code>10.0.0.0/8</code> &mdash; Private (Class A)</li>
+                        <li><code>172.16.0.0/12</code> &mdash; Private (Class B)</li>
+                        <li><code>192.168.0.0/16</code> &mdash; Private (Class C)</li>
+                        <li><code>127.0.0.0/8</code> &mdash; Loopback</li>
+                        <li><code>169.254.0.0/16</code> &mdash; Link-local</li>
+                    </ul>
+                    <p style="margin-top: 8px;">Gateway addresses (*.*.*.1) are rejected except for loopback, preventing accidental exposure on network edges.</p>
+                </div>
+
+                <div class="cat">Authentication Lockout</div>
+                <table class="data-table">
+                    <tr><th>Policy</th><th>Value</th></tr>
+                    <tr><td>Max failed attempts</td><td>3 per IP address</td></tr>
+                    <tr><td>Lockout duration</td><td>5 minutes</td></tr>
+                    <tr><td>Counter reset</td><td>After lockout expires or successful login</td></tr>
+                    <tr><td>Credential comparison</td><td>Constant-time (timing attack resistant)</td></tr>
+                </table>
+
+                <div class="cat">File Path Security</div>
+                <p class="dim-text">
+                    All file operations are restricted to the configured transfer directory.
+                    Filenames are validated to prevent path traversal. Directory changes
+                    are canonicalized to prevent symlink escapes.
+                </p>
+
+                <div class="cat">Signal Handling</div>
+                <div class="instructions">
+                    <h3>Graceful Shutdown</h3>
+                    <ul>
+                        <li><strong>SIGINT</strong> (Ctrl-C) &mdash; Graceful shutdown</li>
+                        <li><strong>SIGTERM</strong> &mdash; Graceful shutdown</li>
+                        <li><strong>SIGHUP</strong> &mdash; Graceful shutdown (Unix only)</li>
+                    </ul>
+                    <p style="margin-top: 8px;">Connected sessions receive a shutdown notification before the server stops.</p>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- TROUBLESHOOTING                               -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="troubleshooting">
+                <div class="section-title">Troubleshooting</div>
+
+                <div class="cat">Terminal Detection</div>
+                <p class="dim-text">
+                    If your terminal is detected as the wrong type, the troubleshooting
+                    feature (press <strong>R</strong> from the main menu) diagnoses input
+                    issues by showing exactly what bytes your terminal sends.
+                </p>
+
+                <div class="cat">File Transfer Problems</div>
+                <table class="data-table">
+                    <tr><th>Symptom</th><th>Solution</th></tr>
+                    <tr>
+                        <td>Transfer times out before starting</td>
+                        <td>Increase negotiation timeout. Ensure your terminal program is set to XMODEM (not YMODEM/ZMODEM).</td>
+                    </tr>
+                    <tr>
+                        <td>Transfer fails partway through</td>
+                        <td>Increase block timeout and max retries. Check for noisy/slow connection.</td>
+                    </tr>
+                    <tr>
+                        <td>Binary files are corrupted</td>
+                        <td>Enable IAC escaping (<strong>I</strong> in file transfer menu). Not needed for SSH.</td>
+                    </tr>
+                    <tr>
+                        <td>File exceeds size limit</td>
+                        <td>XMODEM is limited to 8 MB. Use a different method for larger files.</td>
+                    </tr>
+                </table>
+
+                <div class="cat">Connection Problems</div>
+                <table class="data-table">
+                    <tr><th>Symptom</th><th>Solution</th></tr>
+                    <tr>
+                        <td>"Connection refused" from non-private IP</td>
+                        <td>Enable security for public IP access, or connect from a private network.</td>
+                    </tr>
+                    <tr>
+                        <td>Locked out after failed logins</td>
+                        <td>Wait 5 minutes for the lockout to expire.</td>
+                    </tr>
+                    <tr>
+                        <td>Disconnected unexpectedly</td>
+                        <td>Check idle timeout setting. Set to 0 to disable auto-disconnect.</td>
+                    </tr>
+                    <tr>
+                        <td>AI Chat: "No API key configured"</td>
+                        <td>Set up a Groq API key in Configuration &gt; Other Settings.</td>
+                    </tr>
+                </table>
+
+                <div class="cat">Verbose Logging</div>
+                <p class="dim-text">
+                    Enable verbose mode in <strong>Configuration &gt; Other Settings</strong>
+                    to see detailed XMODEM protocol diagnostics. Useful for debugging
+                    file transfer issues.
+                </p>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- AUTHOR                                        -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="author">
+                <div class="section-title">About the Author</div>
+
+                <div class="author-block">
+                    <img src="ricky.png" alt="Ricky Bryce">
+                    <div class="author-info">
+                        <h3>Ricky Bryce</h3>
+                        <p>
+                            Creator and sole developer of XMODEM Gateway. A lifelong
+                            enthusiast of retrocomputing and telecommunications, Ricky
+                            built this project to bridge the gap between vintage hardware
+                            and modern network services.
+                        </p>
+                        <p>
+                            XMODEM Gateway is released under the
+                            <strong style="color: var(--green);">GNU General Public License v3.0</strong>
+                            (or later).
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SCREENSHOT                                    -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="screenshot">
+                <div class="section-title">Screenshot</div>
+                <p class="intro">The XMODEM Gateway GUI console in action.</p>
+                <div style="text-align: center; margin-top: 16px;">
+                    <img src="screenshot.png" alt="XMODEM Gateway GUI Console" style="max-width: 100%; height: auto; border: 1px solid var(--cyan); box-shadow: 0 0 12px rgba(0, 255, 255, 0.3);">
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ══════════════════════════════════════════════════ -->
+        <!-- FOOTER                                            -->
+        <!-- ══════════════════════════════════════════════════ -->
+        <footer class="site-footer">
+            XMODEM Gateway v0.3.1 &mdash; &copy; 2025 Ricky Bryce &mdash;
+            Licensed under GPL-3.0-or-later
+        </footer>
+
+    </div>
+</body>
+</html>
