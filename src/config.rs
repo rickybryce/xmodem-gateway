@@ -74,6 +74,11 @@ const DEFAULT_SSH_ENABLED: bool = false;
 const DEFAULT_SSH_PORT: u16 = 2222;
 const DEFAULT_SSH_USERNAME: &str = "admin";
 const DEFAULT_SSH_PASSWORD: &str = "changeme";
+/// Default SSH-gateway authentication mode: "key" uses the gateway's
+/// auto-generated Ed25519 client key; "password" prompts the operator
+/// for a remote password on each connect.  Pubkey is the modern default
+/// because the gateway ships a client key out of the box.
+const DEFAULT_SSH_GATEWAY_AUTH: &str = "key";
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +161,11 @@ pub struct Config {
     pub ssh_username: String,
     /// SSH login password (independent of telnet credentials).
     pub ssh_password: String,
+    /// Authentication mode used when the operator connects to a remote
+    /// SSH server through the outbound SSH Gateway.  Accepted values:
+    /// "key" (uses the gateway's auto-generated Ed25519 client key) or
+    /// "password" (prompts for the remote password each time).
+    pub ssh_gateway_auth: String,
 }
 
 impl Default for Config {
@@ -204,6 +214,7 @@ impl Default for Config {
             ssh_port: DEFAULT_SSH_PORT,
             ssh_username: DEFAULT_SSH_USERNAME.into(),
             ssh_password: DEFAULT_SSH_PASSWORD.into(),
+            ssh_gateway_auth: DEFAULT_SSH_GATEWAY_AUTH.into(),
         }
     }
 }
@@ -433,6 +444,11 @@ fn read_config_file(path: &str) -> Config {
             .filter(|v| !v.is_empty())
             .cloned()
             .unwrap_or_else(|| DEFAULT_SSH_PASSWORD.into()),
+        ssh_gateway_auth: map
+            .get("ssh_gateway_auth")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| matches!(v.as_str(), "key" | "password"))
+            .unwrap_or_else(|| DEFAULT_SSH_GATEWAY_AUTH.into()),
     }
 }
 
@@ -574,6 +590,15 @@ ssh_port = {}
 # SSH credentials (independent of telnet credentials)
 ssh_username = {}
 ssh_password = {}
+
+# Authentication mode for the OUTBOUND SSH Gateway (the menu item that
+# proxies to a remote SSH server).  Values:
+#   key      — use the gateway's built-in Ed25519 client key.  Copy the
+#              public half (printed by `cat gateway_client_key.pub`) into
+#              the remote's ~/.ssh/authorized_keys first.
+#   password — prompt the operator for the remote account's password on
+#              each connect.  No key is offered.
+ssh_gateway_auth = {}
 ",
         cfg.telnet_enabled,
         cfg.telnet_port,
@@ -616,6 +641,7 @@ ssh_password = {}
         cfg.ssh_port,
         sanitize_value(&cfg.ssh_username),
         sanitize_value(&cfg.ssh_password),
+        sanitize_value(&cfg.ssh_gateway_auth),
     );
 
     // Write to a per-PID temporary file and rename into place.  The PID
@@ -778,6 +804,12 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
         }
         "ssh_username" => cfg.ssh_username = value.to_string(),
         "ssh_password" => cfg.ssh_password = value.to_string(),
+        "ssh_gateway_auth" => {
+            let lower = value.trim().to_ascii_lowercase();
+            if matches!(lower.as_str(), "key" | "password") {
+                cfg.ssh_gateway_auth = lower;
+            }
+        }
         _ => {}
     }
 }
@@ -1122,6 +1154,7 @@ mod tests {
             ssh_port: 2222,
             ssh_username: "sshuser".into(),
             ssh_password: "sshpass".into(),
+            ssh_gateway_auth: "password".into(),
         };
         write_config_file(path.to_str().unwrap(), &original);
         let loaded = read_config_file(path.to_str().unwrap());
@@ -1167,6 +1200,7 @@ mod tests {
         assert_eq!(loaded.ssh_port, original.ssh_port);
         assert_eq!(loaded.ssh_username, original.ssh_username);
         assert_eq!(loaded.ssh_password, original.ssh_password);
+        assert_eq!(loaded.ssh_gateway_auth, original.ssh_gateway_auth);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

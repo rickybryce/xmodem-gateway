@@ -252,18 +252,81 @@ impl App {
         });
     }
 
-    /// Render the Server frame's advanced options (telnet gateway
-    /// negotiation/raw mode).  Shown only in the popup.
+    /// Render the Server frame's advanced options — outbound Telnet and
+    /// SSH gateway mode choices.  Shown only in the popup.  These are
+    /// persisted server-wide so the gateway menus no longer prompt the
+    /// operator for mode/auth on every connect.
     fn draw_server_advanced(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Telnet Gateway").strong().color(AMBER));
-        ui.checkbox(
-            &mut self.cfg.telnet_gateway_negotiate,
-            "Negotiate TTYPE / NAWS with remote",
-        );
-        ui.checkbox(
-            &mut self.cfg.telnet_gateway_raw,
-            "Raw TCP mode (disable telnet IAC)",
-        );
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            let current = if self.cfg.telnet_gateway_raw {
+                "Raw TCP"
+            } else {
+                "Telnet"
+            };
+            egui::ComboBox::from_id_salt("telnet_gateway_mode")
+                .width(120.0)
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.cfg.telnet_gateway_raw, false, "Telnet");
+                    ui.selectable_value(&mut self.cfg.telnet_gateway_raw, true, "Raw TCP");
+                });
+        });
+        ui.add_enabled_ui(!self.cfg.telnet_gateway_raw, |ui| {
+            ui.checkbox(
+                &mut self.cfg.telnet_gateway_negotiate,
+                "Negotiate TTYPE / NAWS with remote (Telnet mode only)",
+            );
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("SSH Gateway").strong().color(AMBER));
+        ui.horizontal(|ui| {
+            ui.label("Auth:");
+            let display = match self.cfg.ssh_gateway_auth.as_str() {
+                "password" => "Password",
+                _ => "Key",
+            };
+            egui::ComboBox::from_id_salt("ssh_gateway_auth")
+                .width(120.0)
+                .selected_text(display)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.cfg.ssh_gateway_auth,
+                        "key".to_string(),
+                        "Key",
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg.ssh_gateway_auth,
+                        "password".to_string(),
+                        "Password",
+                    );
+                });
+        });
+        if self.cfg.ssh_gateway_auth != "password" {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "Gateway public key (paste into remote ~/.ssh/authorized_keys):",
+                )
+                .italics()
+                .small(),
+            );
+            let pubkey = match crate::ssh::client_public_key_openssh() {
+                Ok(s) => s,
+                Err(e) => format!("<could not load key: {}>", e),
+            };
+            let mut key_display = pubkey;
+            ui.add(
+                egui::TextEdit::multiline(&mut key_display)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .interactive(true),
+            );
+        }
     }
 
     /// Render the Serial Modem frame's primary field rows (port, baud,

@@ -3475,7 +3475,7 @@ impl TelnetSession {
         let is_petscii = self.terminal_type == TerminalType::Petscii;
         let esc_label = if is_petscii { "<-" } else { "ESC" };
 
-        self.send_line("").await?;
+        self.clear_screen().await?;
         let sep = self.separator();
         self.send_line(&sep).await?;
         self.send_line(&format!("  {}", self.yellow("SELECT PROTOCOL")))
@@ -3990,54 +3990,6 @@ impl TelnetSession {
     /// Gateway timeout for SSH connection attempts.
     const GATEWAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    /// Gather gateway connection details from the user (host, port, username, password).
-    /// Returns None if the user cancelled (ESC or empty input).
-    /// Display the outgoing-SSH gateway's public key (OpenSSH format) so
-    /// the operator can paste it into a remote server's
-    /// `~/.ssh/authorized_keys`.  Waits for a keypress before returning.
-    async fn show_gateway_public_key(&mut self) -> Result<(), std::io::Error> {
-        self.send_line("").await?;
-        let sep = self.separator();
-        self.send_line(&sep).await?;
-        self.send_line(&format!(
-            "  {}",
-            self.yellow("Gateway Public Key")
-        ))
-        .await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-        self.send_line(
-            "  Copy the line below into the remote server's",
-        )
-        .await?;
-        self.send_line(
-            "  ~/.ssh/authorized_keys to enable passwordless",
-        )
-        .await?;
-        self.send_line("  SSH login from this gateway.").await?;
-        self.send_line("").await?;
-        match crate::ssh::client_public_key_openssh() {
-            Ok(pub_line) => {
-                self.send_line(&format!("  {}", self.cyan(&pub_line)))
-                    .await?;
-            }
-            Err(e) => {
-                self.show_error(&format!(
-                    "Could not load/generate gateway key: {}",
-                    e,
-                ))
-                .await?;
-                return Ok(());
-            }
-        }
-        self.send_line("").await?;
-        self.send("  Press any key to continue.").await?;
-        self.flush().await?;
-        self.wait_for_key().await?;
-        self.send_line("").await?;
-        Ok(())
-    }
-
     /// Prompt for the remote SSH host, port, and username.  Password is
     /// collected separately (`gateway_password_prompt`) so we can skip
     /// it entirely when public-key authentication succeeds.
@@ -4117,35 +4069,13 @@ impl TelnetSession {
             self.cyan(esc_label)
         ))
         .await?;
+        let auth_label = if cfg.ssh_gateway_auth == "password" {
+            self.yellow("password")
+        } else {
+            self.green("gateway key")
+        };
+        self.send_line(&format!("  Auth: {}", auth_label)).await?;
         self.send_line("").await?;
-
-        // Offer a quick prompt to display the gateway's public key so the
-        // operator can copy it into a remote server's authorized_keys.
-        // Pressing K shows the key and returns to this menu; any other
-        // key proceeds to the host prompt.
-        let is_petscii = self.terminal_type == TerminalType::Petscii;
-        loop {
-            self.send(&format!(
-                "  Press {} to show gateway public key, any other key to connect: ",
-                self.cyan("K"),
-            ))
-            .await?;
-            self.flush().await?;
-            let b = match self.read_byte_filtered().await? {
-                Some(b) => b,
-                None => return Ok(()),
-            };
-            self.send_line("").await?;
-            if is_esc_key(b, is_petscii) {
-                return Ok(());
-            }
-            let ch = if is_petscii { petscii_to_ascii_byte(b) } else { b };
-            if ch == b'k' || ch == b'K' {
-                self.show_gateway_public_key().await?;
-                continue;
-            }
-            break;
-        }
 
         let (host, port, username) = if idle_timeout.is_zero() {
             match self.gateway_host_prompts().await {
@@ -4359,67 +4289,15 @@ impl TelnetSession {
             }
         }
 
-        // Authenticate: try pubkey first, fall back to password.  The
-        // gateway's own Ed25519 client key is auto-generated on first
-        // use; the operator copies its public half to any remote's
-        // `~/.ssh/authorized_keys` they want the gateway to reach.
+        // Authenticate using the configured mode.  The server-config
+        // `ssh_gateway_auth` key dictates the method: "key" uses the
+        // gateway's own auto-generated Ed25519 client key (copy the
+        // public half printed by `cat gateway_client_key.pub` into the
+        // remote's `~/.ssh/authorized_keys` first); "password" prompts
+        // the operator each time.  No silent fallback — the remote sees
+        // exactly one auth method, so failures are unambiguous.
         let mut authed = false;
-        match crate::ssh::load_or_generate_client_key() {
-            Ok(key) => {
-                // best_supported_rsa_hash returns Result<Option<Option<HashAlg>>>:
-                //   outer Option = "server doesn't specify a preference",
-                //   inner Option = "preference is 'no hash' (i.e., not RSA)".
-                // Two flattens collapse both to Option<HashAlg>, which is
-                // what PrivateKeyWithHashAlg::new expects.
-                let hash_alg = session
-                    .best_supported_rsa_hash()
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-                match session
-                    .authenticate_publickey(
-                        &username,
-                        russh::keys::PrivateKeyWithHashAlg::new(
-                            std::sync::Arc::new(key),
-                            hash_alg,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(russh::client::AuthResult::Success) => {
-                        authed = true;
-                        glog!(
-                            "SSH gateway: authenticated to {}:{} as {} via pubkey",
-                            host, port, username,
-                        );
-                        self.send_line(&format!(
-                            "  {}",
-                            self.green("Authenticated (gateway key).")
-                        ))
-                        .await?;
-                    }
-                    Ok(russh::client::AuthResult::Failure { .. }) => {
-                        // Pubkey rejected by remote; password fallback.
-                    }
-                    Err(e) => {
-                        glog!("SSH gateway: pubkey auth error: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                glog!("SSH gateway: client key unavailable: {}", e);
-            }
-        }
-        if !authed {
-            // Pubkey auth did not succeed (either we had no key, the key
-            // wasn't accepted, or there was a transport-level error).
-            // Prompt for a password now and try password auth.
-            self.send_line(&format!(
-                "  {}",
-                self.yellow("Pubkey not accepted — password required."),
-            ))
-            .await?;
+        if cfg.ssh_gateway_auth == "password" {
             let password = if idle_timeout.is_zero() {
                 match self.gateway_password_prompt().await {
                     Ok(Some(p)) => p,
@@ -4487,12 +4365,68 @@ impl TelnetSession {
                     return Ok(());
                 }
             }
+        } else {
+            // "key" mode — gateway's Ed25519 client key, no password fallback.
+            match crate::ssh::load_or_generate_client_key() {
+                Ok(key) => {
+                    // best_supported_rsa_hash returns Result<Option<Option<HashAlg>>>:
+                    //   outer Option = "server doesn't specify a preference",
+                    //   inner Option = "preference is 'no hash' (i.e., not RSA)".
+                    // Two flattens collapse both to Option<HashAlg>.
+                    let hash_alg = session
+                        .best_supported_rsa_hash()
+                        .await
+                        .ok()
+                        .flatten()
+                        .flatten();
+                    match session
+                        .authenticate_publickey(
+                            &username,
+                            russh::keys::PrivateKeyWithHashAlg::new(
+                                std::sync::Arc::new(key),
+                                hash_alg,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(russh::client::AuthResult::Success) => {
+                            authed = true;
+                            glog!(
+                                "SSH gateway: authenticated to {}:{} as {} via pubkey",
+                                host, port, username,
+                            );
+                            self.send_line(&format!(
+                                "  {}",
+                                self.green("Authenticated (gateway key).")
+                            ))
+                            .await?;
+                        }
+                        Ok(russh::client::AuthResult::Failure { .. }) => {}
+                        Err(e) => {
+                            glog!("SSH gateway: pubkey auth error: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    glog!("SSH gateway: client key unavailable: {}", e);
+                }
+            }
         }
         if !authed {
             let _ = session
                 .disconnect(russh::Disconnect::ByApplication, "auth failed", "")
                 .await;
-            self.show_error("Authentication failed.").await?;
+            if cfg.ssh_gateway_auth == "password" {
+                self.show_error("Authentication failed.").await?;
+            } else {
+                self.show_error(
+                    "Key authentication failed. Copy the gateway public key \
+                     (cat gateway_client_key.pub) to the remote's \
+                     ~/.ssh/authorized_keys, or switch to Password mode in \
+                     Server > More.",
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -4679,55 +4613,13 @@ impl TelnetSession {
             self.cyan(esc_label)
         ))
         .await?;
+        let mode_label = if cfg.telnet_gateway_raw {
+            self.red("Raw TCP (no IAC parsing)")
+        } else {
+            self.green("Telnet protocol")
+        };
+        self.send_line(&format!("  Mode: {}", mode_label)).await?;
         self.send_line("").await?;
-
-        // Protocol-mode prompt: let the user toggle the raw-TCP escape
-        // hatch before dialing.  Any change is persisted to xmodem.conf.
-        let is_petscii = self.terminal_type == TerminalType::Petscii;
-        loop {
-            let cfg_now = config::get_config();
-            let mode_label = if cfg_now.telnet_gateway_raw {
-                self.red("Raw TCP (no IAC parsing)")
-            } else {
-                self.green("Telnet protocol")
-            };
-            self.send_line(&format!("  Mode: {}", mode_label)).await?;
-            self.send(&format!(
-                "  Press {} to toggle mode, any other key to continue: ",
-                self.cyan("T"),
-            ))
-            .await?;
-            self.flush().await?;
-            let b = match self.read_byte_filtered().await? {
-                Some(b) => b,
-                None => return Ok(()),
-            };
-            self.send_line("").await?;
-            if is_esc_key(b, is_petscii) {
-                return Ok(());
-            }
-            let ch = if is_petscii { petscii_to_ascii_byte(b) } else { b };
-            if ch == b't' || ch == b'T' {
-                let new_raw = !cfg_now.telnet_gateway_raw;
-                config::update_config_values(&[(
-                    "telnet_gateway_raw",
-                    if new_raw { "true" } else { "false" },
-                )]);
-                self.send_line(&format!(
-                    "  Mode set to {}.",
-                    if new_raw {
-                        self.red("Raw TCP")
-                    } else {
-                        self.green("Telnet protocol")
-                    },
-                ))
-                .await?;
-                self.send_line("").await?;
-                continue;
-            }
-            self.send_line("").await?;
-            break;
-        }
 
         // Gather host and port
         let get_host_port = async {
