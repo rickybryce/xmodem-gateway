@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e4f1e65e26d228385abf29536430b843faf04ed9abeb7db1a174c25e1d604194 # shrinks to ops = [RecvDo(7), LocalEnable(7)]
+cc 76d4453e5e413b0eef75566cdd290c0c7d35972a9a613baf6c9edd3cb2a0506a # shrinks to ops = [LocalEnable(13), LocalDisable(13), RecvDo(13), LocalEnable(13), RecvDo(13)]

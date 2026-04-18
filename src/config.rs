@@ -443,9 +443,14 @@ fn sanitize_value(s: &str) -> String {
 
 /// Save a full `Config` to disk and update the global singleton.
 /// Used by the GUI save button.
+///
+/// Holds the `CONFIG` mutex across the write so that a concurrent
+/// `update_config_values` (from a session-side toggle, e.g. the Telnet
+/// Gateway's raw-mode toggle) can't race and clobber our write with its
+/// own re-read-then-write.
 pub fn save_config(cfg: &Config) {
-    write_config_file(CONFIG_FILE, cfg);
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    write_config_file(CONFIG_FILE, cfg);
     *guard = Some(cfg.clone());
 }
 
@@ -613,12 +618,13 @@ ssh_password = {}
         sanitize_value(&cfg.ssh_password),
     );
 
-    // Write to a temporary file and rename into place to prevent partial
-    // writes if the process is interrupted or multiple sessions write concurrently.
-    let tmp = format!("{}.tmp", path);
+    // Write to a per-PID temporary file and rename into place.  The PID
+    // suffix avoids clobbering another instance's tmp file in the same
+    // working directory and closes a small TOCTOU window against
+    // symlink tricks on a shared path.
+    let tmp = format!("{}.{}.tmp", path, std::process::id());
     if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, path)) {
         glog!("Warning: could not write {}: {}", path, e);
-        // Clean up the temp file if rename failed
         let _ = std::fs::remove_file(&tmp);
     }
 }

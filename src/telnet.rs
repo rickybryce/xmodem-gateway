@@ -41,6 +41,15 @@ const DONT: u8 = 0xFE;
 /// ASCII NAK (Ctrl-U), the conventional line-kill key on Unix.
 const LINE_ERASE_BYTE: u8 = 0x15;
 
+/// Maximum subnegotiation body size.  A remote peer could in theory send
+/// an arbitrarily large `IAC SB <opt> ... IAC SE` payload and drive our
+/// memory use unbounded before the terminating `IAC SE` arrived.  Real
+/// telnet subnegotiations (TTYPE, NAWS, NEW-ENVIRON) are at most a few
+/// hundred bytes; 8 KiB is a comfortable overestimate.  Bytes beyond
+/// this cap are dropped but the state machine keeps scanning for
+/// `IAC SE` so it doesn't desync.
+const MAX_SB_BODY_BYTES: usize = 8192;
+
 // Telnet options
 const OPT_ECHO: u8 = 0x01;
 const OPT_SGA: u8 = 0x03;
@@ -123,9 +132,14 @@ impl Menu {
 }
 
 // ─── Auth lockout ───────────────────────────────────────────
-type LockoutMap = Arc<Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>>;
+//
+// The same `LockoutMap` is shared between the telnet server and the SSH
+// server so that a brute-force attacker cannot simply bounce between
+// protocols to reset their counter.  A single successful auth on either
+// protocol clears the lockout for that IP.
+pub(crate) type LockoutMap = Arc<Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>>;
 
-fn is_locked_out(lockouts: &LockoutMap, ip: IpAddr) -> bool {
+pub(crate) fn is_locked_out(lockouts: &LockoutMap, ip: IpAddr) -> bool {
     let map = lockouts.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((count, when)) = map.get(&ip) {
         *count >= MAX_AUTH_ATTEMPTS && when.elapsed() < LOCKOUT_DURATION
@@ -134,7 +148,7 @@ fn is_locked_out(lockouts: &LockoutMap, ip: IpAddr) -> bool {
     }
 }
 
-fn record_auth_failure(lockouts: &LockoutMap, ip: IpAddr) -> u32 {
+pub(crate) fn record_auth_failure(lockouts: &LockoutMap, ip: IpAddr) -> u32 {
     let mut map = lockouts.lock().unwrap_or_else(|e| e.into_inner());
     let entry = map
         .entry(ip)
@@ -162,10 +176,14 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn clear_lockout(lockouts: &LockoutMap, ip: IpAddr) {
+pub(crate) fn clear_lockout(lockouts: &LockoutMap, ip: IpAddr) {
     let mut map = lockouts.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&ip);
 }
+
+/// Constant used by callers that need to reference the lockout attempt
+/// ceiling when constructing their own user-visible messages.
+pub(crate) const AUTH_MAX_ATTEMPTS: u32 = MAX_AUTH_ATTEMPTS;
 
 /// Check an IPv4 address against private/loopback/link-local ranges and the
 /// gateway (.1) restriction. Returns the rejection reason, or None if allowed.
@@ -453,7 +471,11 @@ async fn read_gateway_event(
                     Err(e) => return Err(e),
                 }
                 let opt = buf[0];
-                // Read body until IAC SE, unescaping IAC IAC → single IAC.
+                // Read body until IAC SE, unescaping IAC IAC → single
+                // IAC.  Cap accumulated size so a malicious peer cannot
+                // drive memory unbounded by sending a giant SB without
+                // a terminating IAC SE; bytes past the cap are dropped
+                // but the loop still scans for IAC SE to stay in sync.
                 let mut body: Vec<u8> = Vec::new();
                 let mut in_iac = false;
                 loop {
@@ -467,14 +489,16 @@ async fn read_gateway_event(
                         if b == SE {
                             break;
                         } else if b == IAC {
-                            body.push(IAC);
+                            if body.len() < MAX_SB_BODY_BYTES {
+                                body.push(IAC);
+                            }
                             in_iac = false;
                         } else {
                             in_iac = false;
                         }
                     } else if b == IAC {
                         in_iac = true;
-                    } else {
+                    } else if body.len() < MAX_SB_BODY_BYTES {
                         body.push(b);
                     }
                 }
@@ -765,9 +789,11 @@ impl GatewayTelnetIac {
             GatewayIacState::InSb => {
                 if byte == IAC {
                     self.state = GatewayIacState::InSbIac;
-                } else {
+                } else if self.sb_body.len() < MAX_SB_BODY_BYTES {
                     self.sb_body.push(byte);
                 }
+                // Bytes beyond MAX_SB_BODY_BYTES are dropped; we stay in
+                // InSb so an eventual IAC SE still terminates the SB.
             }
             GatewayIacState::InSbIac => {
                 match byte {
@@ -776,8 +802,11 @@ impl GatewayTelnetIac {
                         self.state = GatewayIacState::Normal;
                     }
                     IAC => {
-                        // Escaped IAC inside SB — keep as single 0xFF.
-                        self.sb_body.push(IAC);
+                        // Escaped IAC inside SB — keep as single 0xFF
+                        // (subject to the body-size cap).
+                        if self.sb_body.len() < MAX_SB_BODY_BYTES {
+                            self.sb_body.push(IAC);
+                        }
                         self.state = GatewayIacState::InSb;
                     }
                     _ => {
@@ -815,8 +844,11 @@ impl GatewayTelnetIac {
             }
             OptState::WantYesOpposite => {
                 // Peer acked our original DO, but we've since changed to
-                // wanting No; send DONT and enter WantNo.
+                // wanting No; send DONT and enter WantNo.  Mark the
+                // refusal so a misbehaving peer that re-sends WILL from
+                // the subsequent WantNo state doesn't get a duplicate.
                 self.him_state[idx] = OptState::WantNo;
+                self.sent_dont[idx] = true;
                 replies.extend_from_slice(&[IAC, DONT, opt]);
             }
             OptState::WantNo => {
@@ -830,8 +862,11 @@ impl GatewayTelnetIac {
                 }
             }
             OptState::WantNoOpposite => {
-                // Error but harmless: we wanted Yes again anyway.
+                // Error but harmless: we wanted Yes again anyway.  The
+                // stale DONT we sent on the way in is now contradicted
+                // by our accepting Yes — clear the refusal flag.
                 self.him_state[idx] = OptState::Yes;
+                self.sent_dont[idx] = false;
             }
         }
     }
@@ -897,8 +932,11 @@ impl GatewayTelnetIac {
                 }
             }
             OptState::WantYesOpposite => {
-                // Peer acked our WILL but we want No; send WONT.
+                // Peer acked our WILL but we want No; send WONT.  Mark
+                // the refusal so a misbehaving peer that re-sends DO
+                // from the subsequent WantNo state doesn't get a dup.
                 self.us_state[idx] = OptState::WantNo;
+                self.sent_wont[idx] = true;
                 replies.extend_from_slice(&[IAC, WONT, opt]);
             }
             OptState::WantNo => {
@@ -910,8 +948,11 @@ impl GatewayTelnetIac {
                 }
             }
             OptState::WantNoOpposite => {
-                // Error but harmless — we wanted Yes.
+                // Error but harmless — we wanted Yes.  The stale WONT
+                // we sent on the way in is contradicted by accepting
+                // Yes; clear the refusal flag.
                 self.us_state[idx] = OptState::Yes;
+                self.sent_wont[idx] = false;
                 if opt == OPT_NAWS {
                     self.emit_naws_sb(replies);
                 }
@@ -1218,6 +1259,19 @@ fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
     content.push_str(&entry);
     if let Err(e) = atomic_write(GATEWAY_HOSTS_FILE, &content) {
         glog!("Warning: could not save gateway host key: {}", e);
+        return;
+    }
+    // Restrict mode to owner-only.  The stored host public keys are
+    // themselves public, but the file also exposes the dial history
+    // (which hosts the operator has connected to) — a meaningful
+    // privacy signal that other local users shouldn't have.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            GATEWAY_HOSTS_FILE,
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
 }
 
@@ -3942,6 +3996,13 @@ impl TelnetSession {
                         return Ok(());
                     }
                     save_known_host(&host, port, key);
+                    glog!(
+                        "SSH gateway: TOFU-accepted host key for {}:{} ({} {})",
+                        host,
+                        port,
+                        key.algorithm(),
+                        key.fingerprint(russh::keys::HashAlg::Sha256),
+                    );
                     self.send_line(&format!(
                         "  {}",
                         self.green("Host key saved.")
@@ -3991,12 +4052,26 @@ impl TelnetSession {
                     self.send_line("").await?;
                     if answer == b'y' || answer == b'Y' {
                         save_known_host(&host, port, key);
+                        glog!(
+                            "SSH gateway: operator UPDATED changed host key for {}:{} (new {} {})",
+                            host,
+                            port,
+                            key.algorithm(),
+                            key.fingerprint(russh::keys::HashAlg::Sha256),
+                        );
                         self.send_line(&format!(
                             "  {}",
                             self.green("Host key updated.")
                         ))
                         .await?;
                     } else {
+                        glog!(
+                            "SSH gateway: operator REJECTED changed host key for {}:{} (presented {} {})",
+                            host,
+                            port,
+                            key.algorithm(),
+                            key.fingerprint(russh::keys::HashAlg::Sha256),
+                        );
                         let _ = session
                             .disconnect(russh::Disconnect::ByApplication, "host key rejected", "")
                             .await;
@@ -8180,7 +8255,13 @@ impl TelnetSession {
 // ─── Server startup ─────────────────────────────────────────
 
 /// Start the telnet server accept loop.
-pub fn start_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: SessionWriters) {
+pub fn start_server(
+    shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    session_writers: SessionWriters,
+    lockouts: LockoutMap,
+) {
     let cfg = config::get_config();
     if !cfg.telnet_enabled {
         return;
@@ -8200,8 +8281,6 @@ pub fn start_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdow
         glog!("Telnet server listening on port {}", port);
 
         let session_count = Arc::new(AtomicUsize::new(0));
-        let lockouts: LockoutMap =
-            Arc::new(Mutex::new(HashMap::new()));
 
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -10955,6 +11034,42 @@ mod tests {
     }
 
     #[test]
+    fn test_gateway_iac_sb_body_capped_against_oom() {
+        // A malicious remote sending a huge SB body must not make us
+        // allocate unbounded memory.  After processing a 1 MiB body
+        // followed by IAC SE, the parser must terminate cleanly and
+        // the internal sb_body must be at most MAX_SB_BODY_BYTES.
+        let mut iac = reactive_iac();
+        let mut data = Vec::new();
+        let mut replies = Vec::new();
+        iac.feed(IAC, &mut data, &mut replies);
+        iac.feed(SB, &mut data, &mut replies);
+        iac.feed(OPT_TTYPE, &mut data, &mut replies);
+        for _ in 0..(1024 * 1024) {
+            iac.feed(b'A', &mut data, &mut replies);
+        }
+        iac.feed(IAC, &mut data, &mut replies);
+        iac.feed(SE, &mut data, &mut replies);
+        iac.feed(b'Q', &mut data, &mut replies);
+        assert!(
+            iac.sb_body.len() <= MAX_SB_BODY_BYTES,
+            "sb_body grew to {} bytes (cap is {})",
+            iac.sb_body.len(),
+            MAX_SB_BODY_BYTES
+        );
+        assert_eq!(
+            iac.state,
+            GatewayIacState::Normal,
+            "parser should resync to Normal after huge SB"
+        );
+        assert_eq!(
+            data.last().copied(),
+            Some(b'Q'),
+            "post-SB data byte should pass through"
+        );
+    }
+
+    #[test]
     fn test_gateway_iac_malformed_sb_resyncs_on_iac_se() {
         let mut iac = reactive_iac();
         // IAC inside SB followed by an unexpected byte (not SE, not IAC).
@@ -11305,24 +11420,33 @@ mod tests {
         fn check_structural_invariants(iac: &GatewayTelnetIac) {
             for opt in 0u8..=255 {
                 let idx = opt as usize;
-                // Refusal flags only make sense when the side stays at No.
-                // (If a future code path drives him/us into Yes via an
-                // independent route after a refusal was sent, we'd need
-                // to clear the refusal flag first.)
+                // Refusal flags track "we've sent DONT/WONT and have not
+                // yet contradicted it."  Legitimate states where the flag
+                // may be set are the No-side of the machine:
+                //   sent_dont[opt] ∈ {No, WantNo, WantNoOpposite}
+                //   sent_wont[opt] ∈ {No, WantNo, WantNoOpposite}
+                // Yes-side states mean we've emitted an accepting DO/WILL
+                // and must have cleared the flag at that point.
+                let him_ok = matches!(
+                    iac.him_state[idx],
+                    OptState::No | OptState::WantNo | OptState::WantNoOpposite,
+                );
                 if iac.sent_dont[idx] {
-                    assert_eq!(
-                        iac.him_state[idx],
-                        OptState::No,
-                        "sent_dont[{}] is set but him_state is {:?}",
+                    assert!(
+                        him_ok,
+                        "sent_dont[{}] set but him_state is {:?} (yes-side)",
                         opt,
                         iac.him_state[idx],
                     );
                 }
+                let us_ok = matches!(
+                    iac.us_state[idx],
+                    OptState::No | OptState::WantNo | OptState::WantNoOpposite,
+                );
                 if iac.sent_wont[idx] {
-                    assert_eq!(
-                        iac.us_state[idx],
-                        OptState::No,
-                        "sent_wont[{}] is set but us_state is {:?}",
+                    assert!(
+                        us_ok,
+                        "sent_wont[{}] set but us_state is {:?} (yes-side)",
                         opt,
                         iac.us_state[idx],
                     );
@@ -11452,6 +11576,70 @@ mod tests {
         iac.feed(OPT_SGA, &mut Vec::new(), &mut replies);
         assert_eq!(iac.us_state[idx], OptState::WantNo);
         assert_eq!(replies, vec![IAC, WONT, OPT_SGA]);
+        assert!(
+            iac.sent_wont[idx],
+            "refusal flag must be set so a re-sent DO doesn't produce a duplicate WONT"
+        );
+    }
+
+    #[test]
+    fn test_qmethod_no_duplicate_wont_when_peer_re_sends_do() {
+        // Regression: from WantYesOpposite, peer DO transitions us to
+        // WantNo + WONT.  If peer (misbehaving) sends DO again, the
+        // WantNo handler must see sent_wont already and skip the dup.
+        let mut iac = reactive_iac();
+        let idx = OPT_SGA as usize;
+        iac.us_state[idx] = OptState::WantYesOpposite;
+        let mut replies = Vec::new();
+        // First DO: WantYesOpposite → WantNo with WONT.
+        iac.feed(IAC, &mut Vec::new(), &mut replies);
+        iac.feed(DO, &mut Vec::new(), &mut replies);
+        iac.feed(OPT_SGA, &mut Vec::new(), &mut replies);
+        let count_first = replies
+            .windows(3)
+            .filter(|w| *w == [IAC, WONT, OPT_SGA])
+            .count();
+        assert_eq!(count_first, 1);
+        // Second DO (protocol violation): WantNo stays at No, no dup.
+        iac.feed(IAC, &mut Vec::new(), &mut replies);
+        iac.feed(DO, &mut Vec::new(), &mut replies);
+        iac.feed(OPT_SGA, &mut Vec::new(), &mut replies);
+        let count_total = replies
+            .windows(3)
+            .filter(|w| *w == [IAC, WONT, OPT_SGA])
+            .count();
+        assert_eq!(
+            count_total, 1,
+            "a repeated DO should not produce a second WONT"
+        );
+    }
+
+    #[test]
+    fn test_qmethod_no_duplicate_dont_when_peer_re_sends_will() {
+        // Mirror of the above, on the him side.
+        let mut iac = reactive_iac();
+        let idx = OPT_SGA as usize;
+        iac.him_state[idx] = OptState::WantYesOpposite;
+        let mut replies = Vec::new();
+        iac.feed(IAC, &mut Vec::new(), &mut replies);
+        iac.feed(WILL, &mut Vec::new(), &mut replies);
+        iac.feed(OPT_SGA, &mut Vec::new(), &mut replies);
+        let count_first = replies
+            .windows(3)
+            .filter(|w| *w == [IAC, DONT, OPT_SGA])
+            .count();
+        assert_eq!(count_first, 1);
+        iac.feed(IAC, &mut Vec::new(), &mut replies);
+        iac.feed(WILL, &mut Vec::new(), &mut replies);
+        iac.feed(OPT_SGA, &mut Vec::new(), &mut replies);
+        let count_total = replies
+            .windows(3)
+            .filter(|w| *w == [IAC, DONT, OPT_SGA])
+            .count();
+        assert_eq!(
+            count_total, 1,
+            "a repeated WILL should not produce a second DONT"
+        );
     }
 
     #[test]

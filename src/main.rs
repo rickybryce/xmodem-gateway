@@ -76,8 +76,26 @@ fn main() {
             runtime.block_on(async move {
                 let session_writers: telnet::SessionWriters =
                     Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                telnet::start_server(shutdown_rt.clone(), restart_rt.clone(), notify_rt.clone(), session_writers.clone());
-                ssh::start_ssh_server(shutdown_rt.clone(), restart_rt.clone(), notify_rt.clone(), session_writers);
+                // One shared lockout map across telnet + SSH so an
+                // attacker can't bounce between protocols to reset their
+                // attempt counter.
+                let lockouts: telnet::LockoutMap = Arc::new(
+                    std::sync::Mutex::new(std::collections::HashMap::new()),
+                );
+                telnet::start_server(
+                    shutdown_rt.clone(),
+                    restart_rt.clone(),
+                    notify_rt.clone(),
+                    session_writers.clone(),
+                    lockouts.clone(),
+                );
+                ssh::start_ssh_server(
+                    shutdown_rt.clone(),
+                    restart_rt.clone(),
+                    notify_rt.clone(),
+                    session_writers,
+                    lockouts,
+                );
                 serial::start_serial(shutdown_rt.clone(), restart_rt.clone());
 
                 // Wait for shutdown signal

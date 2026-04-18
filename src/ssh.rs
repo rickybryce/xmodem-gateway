@@ -22,7 +22,13 @@ const SSH_HOST_KEY_FILE: &str = "xmodem_ssh_host_key";
 // ─── Public API ────────────────────────────────────────────
 
 /// Start the SSH server if enabled in config.
-pub fn start_ssh_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdown_notify: Arc<tokio::sync::Notify>, session_writers: telnet::SessionWriters) {
+pub fn start_ssh_server(
+    shutdown: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    session_writers: telnet::SessionWriters,
+    lockouts: telnet::LockoutMap,
+) {
     let cfg = config::get_config();
     if !cfg.ssh_enabled {
         return;
@@ -52,6 +58,7 @@ pub fn start_ssh_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shu
             session_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: cfg.max_sessions,
             session_writers: session_writers.clone(),
+            lockouts: lockouts.clone(),
         };
 
         let addr = format!("0.0.0.0:{}", port);
@@ -134,6 +141,8 @@ struct SshServer {
     session_count: Arc<AtomicUsize>,
     max_sessions: usize,
     session_writers: telnet::SessionWriters,
+    /// Brute-force lockout map shared with the telnet server.
+    lockouts: telnet::LockoutMap,
 }
 
 impl russh::server::Server for SshServer {
@@ -160,6 +169,7 @@ impl russh::server::Server for SshServer {
             peer_addr: peer_addr.map(|a| a.ip()),
             duplex_writer: None,
             session_writers: self.session_writers.clone(),
+            lockouts: self.lockouts.clone(),
         }
     }
 }
@@ -179,6 +189,8 @@ struct SshHandler {
     duplex_writer:
         Option<Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>>,
     session_writers: telnet::SessionWriters,
+    /// Shared brute-force lockout map (telnet + SSH).
+    lockouts: telnet::LockoutMap,
 }
 
 impl Drop for SshHandler {
@@ -202,14 +214,36 @@ impl russh::server::Handler for SshHandler {
         if self.session_count.load(Ordering::SeqCst) > self.max_sessions {
             return Ok(russh::server::Auth::reject());
         }
+        // Reject immediately if this IP is locked out from too many
+        // failures (map is shared with the telnet server so bouncing
+        // protocols doesn't help an attacker).
+        if let Some(ip) = self.peer_addr
+            && telnet::is_locked_out(&self.lockouts, ip)
+        {
+            glog!("SSH: auth from {} rejected (locked out)", ip);
+            return Ok(russh::server::Auth::reject());
+        }
         // Constant-time comparison to prevent timing attacks.
         let user_ok =
             telnet::constant_time_eq(user.as_bytes(), self.ssh_username.as_bytes());
         let pass_ok =
             telnet::constant_time_eq(password.as_bytes(), self.ssh_password.as_bytes());
         if user_ok && pass_ok {
+            if let Some(ip) = self.peer_addr {
+                telnet::clear_lockout(&self.lockouts, ip);
+            }
             Ok(russh::server::Auth::Accept)
         } else {
+            if let Some(ip) = self.peer_addr {
+                let count = telnet::record_auth_failure(&self.lockouts, ip);
+                if count >= telnet::AUTH_MAX_ATTEMPTS {
+                    glog!(
+                        "SSH: {} exceeded {} failed attempts; locked out",
+                        ip,
+                        telnet::AUTH_MAX_ATTEMPTS,
+                    );
+                }
+            }
             Ok(russh::server::Auth::reject())
         }
     }
