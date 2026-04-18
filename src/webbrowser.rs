@@ -784,13 +784,13 @@ fn parse_gopher_url(url: &str) -> Result<(String, u16, char, String), String> {
         None => (rest, ""),
     };
 
-    // Parse host and optional port
+    // Parse host and optional port. Port 0 is not a valid network
+    // port, so fall back to the default rather than attempt to connect.
     let (host, port) = if let Some(colon) = host_port.rfind(':') {
         let port_str = &host_port[colon + 1..];
-        if let Ok(p) = port_str.parse::<u16>() {
-            (host_port[..colon].to_string(), p)
-        } else {
-            (host_port.to_string(), GOPHER_PORT)
+        match port_str.parse::<u16>() {
+            Ok(p) if p > 0 => (host_port[..colon].to_string(), p),
+            _ => (host_port.to_string(), GOPHER_PORT),
         }
     } else {
         (host_port.to_string(), GOPHER_PORT)
@@ -1190,8 +1190,7 @@ mod tests {
 
     #[test]
     fn test_is_tls_error_corrupt_message() {
-        let e = ureq::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let e = ureq::Error::Io(std::io::Error::other(
             "received corrupt message of type InvalidContentType",
         ));
         assert!(is_tls_error(&e));
@@ -1199,10 +1198,7 @@ mod tests {
 
     #[test]
     fn test_is_tls_error_invalid_content_type() {
-        let e = ureq::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "InvalidContentType",
-        ));
+        let e = ureq::Error::Io(std::io::Error::other("InvalidContentType"));
         assert!(is_tls_error(&e));
     }
 
@@ -1217,10 +1213,7 @@ mod tests {
 
     #[test]
     fn test_is_tls_error_not_certificate() {
-        let e = ureq::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "certificate verify failed",
-        ));
+        let e = ureq::Error::Io(std::io::Error::other("certificate verify failed"));
         assert!(!is_tls_error(&e));
     }
 
@@ -1235,11 +1228,11 @@ mod tests {
 
     #[test]
     fn test_constants_sanity() {
-        assert!(MAX_BODY_SIZE > 0);
-        assert!(MAX_BODY_SIZE <= 10 * 1024 * 1024, "body limit should be reasonable");
-        assert!(MAX_RENDERED_LINES > 0);
-        assert!(HTTP_TIMEOUT_SECS > 0);
-        assert!(HTTP_TIMEOUT_SECS <= 60, "timeout should not be excessive");
+        const _: () = assert!(MAX_BODY_SIZE > 0);
+        const _: () = assert!(MAX_BODY_SIZE <= 10 * 1024 * 1024, "body limit should be reasonable");
+        const _: () = assert!(MAX_RENDERED_LINES > 0);
+        const _: () = assert!(HTTP_TIMEOUT_SECS > 0);
+        const _: () = assert!(HTTP_TIMEOUT_SECS <= 60, "timeout should not be excessive");
     }
 
     #[test]
@@ -1422,8 +1415,8 @@ mod tests {
 
     #[test]
     fn test_bookmark_constants() {
-        assert!(MAX_BOOKMARKS >= 10);
-        assert!(MAX_BOOKMARKS <= 500);
+        const _: () = assert!(MAX_BOOKMARKS >= 10);
+        const _: () = assert!(MAX_BOOKMARKS <= 500);
     }
 
     // ─── Gopher ─────────────────────────────────────────────
@@ -1462,6 +1455,25 @@ mod tests {
             parse_gopher_url("gopher://example.com:7070/1/test").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 7070);
+    }
+
+    #[test]
+    fn test_parse_gopher_url_rejects_port_zero() {
+        // Port 0 is invalid for actual connections — fall back to the
+        // default instead of attempting to dial a zero port.
+        let (host, port, _, _) =
+            parse_gopher_url("gopher://example.com:0/1/test").unwrap();
+        assert_eq!(host, "example.com:0");
+        assert_eq!(port, GOPHER_PORT);
+    }
+
+    #[test]
+    fn test_parse_gopher_url_rejects_overflow_port() {
+        // Port out of u16 range falls back to default.
+        let (host, port, _, _) =
+            parse_gopher_url("gopher://example.com:99999/1/test").unwrap();
+        assert_eq!(host, "example.com:99999");
+        assert_eq!(port, GOPHER_PORT);
     }
 
     #[test]
@@ -1530,8 +1542,8 @@ mod tests {
 
     #[test]
     fn test_gopher_constants() {
-        assert_eq!(GOPHER_PORT, 70);
-        assert!(GOPHER_TIMEOUT_SECS > 0);
-        assert!(GOPHER_MAX_BODY > 0);
+        const _: () = assert!(GOPHER_PORT == 70);
+        const _: () = assert!(GOPHER_TIMEOUT_SECS > 0);
+        const _: () = assert!(GOPHER_MAX_BODY > 0);
     }
 }

@@ -20,6 +20,28 @@ use tokio::net::TcpListener;
 use crate::config;
 use crate::logger::glog;
 
+// ─── Telnet protocol (RFC 854/855) ──────────────────────────
+const IAC: u8 = 0xFF;
+const SE: u8 = 0xF0;
+const BRK: u8 = 0xF3;
+const IP: u8 = 0xF4;
+const AYT: u8 = 0xF6;
+const SB: u8 = 0xFA;
+const WILL: u8 = 0xFB;
+const WONT: u8 = 0xFC;
+const DO: u8 = 0xFD;
+const DONT: u8 = 0xFE;
+
+// Telnet options
+const OPT_ECHO: u8 = 0x01;
+const OPT_SGA: u8 = 0x03;
+const OPT_TTYPE: u8 = 0x18;
+const OPT_NAWS: u8 = 0x1F;
+
+// TTYPE subnegotiation (RFC 1091)
+const TTYPE_IS: u8 = 0x00;
+const TTYPE_SEND: u8 = 0x01;
+
 // ─── ANSI escape codes ──────────────────────────────────────
 const ANSI_GREEN: &str = "\x1b[1;32m";
 const ANSI_RED: &str = "\x1b[1;31m";
@@ -225,6 +247,49 @@ fn to_latin1_bytes(text: &str) -> Vec<u8> {
     text.chars()
         .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
         .collect()
+}
+
+/// Map a TTYPE name reported by the client (via `IAC SB TTYPE IS ...`)
+/// to one of our TerminalType variants. Returns None for names we don't
+/// recognize so the caller falls back to the BACKSPACE-press detection.
+/// Names arrive uppercase per RFC 1091, but we match case-insensitively
+/// to be tolerant of non-compliant clients.
+fn match_terminal_name(name: &str) -> Option<TerminalType> {
+    let upper = name.trim().to_ascii_uppercase();
+    if upper.is_empty() {
+        return None;
+    }
+    // PETSCII clients: C64, C128, and explicit PETSCII names.
+    if upper == "C64"
+        || upper == "C128"
+        || upper == "COMMODORE"
+        || upper.starts_with("PETSCII")
+        || upper.starts_with("C64")
+        || upper.starts_with("C128")
+    {
+        return Some(TerminalType::Petscii);
+    }
+    // ANSI-capable: xterm family, vt100+, ansi*, linux console, screen/tmux.
+    if upper.starts_with("XTERM")
+        || upper.starts_with("VT")
+        || upper.starts_with("ANSI")
+        || upper.starts_with("LINUX")
+        || upper.starts_with("SCREEN")
+        || upper.starts_with("TMUX")
+        || upper.starts_with("RXVT")
+        || upper.starts_with("KONSOLE")
+        || upper.starts_with("ALACRITTY")
+        || upper.starts_with("WEZTERM")
+        || upper == "CYGWIN"
+        || upper == "PUTTY"
+    {
+        return Some(TerminalType::Ansi);
+    }
+    // Dumb/unknown terminals: fall back to plain ASCII (no color).
+    if upper == "DUMB" || upper == "UNKNOWN" || upper == "NETWORK" {
+        return Some(TerminalType::Ascii);
+    }
+    None
 }
 
 // ─── Input helpers (standalone) ─────────────────────────────
@@ -578,6 +643,19 @@ pub(crate) struct TelnetSession {
     // One-byte pushback used by drain_trailing_eol to safely return any
     // non-CR/LF byte it reads back to the next real input call.
     pushback: Option<u8>,
+    // Telnet option negotiation state. Each per-option flag records a
+    // reply we've already sent so we never loop on repeated requests.
+    neg_sent_will: Box<[bool; 256]>,
+    neg_sent_do: Box<[bool; 256]>,
+    neg_sent_wont: Box<[bool; 256]>,
+    neg_sent_dont: Box<[bool; 256]>,
+    // TTYPE result — set once via SB TTYPE IS. Prevents re-requesting
+    // and lets detect_terminal_type skip the BACKSPACE prompt.
+    ttype_matched: bool,
+    // NAWS (window size), captured from SB NAWS. None if peer didn't
+    // negotiate. Not yet wired into layout code.
+    window_width: Option<u16>,
+    window_height: Option<u16>,
 }
 
 impl TelnetSession {
@@ -617,6 +695,13 @@ impl TelnetSession {
             is_ssh: false,
             idle_timeout: std::time::Duration::from_secs(config::get_config().idle_timeout_secs),
             pushback: None,
+            neg_sent_will: Box::new([false; 256]),
+            neg_sent_do: Box::new([false; 256]),
+            neg_sent_wont: Box::new([false; 256]),
+            neg_sent_dont: Box::new([false; 256]),
+            ttype_matched: false,
+            window_width: None,
+            window_height: None,
         }
     }
 
@@ -654,6 +739,13 @@ impl TelnetSession {
             is_ssh: true,
             idle_timeout: std::time::Duration::from_secs(config::get_config().idle_timeout_secs),
             pushback: None,
+            neg_sent_will: Box::new([false; 256]),
+            neg_sent_do: Box::new([false; 256]),
+            neg_sent_wont: Box::new([false; 256]),
+            neg_sent_dont: Box::new([false; 256]),
+            ttype_matched: false,
+            window_width: None,
+            window_height: None,
         }
     }
 
@@ -785,13 +877,13 @@ impl TelnetSession {
     // ─── I/O helpers ───────────────────────────────────────
 
     async fn send(&mut self, text: &str) -> Result<(), std::io::Error> {
-        let mut writer = self.writer.lock().await;
         match self.terminal_type {
             TerminalType::Petscii => {
                 let swapped = swap_case_for_petscii(text);
-                writer.write_all(&to_latin1_bytes(&swapped)).await
+                let bytes = to_latin1_bytes(&swapped);
+                self.send_raw(&bytes).await
             }
-            _ => writer.write_all(text.as_bytes()).await,
+            _ => self.send_raw(text.as_bytes()).await,
         }
     }
 
@@ -800,7 +892,30 @@ impl TelnetSession {
         self.send(&line).await
     }
 
+    /// Write user-data bytes to the session. In telnet mode, any 0xFF
+    /// data byte is escaped as IAC IAC (0xFF 0xFF) per RFC 854 so the
+    /// peer doesn't misinterpret it as the start of a protocol command.
+    /// Serial and SSH sessions don't speak the IAC protocol, so bytes
+    /// pass through unchanged there.
     async fn send_raw(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let needs_escape = !self.is_serial && !self.is_ssh;
+        if !needs_escape || !bytes.contains(&IAC) {
+            return self.writer.lock().await.write_all(bytes).await;
+        }
+        let mut escaped = Vec::with_capacity(bytes.len() + 1);
+        for &b in bytes {
+            escaped.push(b);
+            if b == IAC {
+                escaped.push(IAC);
+            }
+        }
+        self.writer.lock().await.write_all(&escaped).await
+    }
+
+    /// Write raw telnet-protocol bytes (IAC sequences) without any data
+    /// escaping. Use only for sending IAC commands and option
+    /// negotiation where 0xFF bytes are intentional.
+    async fn send_telnet_protocol(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         self.writer.lock().await.write_all(bytes).await
     }
 
@@ -817,19 +932,10 @@ impl TelnetSession {
     }
 
     async fn read_byte_filtered(&mut self) -> Result<Option<u8>, std::io::Error> {
-        if let Some(b) = self.pushback.take() {
-            return Ok(Some(b));
-        }
-        let filter_iac = !self.is_serial && !self.is_ssh;
         if self.idle_timeout.is_zero() {
-            read_byte_iac_filtered(&mut self.reader, filter_iac).await
+            self.session_read_byte().await
         } else {
-            match tokio::time::timeout(
-                self.idle_timeout,
-                read_byte_iac_filtered(&mut self.reader, filter_iac),
-            )
-            .await
-            {
+            match tokio::time::timeout(self.idle_timeout, self.session_read_byte()).await {
                 Ok(result) => result,
                 Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -837,6 +943,231 @@ impl TelnetSession {
                 )),
             }
         }
+    }
+
+    /// Read a single data byte from the session. In telnet mode, IAC
+    /// sequences are consumed transparently. DO/WILL option requests
+    /// get WONT/DONT replies (RFC 855) except for options we support
+    /// (ECHO, SGA, TTYPE, NAWS). AYT (Are You There) gets a visible
+    /// reply. IP (Interrupt Process) and BRK (Break) surface as the
+    /// terminal's ESC byte so callers treat them like a Ctrl+C / ESC.
+    async fn session_read_byte(&mut self) -> Result<Option<u8>, std::io::Error> {
+        if let Some(b) = self.pushback.take() {
+            return Ok(Some(b));
+        }
+        let filter_iac = !self.is_serial && !self.is_ssh;
+        let mut buf = [0u8; 1];
+        loop {
+            if self.reader.read(&mut buf).await? == 0 {
+                return Ok(None);
+            }
+            let byte = buf[0];
+            if !filter_iac || byte != IAC {
+                return Ok(Some(byte));
+            }
+            if self.reader.read(&mut buf).await? == 0 {
+                return Ok(None);
+            }
+            let cmd = buf[0];
+            match cmd {
+                IAC => return Ok(Some(IAC)), // escaped data 0xFF
+                SB => {
+                    let Some(payload) = self.read_subneg_payload().await? else {
+                        return Ok(None);
+                    };
+                    if let Some((opt, body)) = payload.split_first() {
+                        self.handle_subnegotiation(*opt, body).await?;
+                    }
+                }
+                WILL | WONT | DO | DONT => {
+                    if self.reader.read(&mut buf).await? == 0 {
+                        return Ok(None);
+                    }
+                    let opt = buf[0];
+                    self.handle_telnet_option(cmd, opt).await?;
+                }
+                AYT => {
+                    // Through send_line so PETSCII case-swap applies if the
+                    // terminal type is known.
+                    self.send_line("[Yes]").await?;
+                    self.flush().await?;
+                }
+                IP | BRK => {
+                    let esc = if self.terminal_type == TerminalType::Petscii {
+                        0x5F
+                    } else {
+                        0x1B
+                    };
+                    return Ok(Some(esc));
+                }
+                _ => {
+                    // Other two-byte IAC commands (NOP, DM, AO, EC, EL, GA)
+                    // — nothing for us to do.
+                }
+            }
+        }
+    }
+
+    /// Consume a subnegotiation payload up to (and including) the
+    /// terminating IAC SE. Returns the payload bytes with any escaped
+    /// `IAC IAC` unescaped. First byte is the option code. Returns
+    /// Ok(None) if the connection closes mid-sequence.
+    async fn read_subneg_payload(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let mut payload = Vec::with_capacity(32);
+        let mut buf = [0u8; 1];
+        loop {
+            if self.reader.read(&mut buf).await? == 0 {
+                return Ok(None);
+            }
+            if buf[0] != IAC {
+                if payload.len() < 512 {
+                    payload.push(buf[0]);
+                }
+                continue;
+            }
+            if self.reader.read(&mut buf).await? == 0 {
+                return Ok(None);
+            }
+            match buf[0] {
+                SE => return Ok(Some(payload)),
+                IAC => {
+                    if payload.len() < 512 {
+                        payload.push(IAC);
+                    }
+                }
+                _ => {
+                    // Malformed — skip and keep scanning for IAC SE.
+                }
+            }
+        }
+    }
+
+    /// Reply to peer WILL/WONT/DO/DONT per RFC 855. Options we want
+    /// enabled (ECHO, SGA on our side; SGA, TTYPE, NAWS on peer's side)
+    /// treat the matching ack as a no-op. Everything else is refused
+    /// once. DONT/WONT get a matching ack only if we had actually
+    /// advertised the corresponding WILL/DO.
+    async fn handle_telnet_option(
+        &mut self,
+        cmd: u8,
+        opt: u8,
+    ) -> Result<(), std::io::Error> {
+        match cmd {
+            DO => {
+                // If we already advertised WILL for opt, peer's DO is an
+                // acknowledgement — no reply needed.
+                if self.neg_sent_will[opt as usize] {
+                    return Ok(());
+                }
+                if self.neg_sent_wont[opt as usize] {
+                    return Ok(());
+                }
+                self.neg_sent_wont[opt as usize] = true;
+                self.send_telnet_protocol(&[IAC, WONT, opt]).await?;
+                self.flush().await?;
+            }
+            WILL => {
+                // If we already advertised DO for opt, peer's WILL is an
+                // acknowledgement — no reply needed.
+                if self.neg_sent_do[opt as usize] && opt != OPT_TTYPE {
+                    // TTYPE still needs SB SEND on first WILL so we can
+                    // request the name; handled below.
+                    return Ok(());
+                }
+                if opt == OPT_TTYPE {
+                    if !self.neg_sent_do[opt as usize] {
+                        self.neg_sent_do[opt as usize] = true;
+                        self.send_telnet_protocol(&[IAC, DO, OPT_TTYPE]).await?;
+                    }
+                    if !self.ttype_matched {
+                        self.send_telnet_protocol(&[
+                            IAC, SB, OPT_TTYPE, TTYPE_SEND, IAC, SE,
+                        ])
+                        .await?;
+                    }
+                    self.flush().await?;
+                    return Ok(());
+                }
+                if opt == OPT_NAWS {
+                    if !self.neg_sent_do[opt as usize] {
+                        self.neg_sent_do[opt as usize] = true;
+                        self.send_telnet_protocol(&[IAC, DO, OPT_NAWS]).await?;
+                        self.flush().await?;
+                    }
+                    return Ok(());
+                }
+                if self.neg_sent_dont[opt as usize] {
+                    return Ok(());
+                }
+                self.neg_sent_dont[opt as usize] = true;
+                self.send_telnet_protocol(&[IAC, DONT, opt]).await?;
+                self.flush().await?;
+            }
+            DONT => {
+                // Acknowledge with WONT only if we had previously
+                // advertised WILL for opt.
+                if self.neg_sent_will[opt as usize]
+                    && !self.neg_sent_wont[opt as usize]
+                {
+                    self.neg_sent_wont[opt as usize] = true;
+                    self.send_telnet_protocol(&[IAC, WONT, opt]).await?;
+                    self.flush().await?;
+                }
+            }
+            WONT => {
+                // Acknowledge with DONT only if we had previously
+                // advertised DO for opt.
+                if self.neg_sent_do[opt as usize]
+                    && !self.neg_sent_dont[opt as usize]
+                {
+                    self.neg_sent_dont[opt as usize] = true;
+                    self.send_telnet_protocol(&[IAC, DONT, opt]).await?;
+                    self.flush().await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Process a completed subnegotiation. `body` is the payload after
+    /// the option code. TTYPE IS sets terminal_type if the reported
+    /// name is recognized; NAWS stores the reported window dimensions.
+    async fn handle_subnegotiation(
+        &mut self,
+        opt: u8,
+        body: &[u8],
+    ) -> Result<(), std::io::Error> {
+        match opt {
+            OPT_TTYPE => {
+                if body.first().copied() == Some(TTYPE_IS) && !self.ttype_matched {
+                    let name_bytes = &body[1..];
+                    let name: String = name_bytes
+                        .iter()
+                        .map(|&b| b as char)
+                        .filter(|c| !c.is_control())
+                        .collect();
+                    if let Some(tt) = match_terminal_name(&name) {
+                        self.terminal_type = tt;
+                        self.ttype_matched = true;
+                    }
+                }
+            }
+            OPT_NAWS => {
+                if body.len() >= 4 {
+                    let w = u16::from_be_bytes([body[0], body[1]]);
+                    let h = u16::from_be_bytes([body[2], body[3]]);
+                    if w > 0 {
+                        self.window_width = Some(w);
+                    }
+                    if h > 0 {
+                        self.window_height = Some(h);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Consume up to `max` immediately-queued CR/LF bytes left behind by a
@@ -848,11 +1179,10 @@ impl TelnetSession {
         if self.pushback.is_some() {
             return;
         }
-        let filter_iac = !self.is_serial && !self.is_ssh;
         for _ in 0..max {
             let res = tokio::time::timeout(
                 std::time::Duration::from_millis(20),
-                read_byte_iac_filtered(&mut self.reader, filter_iac),
+                self.session_read_byte(),
             )
             .await;
             match res {
@@ -1092,19 +1422,12 @@ impl TelnetSession {
     }
 
     async fn drain_input(&mut self) {
-        let mut buf = [0u8; 256];
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                self.reader.read(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok(0)) => break,
-                Ok(Ok(_)) => continue,
-                _ => break,
-            }
-        }
+        while let Ok(Ok(Some(_))) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            self.session_read_byte(),
+        )
+        .await
+        {}
     }
 
     async fn show_error(&mut self, msg: &str) -> Result<(), std::io::Error> {
@@ -1154,47 +1477,68 @@ impl TelnetSession {
     // ─── Terminal detection ─────────────────────────────────
 
     async fn detect_terminal_type(&mut self) -> Result<(), std::io::Error> {
-        // IAC WILL ECHO, IAC WILL SGA, IAC DO SGA
-        self.send_raw(&[
-            0xFF, 0xFB, 0x01, // IAC WILL ECHO
-            0xFF, 0xFB, 0x03, // IAC WILL SUPPRESS-GO-AHEAD
-            0xFF, 0xFD, 0x03, // IAC DO SUPPRESS-GO-AHEAD
+        // Advertise server-side echo + char-at-a-time mode, and request
+        // terminal type + window size from the client. Mark the DOs as
+        // sent so a client-initiated WILL TTYPE / WILL NAWS is treated
+        // as an acknowledgement instead of triggering a duplicate DO.
+        self.send_telnet_protocol(&[
+            IAC, WILL, OPT_ECHO,
+            IAC, WILL, OPT_SGA,
+            IAC, DO, OPT_SGA,
+            IAC, DO, OPT_TTYPE,
+            IAC, DO, OPT_NAWS,
         ])
         .await?;
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        self.drain_input().await;
-
-        self.send_raw(b"\r\nPress BACKSPACE to detect terminal: ")
-            .await?;
+        self.neg_sent_will[OPT_ECHO as usize] = true;
+        self.neg_sent_will[OPT_SGA as usize] = true;
+        self.neg_sent_do[OPT_SGA as usize] = true;
+        self.neg_sent_do[OPT_TTYPE as usize] = true;
+        self.neg_sent_do[OPT_NAWS as usize] = true;
         self.flush().await?;
 
-        let byte = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self.read_byte_filtered(),
-        )
-        .await
-        {
-            Ok(result) => match result? {
-                Some(b) => b,
-                None => return Ok(()),
-            },
-            Err(_) => {
-                self.send_raw(b"\r\n\r\n  Disconnected: idle timeout.\r\n\r\n")
-                    .await?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "idle timeout during terminal detection",
-                ));
-            }
-        };
+        // Give the client a moment to respond, then process negotiation
+        // replies (including any TTYPE IS / NAWS subnegotiations).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        self.drain_input().await;
 
-        self.erase_char = byte;
-        self.terminal_type = match byte {
-            0x14 => TerminalType::Petscii,
-            0x08 | 0x7F => TerminalType::Ansi,
-            _ => TerminalType::Ascii,
-        };
+        // If TTYPE already identified the client, skip the manual prompt.
+        if self.ttype_matched {
+            self.erase_char = match self.terminal_type {
+                TerminalType::Petscii => 0x14,
+                _ => 0x7F,
+            };
+        } else {
+            self.send_raw(b"\r\nPress BACKSPACE to detect terminal: ")
+                .await?;
+            self.flush().await?;
+
+            let byte = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.read_byte_filtered(),
+            )
+            .await
+            {
+                Ok(result) => match result? {
+                    Some(b) => b,
+                    None => return Ok(()),
+                },
+                Err(_) => {
+                    self.send_raw(b"\r\n\r\n  Disconnected: idle timeout.\r\n\r\n")
+                        .await?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout during terminal detection",
+                    ));
+                }
+            };
+
+            self.erase_char = byte;
+            self.terminal_type = match byte {
+                0x14 => TerminalType::Petscii,
+                0x08 | 0x7F => TerminalType::Ansi,
+                _ => TerminalType::Ascii,
+            };
+        }
 
         let type_name = match self.terminal_type {
             TerminalType::Petscii => "PETSCII (Commodore 64)",
@@ -1866,8 +2210,10 @@ impl TelnetSession {
             } else {
                 ".".to_string()
             };
-            let path =
-                CString::new(dir.as_str()).unwrap_or_else(|_| CString::new(".").unwrap());
+            // "." never contains a nul byte, so the fallback CString is
+            // always constructable.
+            let path = CString::new(dir.as_str())
+                .unwrap_or_else(|_| c".".to_owned());
             let mut stat = MaybeUninit::<libc::statvfs>::uninit();
             let rc = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
             if rc != 0 {
@@ -4489,7 +4835,8 @@ impl TelnetSession {
             match input.as_str() {
                 "q" => return Ok(()),
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                    let idx = input.parse::<usize>().unwrap() - 1;
+                    // Safe: the match arm only accepts single ASCII digits 1-9.
+                    let idx = (input.as_bytes()[0] - b'1') as usize;
                     let baud_str = bauds[idx].to_string();
                     tokio::task::spawn_blocking(move || {
                         config::update_config_value("serial_baud", &baud_str);
@@ -7042,6 +7389,13 @@ pub fn start_server(shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>, shutdow
                                     is_ssh: false,
                                     idle_timeout: std::time::Duration::from_secs(cfg.idle_timeout_secs),
                                     pushback: None,
+                                    neg_sent_will: Box::new([false; 256]),
+                                    neg_sent_do: Box::new([false; 256]),
+                                    neg_sent_wont: Box::new([false; 256]),
+                                    neg_sent_dont: Box::new([false; 256]),
+                                    ttype_matched: false,
+                                    window_width: None,
+                                    window_height: None,
                                 };
                                 if let Err(e) = session.run().await {
                                     glog!("Telnet: session error from {}: {}", addr, e);
@@ -7176,10 +7530,10 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert_eq!(TelnetSession::MAX_FILE_SIZE, 8 * 1024 * 1024);
-        assert_eq!(TelnetSession::MAX_FILENAME_LEN, 64);
-        assert!(TelnetSession::TRANSFER_PAGE_SIZE > 0);
-        assert!(TelnetSession::TRANSFER_PAGE_SIZE <= 20);
+        const _: () = assert!(TelnetSession::MAX_FILE_SIZE == 8 * 1024 * 1024);
+        const _: () = assert!(TelnetSession::MAX_FILENAME_LEN == 64);
+        const _: () = assert!(TelnetSession::TRANSFER_PAGE_SIZE > 0);
+        const _: () = assert!(TelnetSession::TRANSFER_PAGE_SIZE <= 20);
     }
 
     // ─── Auth lockout ────────────────────────────────────
@@ -7422,7 +7776,62 @@ mod tests {
             is_ssh: false,
             idle_timeout: std::time::Duration::ZERO,
             pushback: None,
+            neg_sent_will: Box::new([false; 256]),
+            neg_sent_do: Box::new([false; 256]),
+            neg_sent_wont: Box::new([false; 256]),
+            neg_sent_dont: Box::new([false; 256]),
+            ttype_matched: false,
+            window_width: None,
+            window_height: None,
         }
+    }
+
+    /// Build a telnet session wired to a controllable client-side pipe.
+    /// Return the session plus the peer end: writing to `peer` feeds
+    /// bytes to the session's reader, reading from `peer` returns what
+    /// the session wrote. Used for end-to-end negotiation tests.
+    fn make_test_session_with_peer(
+        terminal_type: TerminalType,
+    ) -> (TelnetSession, tokio::io::DuplexStream) {
+        let (peer, session_stream) = tokio::io::duplex(512);
+        let (session_reader, session_writer) = tokio::io::split(session_stream);
+        let writer_box: Box<dyn tokio::io::AsyncWrite + Unpin + Send> =
+            Box::new(session_writer);
+        let writer: SharedWriter =
+            Arc::new(tokio::sync::Mutex::new(writer_box));
+        let session = TelnetSession {
+            reader: Box::new(session_reader),
+            writer,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            restart: Arc::new(AtomicBool::new(false)),
+            current_menu: Menu::Main,
+            terminal_type,
+            erase_char: 0x7F,
+            lockouts: Arc::new(Mutex::new(HashMap::new())),
+            peer_addr: None,
+            transfer_subdir: String::new(),
+            xmodem_iac: false,
+            web_lines: Vec::new(),
+            web_scroll: 0,
+            web_links: Vec::new(),
+            web_history: Vec::new(),
+            web_url: None,
+            web_title: None,
+            web_forms: Vec::new(),
+            weather_zip: String::new(),
+            is_serial: false,
+            is_ssh: false,
+            idle_timeout: std::time::Duration::ZERO,
+            pushback: None,
+            neg_sent_will: Box::new([false; 256]),
+            neg_sent_do: Box::new([false; 256]),
+            neg_sent_wont: Box::new([false; 256]),
+            neg_sent_dont: Box::new([false; 256]),
+            ttype_matched: false,
+            window_width: None,
+            window_height: None,
+        };
+        (session, peer)
     }
 
     // ─── Color helpers ──────────────────────────────────
@@ -8643,7 +9052,6 @@ mod tests {
     fn test_separator_widths() {
         assert_eq!("=".repeat(PETSCII_WIDTH).len(), 40);
         assert_eq!("=".repeat(56).len(), 56); // ANSI/ASCII separator
-        assert!(56 <= 80, "ANSI separator exceeds 80 cols");
     }
 
     /// PAGE_CONTENT_LINES must leave room for header and footer within 22 rows.
@@ -8766,8 +9174,8 @@ mod tests {
         let scroll = 0;
         let end = (scroll + page_h).min(total);
         assert_eq!(end, 1);
-        assert!(!( scroll > 0));    // no prev
-        assert!(!(end < total));     // no next
+        assert_eq!(scroll, 0);  // no prev
+        assert!(end >= total);  // no next
     }
 
     #[test]
@@ -8777,8 +9185,8 @@ mod tests {
         let scroll = 0;
         let end = (scroll + page_h).min(total);
         assert_eq!(end, page_h);
-        assert!(!(scroll > 0));
-        assert!(!(end < total));
+        assert_eq!(scroll, 0);
+        assert!(end >= total);
     }
 
     #[test]
@@ -8796,7 +9204,7 @@ mod tests {
         assert_eq!(end, total);
         assert_eq!(end - scroll, 5);
         assert!(scroll > 0);     // has prev
-        assert!(!(end < total));  // no next
+        assert!(end >= total);   // no next
     }
 
     // ─── XMODEM constants ────────────────────────────────
@@ -8832,8 +9240,8 @@ mod tests {
 
     #[test]
     fn test_web_max_history_is_reasonable() {
-        assert!(TelnetSession::WEB_MAX_HISTORY >= 10, "too few history entries");
-        assert!(TelnetSession::WEB_MAX_HISTORY <= 200, "excessive history cap");
+        const _: () = assert!(TelnetSession::WEB_MAX_HISTORY >= 10, "too few history entries");
+        const _: () = assert!(TelnetSession::WEB_MAX_HISTORY <= 200, "excessive history cap");
     }
 
     #[test]
@@ -8952,9 +9360,9 @@ mod tests {
     #[test]
     fn test_web_end_scroll_short_page() {
         let page_h = TelnetSession::WEB_PAGE_HEIGHT;
-        let total = 5;
+        let total: usize = 5;
         // E command when total <= page_h: scroll stays 0
-        let scroll = if total > page_h { total - page_h } else { 0 };
+        let scroll = total.saturating_sub(page_h);
         assert_eq!(scroll, 0);
     }
 
@@ -8970,7 +9378,7 @@ mod tests {
         ];
         let query = "rust";
         let total = lines.len();
-        let start_line = 0 + 1; // search from scroll+1
+        let start_line = 1; // scroll (0) + 1
         let mut found = None;
         for offset in 0..total {
             let idx = (start_line + offset) % total;
@@ -9011,7 +9419,7 @@ mod tests {
         ];
         let query = "xyz";
         let total = lines.len();
-        let start_line = 0 + 1;
+        let start_line = 1; // scroll (0) + 1
         let mut found = None;
         for offset in 0..total {
             let idx = (start_line + offset) % total;
@@ -9214,5 +9622,420 @@ mod tests {
         // Total ≤ 20, well within 22.
         let warning_rows = 6;
         assert!(warning_rows <= 22);
+    }
+
+    // ─── Telnet option negotiation ───────────────────────
+
+    #[test]
+    fn test_match_terminal_name_c64_variants() {
+        assert_eq!(match_terminal_name("C64"), Some(TerminalType::Petscii));
+        assert_eq!(match_terminal_name("c64"), Some(TerminalType::Petscii));
+        assert_eq!(match_terminal_name("C128"), Some(TerminalType::Petscii));
+        assert_eq!(match_terminal_name("PETSCII"), Some(TerminalType::Petscii));
+        assert_eq!(match_terminal_name("COMMODORE"), Some(TerminalType::Petscii));
+        assert_eq!(match_terminal_name(" C64 "), Some(TerminalType::Petscii));
+    }
+
+    #[test]
+    fn test_match_terminal_name_ansi_variants() {
+        assert_eq!(match_terminal_name("XTERM"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("xterm-256color"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("VT100"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("VT220"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("ANSI"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("linux"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("screen-256color"), Some(TerminalType::Ansi));
+        assert_eq!(match_terminal_name("PUTTY"), Some(TerminalType::Ansi));
+    }
+
+    #[test]
+    fn test_match_terminal_name_dumb() {
+        assert_eq!(match_terminal_name("DUMB"), Some(TerminalType::Ascii));
+        assert_eq!(match_terminal_name("UNKNOWN"), Some(TerminalType::Ascii));
+        assert_eq!(match_terminal_name("NETWORK"), Some(TerminalType::Ascii));
+    }
+
+    #[test]
+    fn test_match_terminal_name_unrecognized() {
+        // Fall back to BACKSPACE detection for names we don't know.
+        assert_eq!(match_terminal_name("MY-WEIRD-TERM"), None);
+        assert_eq!(match_terminal_name(""), None);
+        assert_eq!(match_terminal_name("   "), None);
+    }
+
+    #[tokio::test]
+    async fn test_send_raw_escapes_iac_bytes() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.send_raw(&[b'A', 0xFF, b'B']).await.unwrap();
+        drop(session); // close writer so peer reads EOF after data
+
+        let mut out = Vec::new();
+        use tokio::io::AsyncReadExt;
+        peer.read_to_end(&mut out).await.unwrap();
+        // 0xFF data byte must be escaped as IAC IAC (0xFF 0xFF).
+        assert_eq!(out, vec![b'A', 0xFF, 0xFF, b'B']);
+    }
+
+    #[tokio::test]
+    async fn test_send_raw_passthrough_when_no_iac() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.send_raw(b"hello").await.unwrap();
+        drop(session);
+
+        let mut out = Vec::new();
+        use tokio::io::AsyncReadExt;
+        peer.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_send_telnet_protocol_never_escapes() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        // An IAC WILL ECHO protocol sequence contains 0xFF but must
+        // go through verbatim — escaping it would corrupt the command.
+        session
+            .send_telnet_protocol(&[IAC, WILL, OPT_ECHO])
+            .await
+            .unwrap();
+        drop(session);
+
+        let mut out = Vec::new();
+        use tokio::io::AsyncReadExt;
+        peer.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, vec![IAC, WILL, OPT_ECHO]);
+    }
+
+    #[tokio::test]
+    async fn test_ayt_gets_yes_reply() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::AsyncWriteExt;
+        // Send IAC AYT followed by a real data byte so session_read_byte
+        // can return something.
+        peer.write_all(&[IAC, AYT, b'Z']).await.unwrap();
+
+        let b = session.session_read_byte().await.unwrap();
+        assert_eq!(b, Some(b'Z'));
+
+        // The session should have written "[Yes]\r\n" back.
+        let mut out = Vec::new();
+        peer.write_all(&[]).await.ok();
+        // Drop only the session side so we can read EOF.
+        drop(session);
+        use tokio::io::AsyncReadExt;
+        peer.read_to_end(&mut out).await.unwrap();
+        assert!(
+            out.windows(5).any(|w| w == b"[Yes]"),
+            "expected [Yes] reply, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ip_surfaces_as_esc_ansi() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, IP]).await.unwrap();
+
+        let b = session.session_read_byte().await.unwrap();
+        assert_eq!(b, Some(0x1B)); // ANSI ESC
+    }
+
+    #[tokio::test]
+    async fn test_ip_surfaces_as_esc_petscii() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Petscii);
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, BRK]).await.unwrap();
+
+        let b = session.session_read_byte().await.unwrap();
+        assert_eq!(b, Some(0x5F)); // C64 back-arrow used as PETSCII ESC
+    }
+
+    #[tokio::test]
+    async fn test_do_binary_gets_wont() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Peer: IAC DO BINARY (opt 0) + real byte so the read returns.
+        peer.write_all(&[IAC, DO, 0x00, b'X']).await.unwrap();
+
+        let b = session.session_read_byte().await.unwrap();
+        assert_eq!(b, Some(b'X'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        // Expect IAC WONT BINARY somewhere in the reply stream.
+        let wont_binary = [IAC, WONT, 0x00];
+        assert!(
+            out.windows(3).any(|w| w == wont_binary),
+            "expected IAC WONT 0x00, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_will_binary_gets_dont() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, WILL, 0x00, b'X']).await.unwrap();
+
+        let b = session.session_read_byte().await.unwrap();
+        assert_eq!(b, Some(b'X'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        let dont_binary = [IAC, DONT, 0x00];
+        assert!(
+            out.windows(3).any(|w| w == dont_binary),
+            "expected IAC DONT 0x00, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_option_not_repeated() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Send DO BINARY twice, then a data byte.
+        peer.write_all(&[IAC, DO, 0x00, IAC, DO, 0x00, b'X'])
+            .await
+            .unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'X'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        let wont_binary = [IAC, WONT, 0x00];
+        let matches = out.windows(3).filter(|w| *w == wont_binary).count();
+        assert_eq!(matches, 1, "WONT should be sent exactly once, got {:?}", out);
+    }
+
+    #[tokio::test]
+    async fn test_dont_ack_only_when_we_advertised_will() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.neg_sent_will[OPT_ECHO as usize] = true;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // DONT ECHO (we had advertised WILL ECHO) → expect WONT ECHO ack.
+        // DONT BINARY (we never advertised) → no reply.
+        peer.write_all(&[IAC, DONT, OPT_ECHO, IAC, DONT, 0x00, b'Z'])
+            .await
+            .unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'Z'));
+        drop(session);
+
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        let wont_echo = [IAC, WONT, OPT_ECHO];
+        let wont_binary = [IAC, WONT, 0x00];
+        assert!(
+            out.windows(3).any(|w| w == wont_echo),
+            "expected WONT ECHO ack, got {:?}",
+            out
+        );
+        assert!(
+            !out.windows(3).any(|w| w == wont_binary),
+            "should not have replied to DONT BINARY, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ttype_is_sets_terminal_type() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ascii);
+        // Mark as if we'd already DO'd TTYPE in real detection.
+        session.neg_sent_do[OPT_TTYPE as usize] = true;
+
+        use tokio::io::AsyncWriteExt;
+        // IAC WILL TTYPE, then IAC SB TTYPE IS "VT100" IAC SE, then data.
+        peer.write_all(&[IAC, WILL, OPT_TTYPE]).await.unwrap();
+        peer.write_all(&[IAC, SB, OPT_TTYPE, TTYPE_IS])
+            .await
+            .unwrap();
+        peer.write_all(b"VT100").await.unwrap();
+        peer.write_all(&[IAC, SE, b'Q']).await.unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'Q'));
+        assert!(session.ttype_matched);
+        assert_eq!(session.terminal_type, TerminalType::Ansi);
+    }
+
+    #[tokio::test]
+    async fn test_ttype_is_c64_maps_to_petscii() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ascii);
+        session.neg_sent_do[OPT_TTYPE as usize] = true;
+
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, SB, OPT_TTYPE, TTYPE_IS])
+            .await
+            .unwrap();
+        peer.write_all(b"C64").await.unwrap();
+        peer.write_all(&[IAC, SE, b'!']).await.unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'!'));
+        assert_eq!(session.terminal_type, TerminalType::Petscii);
+    }
+
+    #[tokio::test]
+    async fn test_naws_payload_stored() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.neg_sent_do[OPT_NAWS as usize] = true;
+
+        use tokio::io::AsyncWriteExt;
+        // IAC SB NAWS 0x00 0x50 0x00 0x18 IAC SE → 80x24.
+        peer.write_all(&[
+            IAC, SB, OPT_NAWS, 0x00, 0x50, 0x00, 0x18, IAC, SE, b'A',
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'A'));
+        assert_eq!(session.window_width, Some(80));
+        assert_eq!(session.window_height, Some(24));
+    }
+
+    #[tokio::test]
+    async fn test_naws_with_iac_iac_inside_payload() {
+        // Window width 0xFF08 would include the IAC byte — the peer
+        // must send IAC IAC to escape. Make sure our payload parser
+        // unescapes correctly.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.neg_sent_do[OPT_NAWS as usize] = true;
+
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[
+            IAC, SB, OPT_NAWS, 0xFF, 0xFF, 0x08, 0x00, 0x18, IAC, SE, b'A',
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'A'));
+        assert_eq!(session.window_width, Some(0xFF08));
+        assert_eq!(session.window_height, Some(0x0018));
+    }
+
+    #[tokio::test]
+    async fn test_escaped_iac_as_data() {
+        // IAC IAC in the input stream must surface as a single 0xFF
+        // data byte (not a start-of-command).
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[b'A', IAC, IAC, b'B']).await.unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'A'));
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(0xFF));
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'B'));
+    }
+
+    #[tokio::test]
+    async fn test_empty_subneg_tolerated() {
+        // IAC SB TTYPE IAC SE — zero-length payload. Should not crash
+        // and should not set ttype_matched.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ascii);
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, SB, OPT_TTYPE, IAC, SE, b'A'])
+            .await
+            .unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'A'));
+        assert!(!session.ttype_matched);
+    }
+
+    #[tokio::test]
+    async fn test_dont_without_prior_will_is_silent() {
+        // Peer sends DONT ECHO without us having advertised WILL ECHO.
+        // We should not reply (no WONT) per RFC 1143 (prevents loops).
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, DONT, OPT_ECHO, b'Z'])
+            .await
+            .unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'Z'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        // No reply expected.
+        assert!(
+            out.is_empty(),
+            "DONT for unadvertised option should be silent, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wont_without_prior_do_is_silent() {
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, WONT, 0x42, b'Z']).await.unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'Z'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        assert!(
+            out.is_empty(),
+            "WONT for unadvertised option should be silent, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_do_echo_is_ack_when_we_willed_echo() {
+        // Peer's DO ECHO is an acknowledgement of our WILL ECHO — no reply.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.neg_sent_will[OPT_ECHO as usize] = true;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, DO, OPT_ECHO, b'Q']).await.unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'Q'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        // Must NOT contain a WONT ECHO — DO is just an ack.
+        let wont_echo = [IAC, WONT, OPT_ECHO];
+        assert!(
+            !out.windows(3).any(|w| w == wont_echo),
+            "should not have replied to DO ECHO ack, got {:?}",
+            out
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subneg_with_sb_payload_then_data() {
+        // Two subnegs back-to-back, then a data byte. Verify both are
+        // processed and we return the data byte cleanly.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ascii);
+        session.neg_sent_do[OPT_TTYPE as usize] = true;
+        session.neg_sent_do[OPT_NAWS as usize] = true;
+
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, SB, OPT_TTYPE, TTYPE_IS]).await.unwrap();
+        peer.write_all(b"XTERM").await.unwrap();
+        peer.write_all(&[IAC, SE, IAC, SB, OPT_NAWS, 0x00, 0x50, 0x00, 0x18, IAC, SE, b'*'])
+            .await
+            .unwrap();
+
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'*'));
+        assert_eq!(session.terminal_type, TerminalType::Ansi);
+        assert_eq!(session.window_width, Some(80));
+        assert_eq!(session.window_height, Some(24));
+    }
+
+    #[tokio::test]
+    async fn test_nop_is_silently_consumed() {
+        // IAC NOP (0xF1) has no option byte and needs no reply.
+        const NOP: u8 = 0xF1;
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, NOP, b'X']).await.unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'X'));
+
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty(), "NOP should produce no reply, got {:?}", out);
     }
 }

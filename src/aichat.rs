@@ -104,8 +104,8 @@ mod tests {
 
     #[test]
     fn test_api_timeout_is_reasonable() {
-        assert!(API_TIMEOUT_SECS >= 10, "too short for LLM response");
-        assert!(API_TIMEOUT_SECS <= 120, "too long to wait");
+        const _: () = assert!(API_TIMEOUT_SECS >= 10, "too short for LLM response");
+        const _: () = assert!(API_TIMEOUT_SECS <= 120, "too long to wait");
     }
 
     #[test]

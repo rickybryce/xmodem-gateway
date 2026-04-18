@@ -810,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn test_consume_telnet_sb_long() {
         let mut data: Vec<u8> = Vec::new();
-        data.extend(std::iter::repeat(0x42).take(1000));
+        data.extend(std::iter::repeat_n(0x42, 1000));
         data.push(IAC);
         data.push(SE);
         let mut reader = std::io::Cursor::new(data);

@@ -1276,13 +1276,13 @@ mod tests {
     #[test]
     fn test_default_dialup_entry() {
         // The default starter entry should be 1234567 -> telnetbible.com:6400
-        let defaults = vec![DialupEntry {
+        let default = DialupEntry {
             number: "1234567".into(),
             host: "telnetbible.com".into(),
             port: 6400,
-        }];
-        assert_eq!(defaults[0].number, "1234567");
-        assert_eq!(defaults[0].host, "telnetbible.com");
-        assert_eq!(defaults[0].port, 6400);
+        };
+        assert_eq!(default.number, "1234567");
+        assert_eq!(default.host, "telnetbible.com");
+        assert_eq!(default.port, 6400);
     }
 }

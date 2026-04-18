@@ -1756,8 +1756,8 @@ mod tests {
 
     #[test]
     fn test_max_cmd_len_constant() {
-        assert!(MAX_CMD_LEN >= 40, "buffer must hold standard AT commands");
-        assert!(MAX_CMD_LEN <= 1024, "buffer should not be excessively large");
+        const _: () = assert!(MAX_CMD_LEN >= 40, "buffer must hold standard AT commands");
+        const _: () = assert!(MAX_CMD_LEN <= 1024, "buffer should not be excessively large");
     }
 
     // ─── AT command edge cases ──────────────────────────
@@ -1909,7 +1909,6 @@ mod tests {
     #[test]
     fn test_dial_target_host_with_port_zero() {
         // Port 0 should be rejected
-        let mut echo = true;
         let target = "host:0";
         let (_, p) = target.rsplit_once(':').unwrap();
         let port = p.parse::<u16>().unwrap();
