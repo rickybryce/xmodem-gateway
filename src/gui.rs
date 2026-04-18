@@ -30,6 +30,8 @@ const CONSOLE_TEXT: Color32 = Color32::from_rgb(0x33, 0xcc, 0x33);
 const SCRIPTURE: Color32 = Color32::from_rgb(0xc0, 0xaa, 0x60);  // lighter amber for verse
 const CONSOLE_BG: Color32 = Color32::from_rgb(0x08, 0x12, 0x28); // deeper blue for console
 const SELECTION: Color32 = Color32::from_rgb(0x26, 0x4f, 0x78);
+const POPUP_BG: Color32 = Color32::from_rgb(0x04, 0x18, 0x0a);      // deep forest green — popup panel
+const POPUP_INPUT_BG: Color32 = Color32::from_rgb(0x1c, 0x46, 0x2a); // brighter green — text entry on popups
 
 /// Launch the GUI window.  Blocks the calling thread until the window is closed.
 /// If the GUI fails to start (e.g. missing graphics drivers), logs the error and
@@ -871,6 +873,12 @@ impl eframe::App for App {
         // layout.  Each popup mirrors the primary controls and adds
         // per-frame advanced fields, with its own Save button.
         let ctx = ui.ctx().clone();
+        // Dark-burgundy frame so popups read as distinct from the
+        // navy main panels.  Derived from the window style so corner
+        // radius, shadow, and inner margin stay consistent.
+        let popup_frame = egui::Frame::window(&ctx.global_style())
+            .fill(POPUP_BG)
+            .stroke(Stroke::new(1.0, AMBER));
 
         let mut server_open = self.server_popup_open;
         egui::Window::new(egui::RichText::new("Server — More").strong().color(AMBER_BRIGHT))
@@ -878,7 +886,10 @@ impl eframe::App for App {
             .resizable(true)
             .collapsible(false)
             .default_width(440.0)
+            .frame(popup_frame)
             .show(&ctx, |ui| {
+                // Lighter-green text-entry backgrounds scoped to this popup.
+                ui.visuals_mut().extreme_bg_color = POPUP_INPUT_BG;
                 self.draw_server_controls(ui);
                 ui.add_space(6.0);
                 ui.separator();
@@ -907,7 +918,9 @@ impl eframe::App for App {
             .resizable(true)
             .collapsible(false)
             .default_width(520.0)
+            .frame(popup_frame)
             .show(&ctx, |ui| {
+                ui.visuals_mut().extreme_bg_color = POPUP_INPUT_BG;
                 self.draw_serial_controls(ui);
                 ui.add_space(6.0);
                 ui.separator();

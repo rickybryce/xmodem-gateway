@@ -76,9 +76,11 @@ const DEFAULT_SSH_USERNAME: &str = "admin";
 const DEFAULT_SSH_PASSWORD: &str = "changeme";
 /// Default SSH-gateway authentication mode: "key" uses the gateway's
 /// auto-generated Ed25519 client key; "password" prompts the operator
-/// for a remote password on each connect.  Pubkey is the modern default
-/// because the gateway ships a client key out of the box.
-const DEFAULT_SSH_GATEWAY_AUTH: &str = "key";
+/// for a remote password on each connect.  Password is the default
+/// because most remote SSH accounts accept passwords out of the box —
+/// key mode requires the operator to first install the gateway's
+/// public key on the remote's `~/.ssh/authorized_keys`.
+const DEFAULT_SSH_GATEWAY_AUTH: &str = "password";
 
 /// Runtime configuration loaded from `xmodem.conf`.
 #[derive(Debug, Clone, PartialEq)]
@@ -594,8 +596,9 @@ ssh_password = {}
 # Authentication mode for the OUTBOUND SSH Gateway (the menu item that
 # proxies to a remote SSH server).  Values:
 #   key      — use the gateway's built-in Ed25519 client key.  Copy the
-#              public half (printed by `cat gateway_client_key.pub`) into
-#              the remote's ~/.ssh/authorized_keys first.
+#              public half (shown in the GUI Server > More popup, or
+#              extract with `ssh-keygen -y -f xmodem_gateway_ssh_key`)
+#              into the remote's ~/.ssh/authorized_keys first.
 #   password — prompt the operator for the remote account's password on
 #              each connect.  No key is offered.
 ssh_gateway_auth = {}

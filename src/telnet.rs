@@ -4420,10 +4420,10 @@ impl TelnetSession {
                 self.show_error("Authentication failed.").await?;
             } else {
                 self.show_error(
-                    "Key authentication failed. Copy the gateway public key \
-                     (cat gateway_client_key.pub) to the remote's \
-                     ~/.ssh/authorized_keys, or switch to Password mode in \
-                     Server > More.",
+                    "Key authentication failed. Copy the gateway's public \
+                     key (shown in the GUI Server > More popup) into the \
+                     remote's ~/.ssh/authorized_keys, or switch to Password \
+                     mode from Configuration > Gateway Configuration.",
                 )
                 .await?;
             }
@@ -6423,12 +6423,16 @@ impl TelnetSession {
                 "    Connect to this gateway",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
-                "  ATDL Redial last number",
-                "  AT&V Show settings",
-                "  AT&W Save settings",
-                "  +++  Return to command mode",
-                "  ATO  Return online",
-                "  ATH  Hang up",
+                "  ATDL   Redial last number",
+                "  AT&Zn=s  Store number in slot n",
+                "  ATDSn    Dial stored slot 0-3",
+                "  ATIn     Info 0-7 (model, config)",
+                "  A/       Repeat last command",
+                "  AT&V   Show settings",
+                "  AT&W   Save settings",
+                "  +++    Return to command mode",
+                "  ATO    Return online",
+                "  ATH    Hang up",
             ]
         } else {
             &[
@@ -6441,13 +6445,20 @@ impl TelnetSession {
                 "    Connect to this gateway's menus",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
-                "  ATDL   Redial last number",
-                "  AT&V   Show current settings",
-                "  AT&W   Save settings to config",
-                "  ATSn?  Query S-register",
-                "  +++    Return to command mode",
-                "  ATO    Return to online mode",
-                "  ATH    Hang up connection",
+                "  ATDL       Redial last number",
+                "  AT&Zn=str  Store number in slot n (0-3)",
+                "  ATDSn      Dial stored slot 0-3",
+                "  ATIn       Info queries 0-7 (model,",
+                "             config, ROM checksum, etc.)",
+                "  ATXn       Result-code level 0-4",
+                "  AT&Cn/&Dn/&Kn  DCD / DTR / flow mode",
+                "  A/         Repeat the last AT command",
+                "  AT&V       Show current settings",
+                "  AT&W       Save settings to config",
+                "  ATSn?      Query S-register",
+                "  +++        Return to command mode",
+                "  ATO        Return to online mode",
+                "  ATH        Hang up connection",
             ]
         };
         self.show_help_page("MODEM EMULATOR HELP", lines).await
@@ -6468,6 +6479,11 @@ impl TelnetSession {
             self.send_line(&format!(
                 "  {}  Security",
                 self.cyan("E")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Gateway Configuration",
+                self.cyan("G")
             ))
             .await?;
             self.send_line(&format!(
@@ -6516,6 +6532,9 @@ impl TelnetSession {
                 "e" => {
                     self.security_settings().await?;
                 }
+                "g" => {
+                    self.gateway_configuration().await?;
+                }
                 "m" => {
                     self.modem_settings().await?;
                 }
@@ -6536,6 +6555,8 @@ impl TelnetSession {
                         &[
                             "  E  Security: require login,",
                             "     set usernames and passwords",
+                            "  G  Gateway: configure outbound",
+                            "     Telnet and SSH Gateway menus",
                             "  M  Modem: configure the serial",
                             "     port for modem emulation",
                             "  S  Server: enable/disable",
@@ -6552,6 +6573,8 @@ impl TelnetSession {
                         &[
                             "  E  Security: require login, set",
                             "     usernames and passwords",
+                            "  G  Gateway: configure the outbound",
+                            "     Telnet and SSH Gateway menus",
                             "  M  Modem: configure the serial port",
                             "     for modem emulation",
                             "  S  Server: enable/disable services,",
@@ -6568,7 +6591,7 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 _ => {
-                    self.show_error("Press E, M, O, S, X, R, H, or Q.").await?;
+                    self.show_error("Press E, G, M, O, S, X, R, H, or Q.").await?;
                 }
             }
         }
@@ -7180,6 +7203,148 @@ impl TelnetSession {
         }
     }
 
+    // ─── GATEWAY CONFIGURATION ──────────────────────────────
+    //
+    // Submenu of Server Configuration.  Edits the two persistent
+    // outbound-gateway modes so the user doesn't have to touch the GUI
+    // or `xmodem.conf` for these settings.  Changes take effect on the
+    // next gateway connection — no server restart needed.
+    async fn gateway_configuration(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("GATEWAY CONFIGURATION")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            let telnet_mode = if cfg.telnet_gateway_raw {
+                self.red("Raw TCP")
+            } else {
+                self.green("Telnet")
+            };
+            self.send_line(&format!("  Telnet mode: {}", telnet_mode))
+                .await?;
+            let ssh_auth = if cfg.ssh_gateway_auth == "password" {
+                self.yellow("Password")
+            } else {
+                self.green("Key")
+            };
+            self.send_line(&format!("  SSH auth:    {}", ssh_auth))
+                .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Toggle telnet mode (Telnet/Raw)",
+                self.cyan("T")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle SSH auth (Key/Password)",
+                self.cyan("S")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/server/gateway"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "t" => {
+                    let new_val = if cfg.telnet_gateway_raw { "false" } else { "true" };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("telnet_gateway_raw", &v);
+                    })
+                    .await
+                    .ok();
+                }
+                "s" => {
+                    let new_val = if cfg.ssh_gateway_auth == "password" {
+                        "key"
+                    } else {
+                        "password"
+                    };
+                    let v = new_val.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value("ssh_gateway_auth", &v);
+                    })
+                    .await
+                    .ok();
+                }
+                "h" => {
+                    self.gateway_config_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press T, S, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn gateway_config_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure the outbound Telnet",
+                "  and SSH Gateway menus.",
+                "",
+                "  Telnet mode:",
+                "    Telnet - parse IAC (default)",
+                "    Raw    - raw TCP, no IAC",
+                "",
+                "  SSH auth:",
+                "    Key      - gateway Ed25519 key",
+                "    Password - prompt each time",
+                "",
+                "  Changes take effect on the",
+                "  next gateway connection.",
+            ]
+        } else {
+            &[
+                "  Configure the outbound Telnet and SSH",
+                "  Gateway menus (the S and T items on the",
+                "  main menu that proxy to remote servers).",
+                "",
+                "  Telnet mode:",
+                "    Telnet  - parse IAC option negotiation",
+                "              (default; works with real",
+                "              telnet servers)",
+                "    Raw     - raw TCP byte stream, no IAC",
+                "              (for MUDs and hand-rolled BBS",
+                "              software that aren't telnet)",
+                "",
+                "  SSH auth:",
+                "    Key      - offer the gateway's Ed25519",
+                "               client key (paste the public",
+                "               half into the remote's",
+                "               ~/.ssh/authorized_keys first)",
+                "    Password - prompt for the remote account",
+                "               password on each connect",
+                "",
+                "  Changes are saved immediately and take",
+                "  effect on the next gateway connection.",
+                "  No server restart is required.",
+            ]
+        };
+        self.show_help_page("GATEWAY CONFIG HELP", lines).await
+    }
+
     async fn config_set_port(
         &mut self,
         label: &str,
@@ -7322,9 +7487,6 @@ impl TelnetSession {
         let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
             &[
                 "  Change settings for THIS server.",
-                "  The SSH Gateway and Telnet",
-                "  Gateway options in the main",
-                "  menu are not affected.",
                 "",
                 "  T  Enable or disable the telnet",
                 "     server listener",
@@ -7340,10 +7502,6 @@ impl TelnetSession {
         } else {
             &[
                 "  Change settings for THIS server.",
-                "  The SSH Gateway and Telnet Gateway",
-                "  options in the main menu (outbound",
-                "  connections to other servers) are not",
-                "  affected by these settings.",
                 "",
                 "  T  Enable or disable the telnet server",
                 "  P  Change the telnet listening port",
