@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use eframe::egui;
+use egui::text::{CCursor, CCursorRange};
+use egui::widgets::text_edit::TextEditState;
 use egui::{Color32, Stroke};
 
 use crate::config::{self, Config};
@@ -322,12 +324,7 @@ impl App {
                 Err(e) => format!("<could not load key: {}>", e),
             };
             let mut key_display = pubkey;
-            ui.add(
-                egui::TextEdit::multiline(&mut key_display)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .interactive(true),
-            );
+            multiline_with_menu(ui, &mut key_display, 2);
         }
     }
 
@@ -470,11 +467,7 @@ impl App {
             .italics()
             .small(),
         );
-        ui.add(
-            egui::TextEdit::multiline(&mut self.cfg.serial_s_regs)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
+        multiline_with_menu(ui, &mut self.cfg.serial_s_regs, 2);
 
         ui.add_space(6.0);
         ui.separator();
@@ -487,10 +480,7 @@ impl App {
         for (i, slot) in self.cfg.serial_stored_numbers.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("&Z{} =", i));
-                ui.add(
-                    egui::TextEdit::singleline(slot)
-                        .desired_width(f32::INFINITY),
-                );
+                singleline_with_menu(ui, slot, false, Some(f32::INFINITY));
             });
         }
     }
@@ -503,6 +493,74 @@ impl App {
         self.last_synced_cfg = self.cfg.clone();
         self.dirty = false;
         logger::log("Configuration saved.".into());
+    }
+
+    /// Render the console panel as a single read-only multiline `TextEdit`.
+    /// Doing this (instead of one label per line) gives us native mouse-drag
+    /// selection plus our standard right-click menu — including the
+    /// selection-restore-on-right-click fix.  The buffer is rebuilt from
+    /// `console_lines` every frame, so any user keystrokes that slip in
+    /// (the `TextEdit` is technically editable) are silently discarded.
+    fn draw_console_textedit(&mut self, ui: &mut egui::Ui) {
+        let mut text = self.console_lines.join("\n");
+        let row_count = self.console_lines.len().max(1);
+
+        let id = ui.next_auto_id();
+        let prev_range = TextEditState::load(ui.ctx(), id)
+            .and_then(|s| s.cursor.char_range());
+
+        let te = egui::TextEdit::multiline(&mut text)
+            .font(egui::TextStyle::Monospace)
+            .text_color(CONSOLE_TEXT)
+            .desired_width(f32::INFINITY)
+            .desired_rows(row_count)
+            .frame(egui::Frame::NONE);
+
+        let mut output = te.show(ui);
+        restore_selection_after_right_click(
+            ui.ctx(),
+            id,
+            &output.response.response,
+            &mut output.state,
+            prev_range,
+        );
+
+        let cursor_range = output.state.cursor.char_range();
+        let response = output.response.response.clone();
+        let mut state = output.state;
+        let ctx = ui.ctx().clone();
+        let lines_joined = self.console_lines.join("\n");
+
+        response.context_menu(move |ui| {
+            let has_selection = cursor_range.is_some_and(|r| !r.is_empty());
+            ui.add_enabled_ui(has_selection, |ui| {
+                if ui.button("Copy").clicked() {
+                    if let Some(range) = cursor_range {
+                        let [start, end] = range.sorted_cursors();
+                        let (s, e) = (start.index, end.index);
+                        let selected: String =
+                            text.chars().skip(s).take(e.saturating_sub(s)).collect();
+                        ctx.copy_text(selected);
+                    }
+                    ui.close();
+                }
+            });
+            if ui.button("Copy all").clicked() {
+                ctx.copy_text(lines_joined);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Select All").clicked() {
+                let len = text.chars().count();
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(0),
+                    CCursor::new(len),
+                )));
+                state.clone().store(&ctx, id);
+                ctx.memory_mut(|mem| mem.request_focus(id));
+                ui.close();
+            }
+        });
     }
 
     /// Pull the global config singleton and, if it changed since our last
@@ -533,16 +591,187 @@ impl App {
 /// Helper: labeled text field in a horizontal row.
 fn labeled_field(ui: &mut egui::Ui, label: &str, buf: &mut String, width: f32) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(buf).desired_width(width));
+    singleline_with_menu(ui, buf, false, Some(width));
 }
 
 /// Helper: labeled password field in a horizontal row.
 fn labeled_password(ui: &mut egui::Ui, label: &str, buf: &mut String) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(buf).password(true));
+    singleline_with_menu(ui, buf, true, None);
 }
 
-const CONSOLE_FONT_SIZE: f32 = 16.0;
+/// A singleline `TextEdit` with a Cut/Copy/Paste/Select All right-click menu.
+/// When `password` is true, Cut/Copy are disabled so the password text is
+/// never written to the clipboard.
+fn singleline_with_menu(
+    ui: &mut egui::Ui,
+    buf: &mut String,
+    password: bool,
+    desired_width: Option<f32>,
+) -> egui::Response {
+    let id = ui.next_auto_id();
+    let prev_range = TextEditState::load(ui.ctx(), id)
+        .and_then(|s| s.cursor.char_range());
+
+    let mut te = egui::TextEdit::singleline(buf).password(password);
+    if let Some(w) = desired_width {
+        te = te.desired_width(w);
+    }
+    let mut output = te.show(ui);
+    restore_selection_after_right_click(
+        ui.ctx(),
+        id,
+        &output.response.response,
+        &mut output.state,
+        prev_range,
+    );
+    attach_text_edit_menu(ui.ctx(), &output.response.response, output.state, buf, password);
+    output.response.response
+}
+
+/// A multiline (full-width) `TextEdit` with a Cut/Copy/Paste/Select All
+/// right-click menu.
+fn multiline_with_menu(
+    ui: &mut egui::Ui,
+    buf: &mut String,
+    desired_rows: usize,
+) -> egui::Response {
+    let id = ui.next_auto_id();
+    let prev_range = TextEditState::load(ui.ctx(), id)
+        .and_then(|s| s.cursor.char_range());
+
+    let te = egui::TextEdit::multiline(buf)
+        .desired_rows(desired_rows)
+        .desired_width(f32::INFINITY);
+    let mut output = te.show(ui);
+    restore_selection_after_right_click(
+        ui.ctx(),
+        id,
+        &output.response.response,
+        &mut output.state,
+        prev_range,
+    );
+    attach_text_edit_menu(ui.ctx(), &output.response.response, output.state, buf, false);
+    output.response.response
+}
+
+/// Egui's `TextEdit` collapses any active selection on every mouse *press*,
+/// including the secondary (right) press that summons our context menu — so
+/// by the time the menu opens, the selection is gone and Copy is not useful.
+///
+/// We have to act on the **press** frame (when the selection was actually
+/// cleared) rather than the click/release frame: by release the persisted
+/// state is already empty, so `prev_range` would be empty too.  We detect a
+/// secondary press over this widget, then restore the selection that was
+/// captured from the *previous* frame's state.
+fn restore_selection_after_right_click(
+    ctx: &egui::Context,
+    id: egui::Id,
+    response: &egui::Response,
+    state: &mut TextEditState,
+    prev_range: Option<CCursorRange>,
+) {
+    let secondary_press_on_widget = response.contains_pointer()
+        && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+    if !secondary_press_on_widget {
+        return;
+    }
+    let Some(prev) = prev_range else { return };
+    if prev.is_empty() {
+        return;
+    }
+    let cleared = state.cursor.char_range().is_none_or(|r| r.is_empty());
+    if cleared {
+        state.cursor.set_char_range(Some(prev));
+        state.clone().store(ctx, id);
+    }
+}
+
+/// Attach a right-click context menu (Cut / Copy / Paste / Select All) to a
+/// `TextEdit` that has already been rendered.  The freshly-loaded `state` is
+/// re-stored after any cursor or buffer mutation so the next frame picks up
+/// the change.
+fn attach_text_edit_menu(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    mut state: TextEditState,
+    buf: &mut String,
+    password: bool,
+) {
+    let cursor_range = state.cursor.char_range();
+    let id = response.id;
+    let ctx = ctx.clone();
+
+    response.context_menu(move |ui| {
+        let has_selection = cursor_range.is_some_and(|r| !r.is_empty());
+
+        ui.add_enabled_ui(has_selection && !password, |ui| {
+            if ui.button("Cut").clicked() {
+                if let Some(range) = cursor_range {
+                    let [start, end] = range.sorted_cursors();
+                    let (s, e) = (start.index, end.index);
+                    let selected: String =
+                        buf.chars().skip(s).take(e.saturating_sub(s)).collect();
+                    ctx.copy_text(selected);
+                    let mut new_buf = String::with_capacity(buf.len());
+                    new_buf.extend(buf.chars().take(s));
+                    new_buf.extend(buf.chars().skip(e));
+                    *buf = new_buf;
+                    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(s))));
+                    state.clone().store(&ctx, id);
+                }
+                ui.close();
+            }
+            if ui.button("Copy").clicked() {
+                if let Some(range) = cursor_range {
+                    let [start, end] = range.sorted_cursors();
+                    let (s, e) = (start.index, end.index);
+                    let selected: String =
+                        buf.chars().skip(s).take(e.saturating_sub(s)).collect();
+                    ctx.copy_text(selected);
+                }
+                ui.close();
+            }
+        });
+        if ui.button("Paste").clicked() {
+            if let Ok(mut cb) = arboard::Clipboard::new()
+                && let Ok(text) = cb.get_text()
+            {
+                let (s, e) = match cursor_range {
+                    Some(range) => {
+                        let [start, end] = range.sorted_cursors();
+                        (start.index, end.index)
+                    }
+                    None => {
+                        let n = buf.chars().count();
+                        (n, n)
+                    }
+                };
+                let mut new_buf = String::with_capacity(buf.len() + text.len());
+                new_buf.extend(buf.chars().take(s));
+                new_buf.push_str(&text);
+                new_buf.extend(buf.chars().skip(e));
+                *buf = new_buf;
+                let new_pos = s + text.chars().count();
+                state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_pos))));
+                state.clone().store(&ctx, id);
+            }
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Select All").clicked() {
+            let len = buf.chars().count();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(0),
+                CCursor::new(len),
+            )));
+            state.clone().store(&ctx, id);
+            // Focus the field so the selection is visible.
+            ctx.memory_mut(|mem| mem.request_focus(id));
+            ui.close();
+        }
+    });
+}
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -581,14 +810,7 @@ impl eframe::App for App {
                         .stick_to_bottom(true)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for line in &self.console_lines {
-                                ui.label(
-                                    egui::RichText::new(line)
-                                        .monospace()
-                                        .size(CONSOLE_FONT_SIZE)
-                                        .color(CONSOLE_TEXT),
-                                );
-                            }
+                            self.draw_console_textedit(ui);
                         });
                 });
             });
@@ -697,7 +919,7 @@ impl eframe::App for App {
                                 ui.label(egui::RichText::new("File Transfer (XMODEM)").strong().color(AMBER));
                                 ui.horizontal(|ui| {
                                     ui.label("Dir:");
-                                    ui.text_edit_singleline(&mut self.cfg.transfer_dir);
+                                    singleline_with_menu(ui, &mut self.cfg.transfer_dir, false, None);
                                 });
                                 ui.horizontal(|ui| {
                                     labeled_field(ui, "Negotiate:", &mut self.negotiation_timeout_buf, 40.0);
@@ -718,11 +940,11 @@ impl eframe::App for App {
                                 ui.label(egui::RichText::new("AI Chat, Browser, and Weather").strong().color(AMBER));
                                 ui.horizontal(|ui| {
                                     ui.label("API Key:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.groq_api_key).password(true));
+                                    singleline_with_menu(ui, &mut self.cfg.groq_api_key, true, None);
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Home:");
-                                    ui.text_edit_singleline(&mut self.cfg.browser_homepage);
+                                    singleline_with_menu(ui, &mut self.cfg.browser_homepage, false, None);
                                     labeled_field(ui, "Zip:", &mut self.cfg.weather_zip, 60.0);
                                 });
                             });
