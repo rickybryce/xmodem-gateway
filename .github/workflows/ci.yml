@@ -78,6 +78,13 @@ jobs:
   audit:
     name: cargo audit (CVE scan)
     runs-on: ubuntu-latest
+    # `rustsec/audit-check@v2` creates a GitHub Check Run to summarise
+    # advisories, which requires `checks: write`.  Without it the
+    # action fails with "Resource not accessible by integration".
+    # `contents: read` is the minimum needed by actions/checkout.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
