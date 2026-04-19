@@ -1284,19 +1284,20 @@ fn save_known_host(host: &str, port: u16, key: &russh::keys::PublicKey) {
     content.push_str(&entry);
     if let Err(e) = atomic_write(GATEWAY_HOSTS_FILE, &content) {
         glog!("Warning: could not save gateway host key: {}", e);
-        return;
-    }
-    // Restrict mode to owner-only.  The stored host public keys are
-    // themselves public, but the file also exposes the dial history
-    // (which hosts the operator has connected to) — a meaningful
-    // privacy signal that other local users shouldn't have.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            GATEWAY_HOSTS_FILE,
-            std::fs::Permissions::from_mode(0o600),
-        );
+    } else {
+        // Restrict mode to owner-only.  The stored host public keys
+        // are themselves public, but the file also exposes the dial
+        // history (which hosts the operator has connected to) — a
+        // meaningful privacy signal that other local users shouldn't
+        // have.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                GATEWAY_HOSTS_FILE,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
 }
 

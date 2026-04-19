@@ -655,19 +655,19 @@ ssh_gateway_auth = {}
     if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, path)) {
         glog!("Warning: could not write {}: {}", path, e);
         let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    // Restrict to owner-only on Unix — the config holds plaintext
-    // credentials (telnet password, SSH password, Groq API key).  Windows
-    // users on multi-user systems should place the binary in a per-user
-    // folder to get equivalent NTFS ACL protection.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+    } else {
+        // Restrict to owner-only on Unix — the config holds plaintext
+        // credentials (telnet password, SSH password, Groq API key).
+        // Windows users on multi-user systems should place the binary
+        // in a per-user folder to get equivalent NTFS ACL protection.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
 }
 
@@ -897,18 +897,18 @@ pub fn save_dialup_mappings(entries: &[DialupEntry]) {
     if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, DIALUP_FILE)) {
         glog!("Warning: could not write {}: {}", DIALUP_FILE, e);
         let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    // Restrict to owner-only on Unix — the mapping file reveals the
-    // host/port pairs the operator has configured, which is a meaningful
-    // privacy signal other local users shouldn't have.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            DIALUP_FILE,
-            std::fs::Permissions::from_mode(0o600),
-        );
+    } else {
+        // Restrict to owner-only on Unix — the mapping file reveals
+        // the host/port pairs the operator has configured, which is a
+        // meaningful privacy signal other local users shouldn't have.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                DIALUP_FILE,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
 }
 
