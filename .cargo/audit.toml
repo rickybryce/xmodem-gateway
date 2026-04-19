@@ -1,0 +1,28 @@
+# cargo-audit configuration — waivers for advisories we've triaged and
+# cannot or should not act on.  Each entry MUST have a nearby comment
+# explaining the mitigation so future maintainers understand why this
+# is still here.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (CVE-2023-49092) — "Marvin Attack" timing
+    # side-channel in the `rsa` crate.  No upstream patch is available
+    # as of 2026-04: the constant-time rewrite is still in progress.
+    # Pulled in transitively via `russh` → `internal-russh-forked-ssh-key`
+    # for RSA host-key signature verification on legacy SSH servers.
+    #
+    # Mitigation for our deployment:
+    #   * The SSH Gateway is an OUTBOUND client, not a server exposing
+    #     RSA signing to network attackers.  Marvin requires observing
+    #     signature timing on the signing side; our server does not
+    #     sign with RSA.
+    #   * The inbound SSH SERVER uses an Ed25519 host key only (see
+    #     `load_or_generate_host_key` in src/ssh.rs), so the server's
+    #     signing path is unaffected.
+    #   * The only RSA usage is parsing/verifying remote RSA host keys
+    #     when dialling a remote SSH server — verification, not
+    #     signing, so Marvin does not apply.
+    #
+    # Re-evaluate when `rsa` ≥ 0.11 ships the constant-time impl.
+    "RUSTSEC-2023-0071",
+]
