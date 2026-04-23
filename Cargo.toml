@@ -1,14 +1,14 @@
 [package]
 name = "xmodem-gateway"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 authors = ["Ricky Bryce"]
 license = "GPL-3.0-or-later"
-description = "Telnet/SSH gateway and Hayes AT modem emulator for retro terminals — PETSCII, ANSI, and ASCII. Bridges Commodore 64, CP/M, and similar machines to modern networks with XMODEM file transfer, a web browser, AI chat, weather, SSH and telnet gateways."
+description = "Telnet/SSH gateway and Hayes AT modem emulator for retro terminals — PETSCII, ANSI, and ASCII. Bridges Commodore 64, CP/M, and similar machines to modern networks with XMODEM/XMODEM-1K/YMODEM/ZMODEM file transfer, a web browser, AI chat, weather, SSH and telnet gateways."
 repository = "https://github.com/rbryce/xmodem-gateway"
 homepage = "https://github.com/rbryce/xmodem-gateway"
 readme = "README.md"
-keywords = ["telnet", "ssh", "xmodem", "bbs", "retrocomputing"]
+keywords = ["telnet", "ssh", "zmodem", "xmodem", "retrocomputing"]
 categories = ["command-line-utilities", "network-programming", "emulators"]
 rust-version = "1.87"
 # Exclude build artifacts and dev-only files from the published crate.
@@ -37,6 +37,8 @@ rand = "0.10"
 if-addrs = "0.15"
 eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 egui_extras = { version = "0.34", features = ["image"] }
+arboard = { version = "3", default-features = false }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
 [dev-dependencies]
 proptest = "1"

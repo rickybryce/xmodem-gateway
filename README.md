@@ -1,33 +1,34 @@
 # XMODEM Gateway
 
-A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible modem
-emulator for serial-attached retro hardware, text-mode web browser, and AI chat
-client written in Rust. Supports PETSCII (Commodore 64), ANSI, and ASCII
-terminals. Designed for local network use with retro and modern terminal clients.
+A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible
+modem emulator for serial-attached retro hardware, text-mode web browser,
+and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI,
+and ASCII terminals. Designed for local network use with retro and modern
+terminal clients.
 
 **[User Manual](http://telnetbible.com/xmodem-gateway/index.html)**
 
-Once you run the server on your PC, you can telnet to that server from anywhere 
-on your network (allow firewall port 2323).  
+Once you run the server on your PC, you can telnet to that server from
+anywhere on your network (allow firewall port 2323).
 
-Example:  telnet 192.168.1.160:2323 
+Example: `telnet 192.168.1.160:2323`
 
-This program also serves as a modem emulator.  For an Altairduino PRO, connect 
-directly to the altairduino, and set your modem port to be 2SIO2. (A6/A7 on 
-mine).  Remember, you can configure the serial ports by pressing stop and aux1
-up.
+This program also serves as a modem emulator. For an Altairduino PRO,
+connect directly to the altairduino, and set your modem port to be 2SIO2.
+(A6/A7 on mine). Remember, you can configure the serial ports by pressing
+stop and aux1 up.
 
-Run IMP8, then hit T for terminal mode on the Altairduino.  
-Example:  ATDT <host>:2323
-For gateway options:  ATDT xmodem-gateway
-Note:  For the Altairduino, I simply connected my USB to RS232 adapter to the 9 pin RS232 connector.
+Run IMP8, then hit T for terminal mode on the Altairduino.
 
-For other machines, you may need to use a NULL modem adapter (Cross RX and TX).
+Example: `ATDT :2323` — for gateway options: `ATDT xmodem-gateway`
 
+Note: For the Altairduino, I simply connected my USB to RS232 adapter to
+the 9 pin RS232 connector.
+
+For other machines, you may need to use a NULL modem adapter (Cross RX
+and TX).
 
 This should also work with the RC2014 / SC126, etc as well.
-
-
 
 Author: Ricky Bryce
 
@@ -246,7 +247,7 @@ ships with:
 ### Verifying the checksum
 
 ```sh
-sha256sum -c xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 ### Verifying the GPG signature (if present)
@@ -254,8 +255,8 @@ sha256sum -c xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```sh
 gpg --keyserver keys.openpgp.org --recv-keys <KEY_FINGERPRINT>
 gpg --verify \
-    xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz.asc \
-    xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz
+    xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz.asc \
+    xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 ### Verifying the Sigstore signature
@@ -265,11 +266,11 @@ free):
 
 ```sh
 cosign verify-blob \
-    --certificate xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz.pem \
-    --signature   xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz.sig \
+    --certificate xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz.pem \
+    --signature   xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz.sig \
     --certificate-identity-regexp "https://github.com/rbryce/xmodem-gateway/.*" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    xmodem-gateway-v0.3.3-x86_64-unknown-linux-gnu.tar.gz
+    xmodem-gateway-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 This ties the binary to a specific GitHub Actions workflow run on
@@ -360,6 +361,10 @@ opens on startup. The GUI provides:
   saved without editing the file by hand
 - **Serial port auto-detection** -- the Serial Modem section lists detected
   serial ports in a dropdown; click the refresh button to re-scan
+- **"More..." popups** -- the Server, File Transfer, and Serial Modem frames
+  each have a **More...** button that opens an advanced-options window. The
+  File Transfer popup exposes the XMODEM-family timeouts plus the independent
+  ZMODEM tunables (handshake, frame timeout, retry cap) side by side.
 - **User Manual button** -- opens the PDF user manual on GitHub in your browser
 - **Save and Restart Server** -- writes changes to `xmodem.conf` and restarts
   the server so all changes (including security, ports, and credentials) take
@@ -397,9 +402,19 @@ Most settings can be changed from within a telnet or SSH session using the
 **C** (Configuration) menu, which provides submenus for:
 
 - **E** Security -- toggle login requirement, set telnet/SSH credentials
+- **G** Gateway Configuration -- outbound Telnet and SSH Gateway options
 - **M** Modem Emulator -- serial port selection and parameters
 - **S** Server Configuration -- enable/disable telnet and SSH, set ports
-- **X** XMODEM Settings -- transfer directory, timeouts, retry limit
+- **F** File Transfer -- submenu with shared transfer directory and
+  per-protocol settings pages:
+  - **X** XMODEM settings -- negotiation timeout, retry interval
+    (C/NAK poke cadence), block timeout, and retry limit (shared with
+    XMODEM-1K and YMODEM, which use the same protocol code)
+  - **Y** YMODEM settings -- same keys as XMODEM; page calls out the
+    shared-family behavior
+  - **Z** ZMODEM settings -- independent handshake timeout, retry
+    interval (ZRINIT/ZRQINIT re-send cadence), per-frame read timeout,
+    and ZRQINIT/ZRPOS/ZDATA retry cap
 - **O** Other Settings -- AI API key, browser homepage, weather zip, verbose
   logging, GUI on startup
 - **R** Reset Defaults -- restore all settings to factory defaults
@@ -455,13 +470,31 @@ browser_homepage = http://telnetbible.com
 # Last-used weather zip code (updated automatically when you check weather)
 weather_zip =
 
-# Verbose logging: set to true for detailed XMODEM protocol diagnostics
+# Verbose logging: set to true for detailed XMODEM/YMODEM/ZMODEM protocol diagnostics
 verbose = false
 
-# XMODEM protocol timeouts
+# XMODEM-family protocol timeouts (apply to XMODEM, XMODEM-1K, and YMODEM —
+# they share the same protocol code path).
+# xmodem_negotiation_timeout:        seconds to wait for the peer to start sending.
+# xmodem_block_timeout:              seconds to wait for each data block.
+# xmodem_max_retries:                retry limit per block.
+# xmodem_negotiation_retry_interval: seconds between C/NAK pokes during the
+#                                    initial handshake (spec ~10 s, default 7).
 xmodem_negotiation_timeout = 45
 xmodem_block_timeout = 20
 xmodem_max_retries = 10
+xmodem_negotiation_retry_interval = 7
+
+# ZMODEM protocol tunables (independent of the XMODEM family).
+# zmodem_negotiation_timeout:        seconds to wait for ZRQINIT / ZRINIT handshake.
+# zmodem_frame_timeout:              seconds to wait for each header / subpacket.
+# zmodem_max_retries:                retry limit for ZRQINIT / ZRPOS / ZDATA frames.
+# zmodem_negotiation_retry_interval: seconds between ZRINIT / ZRQINIT re-sends
+#                                    during the handshake (default 5).
+zmodem_negotiation_timeout = 45
+zmodem_frame_timeout = 30
+zmodem_max_retries = 10
+zmodem_negotiation_retry_interval = 5
 
 # Serial modem emulation (Hayes AT commands)
 # Set serial_enabled = true and configure the port to activate.
@@ -574,6 +607,21 @@ Y or N to continue; no default is applied.
 
 ## Transferring Files
 
+### Supported Protocols
+
+The gateway implements four members of the XMODEM family, selectable
+per-transfer from menus on the gateway side:
+
+| Protocol | Block size | CRC | Direction | Notes |
+|----------|------------|-----|-----------|-------|
+| **XMODEM** | 128 B (SOH) | CRC-16 or checksum | up/down | Auto-detects CRC vs. checksum on receive; classic single-file. |
+| **XMODEM-1K** | 1024 B (STX) | CRC-16 | up/down | Download option; on upload the XMODEM/YMODEM branch accepts STX blocks transparently. Opportunistically falls back to SOH if the peer NAKs the first STX. |
+| **YMODEM** | 1024 B + block-0 header | CRC-16 | up/down | Block 0 carries filename + size; the receive path auto-detects it. |
+| **ZMODEM** | variable subpackets (1 K default) | CRC-16 out, CRC-16 or CRC-32 in | up/down | Full Forsberg spec: ZRQINIT handshake, ZDLE escaping, ZSKIP, batch sends and receives. On upload the first file is saved under the name you entered; subsequent files in a batch use the sender's filename (validated, collisions skipped via ZSKIP). |
+
+On upload, the gateway offers **XMODEM / YMODEM** (variant auto-detected) or
+**ZMODEM**. On download, you pick the specific variant you want.
+
 ### Uploading a File to the Server
 
 1. Connect via telnet and navigate to **F** (File Transfer)
@@ -581,14 +629,17 @@ Y or N to continue; no default is applied.
 3. Enter a filename (letters, numbers, dots, hyphens, underscores only; max 64
    characters; cannot start with a dot, cannot contain `..`, must include at
    least one letter or digit)
-4. The server displays "Begin XMODEM send now" and waits up to 45 seconds
-5. In your terminal client, start an XMODEM send of the local file
+4. On the **SELECT UPLOAD PROTOCOL** screen, press **X** (XMODEM / YMODEM —
+   block size, CRC mode, and batch header are auto-detected) or **Z** (ZMODEM)
+5. The server displays "Start XMODEM/YMODEM send now" or "Start ZMODEM send
+   now" and waits up to 45 seconds
+6. In your terminal client, start the matching upload
    - Most terminal programs have a "Send File" or "Upload" option under a
      Transfer or File menu
-   - Select XMODEM as the protocol
-6. The transfer runs at 128-byte blocks with CRC-16 error checking (falls back
-   to checksum mode if the client does not support CRC)
-7. On completion, the server reports bytes, blocks, and elapsed time
+   - ExtraPutty: **File Transfer → Zmodem → Send**; SyncTerm: **Ctrl-PgUp**
+7. On completion, the server reports bytes, blocks, and elapsed time. For
+   ZMODEM batches, every file the sender transmits is listed (saved or
+   skipped)
 
 ### Downloading a File from the Server
 
@@ -596,11 +647,13 @@ Y or N to continue; no default is applied.
 2. The server lists files in the current transfer directory (paginated, 10 per
    page)
 3. Enter the number of the file to download
-4. The server displays "Start XMODEM receive now" and waits up to 45 seconds
-5. In your terminal client, start an XMODEM receive
-   - Select XMODEM as the protocol
-   - Choose where to save the file locally
-6. On completion, the server reports the transfer result
+4. On the **SELECT PROTOCOL** screen, choose **X** (XMODEM), **1** (XMODEM-1K),
+   **Y** (YMODEM), or **Z** (ZMODEM)
+5. The server prompts "Start XMODEM/YMODEM/ZMODEM receive now" and waits up
+   to 45 seconds
+6. In your terminal client, start the matching receive and choose where to
+   save the file locally (ZMODEM auto-starts in most modern terminals)
+7. On completion, the server reports the transfer result
 
 ### Other File Operations
 

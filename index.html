@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>XMODEM Gateway v0.3.1 &mdash; User Manual</title>
+    <title>XMODEM Gateway v0.3.5 &mdash; User Manual</title>
     <meta name="description" content="Complete user manual for XMODEM Gateway — a telnet/SSH gateway server with XMODEM file transfer, AI chat, web browser, weather, and serial modem emulation.">
     <style>
         :root {
@@ -519,7 +519,7 @@
             </div>
             <h1>XMODEM Gateway</h1>
             <p class="hdr-tagline">User Manual</p>
-            <div class="hdr-version">v0.3.1</div>
+            <div class="hdr-version">v0.3.5</div>
             <div class="hdr-badges">
                 <span class="hdr-badge">Telnet</span>
                 <span class="hdr-badge">SSH</span>
@@ -580,7 +580,7 @@
                     <tr>
                         <td class="key-col">[F]</td>
                         <td class="name-col">File Transfer</td>
-                        <td class="desc-col">Upload, download, and delete files via the XMODEM protocol with CRC-16 and checksum support.</td>
+                        <td class="desc-col">Upload, download, and delete files via XMODEM, XMODEM-1K, YMODEM, or ZMODEM (batch).</td>
                     </tr>
                     <tr>
                         <td class="key-col">[S]</td>
@@ -654,7 +654,7 @@
                     automatically.
                 </p>
                 <pre><code><span class="prompt-char">$</span> ./xmodem-gateway
-<span class="output-text">XMODEM Gateway v0.3.1
+<span class="output-text">XMODEM Gateway v0.3.5
 Author: Ricky Bryce
 
 Created default configuration: xmodem.conf
@@ -758,7 +758,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                         <li><strong>A</strong> &mdash; AI Chat: ask questions to an AI</li>
                         <li><strong>B</strong> &mdash; Browser: browse the web</li>
                         <li><strong>C</strong> &mdash; Configuration: server settings and other options</li>
-                        <li><strong>F</strong> &mdash; File Transfer: upload/download files using the XMODEM protocol</li>
+                        <li><strong>F</strong> &mdash; File Transfer: upload/download files using XMODEM, XMODEM-1K, YMODEM, or ZMODEM</li>
                         <li><strong>R</strong> &mdash; Troubleshooting: diagnose terminal input issues</li>
                         <li><strong>S</strong> &mdash; SSH Gateway: connect to a remote server via SSH</li>
                         <li><strong>T</strong> &mdash; Telnet Gateway: connect to a remote server via telnet</li>
@@ -775,7 +775,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
             <!-- ══════════════════════════════════════════════ -->
             <div class="section" id="file-transfer">
                 <div class="section-title">File Transfer</div>
-                <p class="intro">Upload, download, and manage files on the server using the XMODEM protocol.</p>
+                <p class="intro">Upload, download, and manage files on the server using XMODEM, XMODEM-1K, YMODEM, or ZMODEM. The gateway supports the full Forsberg ZMODEM spec including batch sends, batch receives, and ZSKIP.</p>
 
                 <div class="menu-block">
                     <div class="sep">========================================</div>
@@ -798,10 +798,14 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <h3>Steps</h3>
                     <ol>
                         <li>Press <strong>U</strong> to begin an upload</li>
-                        <li>Enter the filename when prompted (max 255 characters, no path separators)</li>
-                        <li>The server waits for your terminal to begin the XMODEM transfer</li>
-                        <li>Start the XMODEM send in your terminal program</li>
-                        <li>Progress is shown as blocks are received</li>
+                        <li>Enter the filename when prompted (max 64 characters; letters, digits, dots, hyphens, underscores; cannot start with a dot; cannot contain <code>..</code>)</li>
+                        <li>If the file already exists, confirm overwrite with <strong>Y</strong></li>
+                        <li>On the <strong>SELECT UPLOAD PROTOCOL</strong> screen press
+                            <strong>X</strong> (XMODEM/YMODEM, block size + CRC mode + YMODEM block-0 header auto-detected) or
+                            <strong>Z</strong> (ZMODEM)</li>
+                        <li>The server waits up to 45 seconds for your terminal to begin sending &mdash; tunable per protocol via <code>xmodem_negotiation_timeout</code> (XMODEM / XMODEM-1K / YMODEM) or <code>zmodem_negotiation_timeout</code> (ZMODEM)</li>
+                        <li>In your terminal client, start the matching send &mdash; e.g. ExtraPutty's <em>File Transfer &rsaquo; Zmodem &rsaquo; Send</em>, SyncTerm's <em>Ctrl-PgUp</em>, or any XMODEM/YMODEM &ldquo;Send File&rdquo; dialog</li>
+                        <li>For a ZMODEM batch, the first file is saved under the name you entered; any additional files the sender transmits are saved under the sender's own filename (after path-safety validation &mdash; colliding names are auto-skipped via ZSKIP)</li>
                     </ol>
                 </div>
 
@@ -810,9 +814,14 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <h3>Steps</h3>
                     <ol>
                         <li>Press <strong>D</strong> to begin a download</li>
-                        <li>A numbered list of files is displayed &mdash; enter the file number</li>
-                        <li>Start the XMODEM receive in your terminal program</li>
-                        <li>The file is sent block by block</li>
+                        <li>A paginated list of files is displayed &mdash; enter the file number</li>
+                        <li>On the <strong>SELECT PROTOCOL</strong> screen press
+                            <strong>X</strong> (XMODEM, 128-byte blocks),
+                            <strong>1</strong> (XMODEM-1K, 1024-byte blocks with SOH fallback),
+                            <strong>Y</strong> (YMODEM, filename + size header),
+                            or <strong>Z</strong> (ZMODEM, auto-starts in most modern terminals)</li>
+                        <li>Start the matching receive in your terminal and choose where to save the file locally</li>
+                        <li>The file is transmitted and the server reports bytes / blocks / elapsed time on completion</li>
                     </ol>
                 </div>
 
@@ -1136,13 +1145,49 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <tr><td>Idle timeout</td><td>900s (15 min)</td><td>Disconnect after inactivity (0 = disabled)</td></tr>
                 </table>
 
-                <div class="cat">XMODEM Settings</div>
+                <div class="cat">File Transfer Settings</div>
+                <p class="dim-text">
+                    In the telnet menu, <strong>Configuration &rsaquo; F File Transfer</strong>
+                    opens a submenu with the shared transfer directory plus per-protocol
+                    pages for <strong>X</strong> XMODEM, <strong>Y</strong> YMODEM, and
+                    <strong>Z</strong> ZMODEM. In the GUI, the same fields live under the
+                    File Transfer frame's <strong>More...</strong> popup.
+                </p>
+
+                <div class="cat" style="margin-top:12px;">Shared</div>
                 <table class="data-table">
                     <tr><th>Setting</th><th>Default</th><th>Range</th></tr>
                     <tr><td>Transfer directory</td><td><code>transfer</code></td><td>&mdash;</td></tr>
+                </table>
+
+                <div class="cat" style="margin-top:12px;">XMODEM / XMODEM-1K / YMODEM</div>
+                <p class="dim-text">
+                    These three protocols share the same <code>xmodem_*</code> config keys
+                    because they use the same send/receive code path. The XMODEM and YMODEM
+                    settings pages edit the same values; the page calls out the shared-family
+                    behavior so operators aren't surprised when editing either page changes
+                    the other.
+                </p>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Range</th></tr>
                     <tr><td>Negotiation timeout</td><td>45s</td><td>1&ndash;300 seconds</td></tr>
+                    <tr><td>Retry interval</td><td>7s</td><td>1&ndash;60 seconds (C / NAK poke cadence; XMODEM/YMODEM spec suggests ~10)</td></tr>
                     <tr><td>Block timeout</td><td>20s</td><td>1&ndash;120 seconds</td></tr>
                     <tr><td>Max retries</td><td>10</td><td>1&ndash;100</td></tr>
+                </table>
+
+                <div class="cat" style="margin-top:12px;">ZMODEM</div>
+                <p class="dim-text">
+                    Independent tunables. These values used to be hardcoded constants in
+                    the ZMODEM implementation; they now live in <code>xmodem.conf</code>
+                    so operators can tune them per environment.
+                </p>
+                <table class="data-table">
+                    <tr><th>Setting</th><th>Default</th><th>Range</th></tr>
+                    <tr><td>Negotiation timeout</td><td>45s</td><td>1&ndash;300 seconds (ZRQINIT / ZRINIT handshake)</td></tr>
+                    <tr><td>Retry interval</td><td>5s</td><td>1&ndash;60 seconds (ZRINIT / ZRQINIT re-send gap)</td></tr>
+                    <tr><td>Frame timeout</td><td>30s</td><td>1&ndash;120 seconds (per header / subpacket read)</td></tr>
+                    <tr><td>Max retries</td><td>10</td><td>1&ndash;100 (ZRQINIT / ZRPOS / ZDATA caps)</td></tr>
                 </table>
 
                 <div class="cat">Modem Emulator Settings</div>
@@ -1199,7 +1244,12 @@ serial_stopbits = 1
 serial_flowcontrol = none
 xmodem_negotiation_timeout = 45
 xmodem_block_timeout = 20
-xmodem_max_retries = 10</span></code></pre>
+xmodem_max_retries = 10
+xmodem_negotiation_retry_interval = 7
+zmodem_negotiation_timeout = 45
+zmodem_frame_timeout = 30
+zmodem_max_retries = 10
+zmodem_negotiation_retry_interval = 5</span></code></pre>
             </div>
 
             <hr class="divider">
@@ -1468,11 +1518,11 @@ xmodem_max_retries = 10</span></code></pre>
                     <tr><th>Symptom</th><th>Solution</th></tr>
                     <tr>
                         <td>Transfer times out before starting</td>
-                        <td>Increase negotiation timeout. Ensure your terminal program is set to XMODEM (not YMODEM/ZMODEM).</td>
+                        <td>Pick the same protocol on both sides: the gateway's upload menu expects either XMODEM/YMODEM or ZMODEM, and the download menu lets you select XMODEM, XMODEM-1K, YMODEM, or ZMODEM explicitly. If your terminal takes a while to open its Send/Receive dialog, increase <code>xmodem_negotiation_timeout</code> (XMODEM / XMODEM-1K / YMODEM, default 45 s) or <code>zmodem_negotiation_timeout</code> (ZMODEM, default 45 s) in <code>xmodem.conf</code>.</td>
                     </tr>
                     <tr>
                         <td>Transfer fails partway through</td>
-                        <td>Increase block timeout and max retries. Check for noisy/slow connection.</td>
+                        <td>For XMODEM/XMODEM-1K/YMODEM raise <code>xmodem_block_timeout</code> and <code>xmodem_max_retries</code>. For ZMODEM raise <code>zmodem_frame_timeout</code> and <code>zmodem_max_retries</code>. Check for a noisy or slow connection.</td>
                     </tr>
                     <tr>
                         <td>Consistent block-CRC failures in the same direction</td>
@@ -1559,7 +1609,7 @@ xmodem_max_retries = 10</span></code></pre>
         <!-- FOOTER                                            -->
         <!-- ══════════════════════════════════════════════════ -->
         <footer class="site-footer">
-            XMODEM Gateway v0.3.1 &mdash; &copy; 2025 Ricky Bryce &mdash;
+            XMODEM Gateway v0.3.5 &mdash; &copy; 2025 Ricky Bryce &mdash;
             Licensed under GPL-3.0-or-later
         </footer>
 

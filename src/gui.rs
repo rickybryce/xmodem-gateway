@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use eframe::egui;
+use egui::text::{CCursor, CCursorRange};
+use egui::widgets::text_edit::TextEditState;
 use egui::{Color32, Stroke};
 
 use crate::config::{self, Config};
@@ -41,7 +43,7 @@ pub fn run(cfg: Config, shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title(format!("XMODEM Gateway v{}", env!("CARGO_PKG_VERSION")))
-                .with_inner_size([990.0, 810.0])
+                .with_inner_size([1120.0, 810.0])
                 .with_min_inner_size([640.0, 480.0]),
             ..Default::default()
         };
@@ -136,6 +138,53 @@ fn local_ip() -> String {
     "unknown".into()
 }
 
+/// Shared tokio runtime used by the folder-picker.  Creating and dropping
+/// a fresh runtime for each pick caused the XDG portal's D-Bus connection
+/// to go stale, so subsequent dialogs never resolved and the button
+/// stayed disabled forever.  A single long-lived runtime avoids that.
+static PICKER_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+    std::sync::OnceLock::new();
+
+fn picker_runtime() -> &'static tokio::runtime::Runtime {
+    PICKER_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("folder-picker")
+            .build()
+            .expect("folder-picker runtime")
+    })
+}
+
+/// Launch a native folder-picker dialog on the shared picker runtime so
+/// it does not block the egui event loop.  Returns the receiver end of
+/// an mpsc channel; the App polls it each frame and updates
+/// `transfer_dir` when the user has chosen a folder (or clears the
+/// in-flight marker if the user cancels).
+fn spawn_folder_picker(
+    current_dir: &str,
+) -> std::sync::mpsc::Receiver<Option<std::path::PathBuf>> {
+    let start = {
+        let p = std::path::PathBuf::from(current_dir);
+        if p.is_dir() {
+            p
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    picker_runtime().spawn(async move {
+        let result = rfd::AsyncFileDialog::new()
+            .set_title("Select transfer directory")
+            .set_directory(&start)
+            .pick_folder()
+            .await
+            .map(|h| h.path().to_path_buf());
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 /// Enumerate available serial ports, returning their device paths.
 fn detect_serial_ports() -> Vec<String> {
     match serialport::available_ports() {
@@ -166,6 +215,11 @@ struct App {
     negotiation_timeout_buf: String,
     block_timeout_buf: String,
     max_retries_buf: String,
+    negotiation_retry_interval_buf: String,
+    zmodem_negotiation_timeout_buf: String,
+    zmodem_frame_timeout_buf: String,
+    zmodem_max_retries_buf: String,
+    zmodem_negotiation_retry_interval_buf: String,
     serial_baud_buf: String,
     // Detected serial ports for the dropdown
     serial_ports: Vec<String>,
@@ -176,6 +230,14 @@ struct App {
     server_popup_open: bool,
     /// Whether the Serial Modem "More..." popup is open.
     serial_popup_open: bool,
+    /// Whether the File Transfer "More..." popup is open.
+    file_transfer_popup_open: bool,
+    /// When the user clicks the folder-browse button, the native dialog
+    /// runs on a background OS thread so it can't block the egui event
+    /// loop.  This channel carries back the chosen path (or None if
+    /// cancelled).  While `Some`, the button is disabled to prevent
+    /// spawning duplicate pickers.
+    pending_dir_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 impl App {
@@ -187,6 +249,13 @@ impl App {
         let negotiation_timeout_buf = cfg.xmodem_negotiation_timeout.to_string();
         let block_timeout_buf = cfg.xmodem_block_timeout.to_string();
         let max_retries_buf = cfg.xmodem_max_retries.to_string();
+        let negotiation_retry_interval_buf =
+            cfg.xmodem_negotiation_retry_interval.to_string();
+        let zmodem_negotiation_timeout_buf = cfg.zmodem_negotiation_timeout.to_string();
+        let zmodem_frame_timeout_buf = cfg.zmodem_frame_timeout.to_string();
+        let zmodem_max_retries_buf = cfg.zmodem_max_retries.to_string();
+        let zmodem_negotiation_retry_interval_buf =
+            cfg.zmodem_negotiation_retry_interval.to_string();
         let serial_baud_buf = cfg.serial_baud.to_string();
         let serial_ports = detect_serial_ports();
         let last_synced_cfg = cfg.clone();
@@ -205,11 +274,18 @@ impl App {
             negotiation_timeout_buf,
             block_timeout_buf,
             max_retries_buf,
+            negotiation_retry_interval_buf,
+            zmodem_negotiation_timeout_buf,
+            zmodem_frame_timeout_buf,
+            zmodem_max_retries_buf,
+            zmodem_negotiation_retry_interval_buf,
             serial_baud_buf,
             serial_ports,
             dirty: false,
             server_popup_open: false,
             serial_popup_open: false,
+            file_transfer_popup_open: false,
+            pending_dir_pick: None,
         }
     }
 
@@ -221,6 +297,11 @@ impl App {
         if let Ok(v) = self.negotiation_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.xmodem_negotiation_timeout = v; }
         if let Ok(v) = self.block_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.xmodem_block_timeout = v; }
         if let Ok(v) = self.max_retries_buf.parse::<usize>() && v >= 1 { self.cfg.xmodem_max_retries = v; }
+        if let Ok(v) = self.negotiation_retry_interval_buf.parse::<u64>() && v >= 1 { self.cfg.xmodem_negotiation_retry_interval = v; }
+        if let Ok(v) = self.zmodem_negotiation_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.zmodem_negotiation_timeout = v; }
+        if let Ok(v) = self.zmodem_frame_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.zmodem_frame_timeout = v; }
+        if let Ok(v) = self.zmodem_max_retries_buf.parse::<u32>() && v >= 1 { self.cfg.zmodem_max_retries = v; }
+        if let Ok(v) = self.zmodem_negotiation_retry_interval_buf.parse::<u64>() && v >= 1 { self.cfg.zmodem_negotiation_retry_interval = v; }
         if let Ok(v) = self.serial_baud_buf.parse::<u32>() && v >= 300 { self.cfg.serial_baud = v; }
     }
 
@@ -235,10 +316,29 @@ impl App {
         }
     }
 
+    /// Check whether a backgrounded folder-picker has delivered a result.
+    /// If the user chose a folder, copy it into `transfer_dir`; if they
+    /// cancelled (or the picker failed), just drop the pending state.
+    fn poll_dir_pick(&mut self) {
+        let Some(rx) = &self.pending_dir_pick else { return };
+        match rx.try_recv() {
+            Ok(Some(path)) => {
+                self.cfg.transfer_dir = path.display().to_string();
+                self.pending_dir_pick = None;
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_dir_pick = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     /// Render the Server frame's primary field rows (telnet/SSH ports,
     /// session cap, idle timeout).  Shared between the main layout and
-    /// the Server popup so both stay in sync.
-    fn draw_server_controls(&mut self, ui: &mut egui::Ui) {
+    /// the Server popup.  When `with_more_button` is true, a right-aligned
+    /// "More..." button is appended to the SSH row; the popup passes false
+    /// since it's already the More view.
+    fn draw_server_controls(&mut self, ui: &mut egui::Ui, with_more_button: bool) {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.cfg.telnet_enabled, "Telnet");
             labeled_field(ui, "Port:", &mut self.telnet_port_buf, 50.0);
@@ -251,6 +351,9 @@ impl App {
             labeled_field(ui, "Port:", &mut self.ssh_port_buf, 50.0);
             ui.add_space(8.0);
             labeled_field(ui, "Idle (s):", &mut self.idle_timeout_buf, 50.0);
+            if with_more_button && right_aligned_small_button(ui, "More...") {
+                self.server_popup_open = true;
+            }
         });
     }
 
@@ -322,19 +425,16 @@ impl App {
                 Err(e) => format!("<could not load key: {}>", e),
             };
             let mut key_display = pubkey;
-            ui.add(
-                egui::TextEdit::multiline(&mut key_display)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .interactive(true),
-            );
+            multiline_with_menu(ui, &mut key_display, 2);
         }
     }
 
     /// Render the Serial Modem frame's primary field rows (port, baud,
     /// line framing, flow control).  Shared between the main layout and
-    /// the Serial popup.
-    fn draw_serial_controls(&mut self, ui: &mut egui::Ui) {
+    /// the Serial popup.  When `with_more_button` is true, a right-aligned
+    /// "More..." button is appended to the Bits/Par/Stop/Flow row; the
+    /// popup passes false since it's already the More view.
+    fn draw_serial_controls(&mut self, ui: &mut egui::Ui, with_more_button: bool) {
         ui.horizontal(|ui| {
             ui.label("Port:");
             let selected = if self.cfg.serial_port.is_empty() {
@@ -402,6 +502,9 @@ impl App {
                         ui.selectable_value(&mut self.cfg.serial_flowcontrol, f.to_string(), f);
                     }
                 });
+            if with_more_button && right_aligned_small_button(ui, "More...") {
+                self.serial_popup_open = true;
+            }
         });
     }
 
@@ -470,11 +573,7 @@ impl App {
             .italics()
             .small(),
         );
-        ui.add(
-            egui::TextEdit::multiline(&mut self.cfg.serial_s_regs)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
+        multiline_with_menu(ui, &mut self.cfg.serial_s_regs, 2);
 
         ui.add_space(6.0);
         ui.separator();
@@ -487,22 +586,227 @@ impl App {
         for (i, slot) in self.cfg.serial_stored_numbers.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("&Z{} =", i));
-                ui.add(
-                    egui::TextEdit::singleline(slot)
-                        .desired_width(f32::INFINITY),
-                );
+                singleline_with_menu(ui, slot, false, Some(f32::INFINITY));
             });
         }
     }
 
-    /// Persist the current in-memory config to disk.  Called by popup
-    /// Save buttons; leaves the server running (no restart).
-    fn save_config_now(&mut self) {
+    /// Render the File Transfer frame's primary rows.  The main layout
+    /// shows the transfer directory plus a quick-glance timeouts row
+    /// (Negotiate / Block / Retries) carrying the XMODEM-family values;
+    /// the popup shows only the directory row because the timeouts are
+    /// repeated in the per-protocol advanced section just below it.
+    ///
+    /// When `with_more_button` is true, a right-aligned "More..." button
+    /// is appended to the timeouts row; the popup passes false (no More
+    /// button needed once you're already in the More view).
+    fn draw_file_transfer_controls(&mut self, ui: &mut egui::Ui, with_more_button: bool) {
+        ui.horizontal(|ui| {
+            ui.label("Dir:");
+            let btn_w = 32.0;
+            let text_w = (ui.available_width() - btn_w - 4.0).max(60.0);
+            singleline_with_menu(ui, &mut self.cfg.transfer_dir, false, Some(text_w));
+            let browse = ui.add_enabled(
+                self.pending_dir_pick.is_none(),
+                egui::Button::new("\u{1F4C1}").small(),
+            );
+            if browse.on_hover_text("Browse for folder").clicked() {
+                self.pending_dir_pick = Some(spawn_folder_picker(&self.cfg.transfer_dir));
+            }
+        });
+        if with_more_button {
+            ui.horizontal(|ui| {
+                labeled_field(ui, "Negotiate:", &mut self.negotiation_timeout_buf, 40.0);
+                labeled_field(ui, "Block:", &mut self.block_timeout_buf, 40.0);
+                labeled_field(ui, "Retries:", &mut self.max_retries_buf, 40.0);
+                if right_aligned_small_button(ui, "More...") {
+                    self.file_transfer_popup_open = true;
+                }
+            });
+        }
+    }
+
+    /// Render the File Transfer frame's advanced options — a per-
+    /// protocol breakdown with XMODEM/YMODEM/ZMODEM sections.  Shown
+    /// only in the File Transfer popup.  XMODEM and YMODEM share the
+    /// same `xmodem_*` keys since they use the same protocol code
+    /// path in `xmodem.rs`; ZMODEM has its own independent timeouts
+    /// defined in `config.rs`.
+    fn draw_file_transfer_advanced(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("XMODEM / XMODEM-1K / YMODEM").strong().color(AMBER));
+        ui.label(
+            egui::RichText::new(
+                "Shared timeouts — XMODEM, XMODEM-1K, and YMODEM all use the same code path.",
+            )
+            .italics()
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            labeled_field(ui, "Negotiate (s):", &mut self.negotiation_timeout_buf, 50.0);
+            labeled_field(ui, "Block (s):", &mut self.block_timeout_buf, 50.0);
+            labeled_field(ui, "Retries:", &mut self.max_retries_buf, 50.0);
+        });
+        ui.horizontal(|ui| {
+            labeled_field(
+                ui,
+                "Retry interval (s):",
+                &mut self.negotiation_retry_interval_buf,
+                50.0,
+            );
+            ui.label(
+                egui::RichText::new(
+                    "(seconds between C/NAK pokes during handshake; spec suggests ~10)",
+                )
+                .italics()
+                .small(),
+            );
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("ZMODEM").strong().color(AMBER));
+        ui.label(
+            egui::RichText::new(
+                "Independent ZMODEM tunables (handshake budget, per-frame read timeout, retry cap).",
+            )
+            .italics()
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            labeled_field(
+                ui,
+                "Negotiate (s):",
+                &mut self.zmodem_negotiation_timeout_buf,
+                50.0,
+            );
+            labeled_field(
+                ui,
+                "Frame (s):",
+                &mut self.zmodem_frame_timeout_buf,
+                50.0,
+            );
+            labeled_field(ui, "Retries:", &mut self.zmodem_max_retries_buf, 50.0);
+        });
+        ui.horizontal(|ui| {
+            labeled_field(
+                ui,
+                "Retry interval (s):",
+                &mut self.zmodem_negotiation_retry_interval_buf,
+                50.0,
+            );
+            ui.label(
+                egui::RichText::new("(ZRINIT / ZRQINIT re-send gap; default 5)")
+                    .italics()
+                    .small(),
+            );
+        });
+    }
+
+    /// Flush numeric text buffers into `cfg`, persist to disk, refresh
+    /// the sync snapshot, and clear the dirty flag.  Shared prefix for
+    /// every Save action; callers follow it with a log line and any
+    /// restart signals they need.
+    fn persist_config(&mut self) {
         self.sync_numeric_fields();
         config::save_config(&self.cfg);
         self.last_synced_cfg = self.cfg.clone();
         self.dirty = false;
+    }
+
+    /// Persist config; leaves the server running (no restart).  Used by
+    /// the popup Save buttons and the per-frame Save buttons on frames
+    /// whose fields are all runtime-safe.
+    fn save_config_now(&mut self) {
+        self.persist_config();
         logger::log("Configuration saved.".into());
+    }
+
+    /// Persist config and trigger a full server restart.  Used by the
+    /// Server frame's Save and Restart button.
+    fn save_and_restart_all(&mut self) {
+        self.persist_config();
+        logger::log("Configuration saved — restarting server...".into());
+        // Set restart BEFORE shutdown so the main loop sees the intent to
+        // restart when it checks after join().
+        self.restart.store(true, Ordering::SeqCst);
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Persist config and signal the serial manager to reopen the port
+    /// with the new settings.  Leaves telnet/SSH sessions untouched.
+    fn save_and_restart_serial(&mut self) {
+        self.persist_config();
+        crate::serial::restart_serial();
+        logger::log("Configuration saved — serial modem reconfigured.".into());
+    }
+
+    /// Render the console panel as a single read-only multiline `TextEdit`.
+    /// Doing this (instead of one label per line) gives us native mouse-drag
+    /// selection plus our standard right-click menu — including the
+    /// selection-restore-on-right-click fix.  The buffer is rebuilt from
+    /// `console_lines` every frame, so any user keystrokes that slip in
+    /// (the `TextEdit` is technically editable) are silently discarded.
+    fn draw_console_textedit(&mut self, ui: &mut egui::Ui) {
+        let mut text = self.console_lines.join("\n");
+        let row_count = self.console_lines.len().max(1);
+
+        let id = ui.next_auto_id();
+        let prev_range = TextEditState::load(ui.ctx(), id)
+            .and_then(|s| s.cursor.char_range());
+
+        let te = egui::TextEdit::multiline(&mut text)
+            .font(egui::TextStyle::Monospace)
+            .text_color(CONSOLE_TEXT)
+            .desired_width(f32::INFINITY)
+            .desired_rows(row_count)
+            .frame(egui::Frame::NONE);
+
+        let mut output = te.show(ui);
+        restore_selection_after_right_click(
+            ui.ctx(),
+            id,
+            &output.response.response,
+            &mut output.state,
+            prev_range,
+        );
+
+        let cursor_range = output.state.cursor.char_range();
+        let response = output.response.response.clone();
+        let mut state = output.state;
+        let ctx = ui.ctx().clone();
+        let lines_joined = self.console_lines.join("\n");
+
+        response.context_menu(move |ui| {
+            let has_selection = cursor_range.is_some_and(|r| !r.is_empty());
+            ui.add_enabled_ui(has_selection, |ui| {
+                if ui.button("Copy").clicked() {
+                    if let Some(range) = cursor_range {
+                        let [start, end] = range.sorted_cursors();
+                        let (s, e) = (start.index, end.index);
+                        let selected: String =
+                            text.chars().skip(s).take(e.saturating_sub(s)).collect();
+                        ctx.copy_text(selected);
+                    }
+                    ui.close();
+                }
+            });
+            if ui.button("Copy all").clicked() {
+                ctx.copy_text(lines_joined);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Select All").clicked() {
+                let len = text.chars().count();
+                state.cursor.set_char_range(Some(CCursorRange::two(
+                    CCursor::new(0),
+                    CCursor::new(len),
+                )));
+                state.clone().store(&ctx, id);
+                ctx.memory_mut(|mem| mem.request_focus(id));
+                ui.close();
+            }
+        });
     }
 
     /// Pull the global config singleton and, if it changed since our last
@@ -526,6 +830,13 @@ impl App {
         self.negotiation_timeout_buf = self.cfg.xmodem_negotiation_timeout.to_string();
         self.block_timeout_buf = self.cfg.xmodem_block_timeout.to_string();
         self.max_retries_buf = self.cfg.xmodem_max_retries.to_string();
+        self.negotiation_retry_interval_buf =
+            self.cfg.xmodem_negotiation_retry_interval.to_string();
+        self.zmodem_negotiation_timeout_buf = self.cfg.zmodem_negotiation_timeout.to_string();
+        self.zmodem_frame_timeout_buf = self.cfg.zmodem_frame_timeout.to_string();
+        self.zmodem_max_retries_buf = self.cfg.zmodem_max_retries.to_string();
+        self.zmodem_negotiation_retry_interval_buf =
+            self.cfg.zmodem_negotiation_retry_interval.to_string();
         self.serial_baud_buf = self.cfg.serial_baud.to_string();
     }
 }
@@ -533,16 +844,197 @@ impl App {
 /// Helper: labeled text field in a horizontal row.
 fn labeled_field(ui: &mut egui::Ui, label: &str, buf: &mut String, width: f32) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(buf).desired_width(width));
+    singleline_with_menu(ui, buf, false, Some(width));
+}
+
+/// Helper: render a small button right-aligned in the current horizontal
+/// row.  Returns true if the button was clicked this frame.
+fn right_aligned_small_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.with_layout(
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| ui.small_button(label).clicked(),
+    )
+    .inner
 }
 
 /// Helper: labeled password field in a horizontal row.
 fn labeled_password(ui: &mut egui::Ui, label: &str, buf: &mut String) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(buf).password(true));
+    singleline_with_menu(ui, buf, true, None);
 }
 
-const CONSOLE_FONT_SIZE: f32 = 16.0;
+/// A singleline `TextEdit` with a Cut/Copy/Paste/Select All right-click menu.
+/// When `password` is true, Cut/Copy are disabled so the password text is
+/// never written to the clipboard.
+fn singleline_with_menu(
+    ui: &mut egui::Ui,
+    buf: &mut String,
+    password: bool,
+    desired_width: Option<f32>,
+) -> egui::Response {
+    let id = ui.next_auto_id();
+    let prev_range = TextEditState::load(ui.ctx(), id)
+        .and_then(|s| s.cursor.char_range());
+
+    let mut te = egui::TextEdit::singleline(buf).password(password);
+    if let Some(w) = desired_width {
+        te = te.desired_width(w);
+    }
+    let mut output = te.show(ui);
+    restore_selection_after_right_click(
+        ui.ctx(),
+        id,
+        &output.response.response,
+        &mut output.state,
+        prev_range,
+    );
+    attach_text_edit_menu(ui.ctx(), &output.response.response, output.state, buf, password);
+    output.response.response
+}
+
+/// A multiline (full-width) `TextEdit` with a Cut/Copy/Paste/Select All
+/// right-click menu.
+fn multiline_with_menu(
+    ui: &mut egui::Ui,
+    buf: &mut String,
+    desired_rows: usize,
+) -> egui::Response {
+    let id = ui.next_auto_id();
+    let prev_range = TextEditState::load(ui.ctx(), id)
+        .and_then(|s| s.cursor.char_range());
+
+    let te = egui::TextEdit::multiline(buf)
+        .desired_rows(desired_rows)
+        .desired_width(f32::INFINITY);
+    let mut output = te.show(ui);
+    restore_selection_after_right_click(
+        ui.ctx(),
+        id,
+        &output.response.response,
+        &mut output.state,
+        prev_range,
+    );
+    attach_text_edit_menu(ui.ctx(), &output.response.response, output.state, buf, false);
+    output.response.response
+}
+
+/// Egui's `TextEdit` collapses any active selection on every mouse *press*,
+/// including the secondary (right) press that summons our context menu — so
+/// by the time the menu opens, the selection is gone and Copy is not useful.
+///
+/// We have to act on the **press** frame (when the selection was actually
+/// cleared) rather than the click/release frame: by release the persisted
+/// state is already empty, so `prev_range` would be empty too.  We detect a
+/// secondary press over this widget, then restore the selection that was
+/// captured from the *previous* frame's state.
+fn restore_selection_after_right_click(
+    ctx: &egui::Context,
+    id: egui::Id,
+    response: &egui::Response,
+    state: &mut TextEditState,
+    prev_range: Option<CCursorRange>,
+) {
+    let secondary_press_on_widget = response.contains_pointer()
+        && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+    if !secondary_press_on_widget {
+        return;
+    }
+    let Some(prev) = prev_range else { return };
+    if prev.is_empty() {
+        return;
+    }
+    let cleared = state.cursor.char_range().is_none_or(|r| r.is_empty());
+    if cleared {
+        state.cursor.set_char_range(Some(prev));
+        state.clone().store(ctx, id);
+    }
+}
+
+/// Attach a right-click context menu (Cut / Copy / Paste / Select All) to a
+/// `TextEdit` that has already been rendered.  The freshly-loaded `state` is
+/// re-stored after any cursor or buffer mutation so the next frame picks up
+/// the change.
+fn attach_text_edit_menu(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    mut state: TextEditState,
+    buf: &mut String,
+    password: bool,
+) {
+    let cursor_range = state.cursor.char_range();
+    let id = response.id;
+    let ctx = ctx.clone();
+
+    response.context_menu(move |ui| {
+        let has_selection = cursor_range.is_some_and(|r| !r.is_empty());
+
+        ui.add_enabled_ui(has_selection && !password, |ui| {
+            if ui.button("Cut").clicked() {
+                if let Some(range) = cursor_range {
+                    let [start, end] = range.sorted_cursors();
+                    let (s, e) = (start.index, end.index);
+                    let selected: String =
+                        buf.chars().skip(s).take(e.saturating_sub(s)).collect();
+                    ctx.copy_text(selected);
+                    let mut new_buf = String::with_capacity(buf.len());
+                    new_buf.extend(buf.chars().take(s));
+                    new_buf.extend(buf.chars().skip(e));
+                    *buf = new_buf;
+                    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(s))));
+                    state.clone().store(&ctx, id);
+                }
+                ui.close();
+            }
+            if ui.button("Copy").clicked() {
+                if let Some(range) = cursor_range {
+                    let [start, end] = range.sorted_cursors();
+                    let (s, e) = (start.index, end.index);
+                    let selected: String =
+                        buf.chars().skip(s).take(e.saturating_sub(s)).collect();
+                    ctx.copy_text(selected);
+                }
+                ui.close();
+            }
+        });
+        if ui.button("Paste").clicked() {
+            if let Ok(mut cb) = arboard::Clipboard::new()
+                && let Ok(text) = cb.get_text()
+            {
+                let (s, e) = match cursor_range {
+                    Some(range) => {
+                        let [start, end] = range.sorted_cursors();
+                        (start.index, end.index)
+                    }
+                    None => {
+                        let n = buf.chars().count();
+                        (n, n)
+                    }
+                };
+                let mut new_buf = String::with_capacity(buf.len() + text.len());
+                new_buf.extend(buf.chars().take(s));
+                new_buf.push_str(&text);
+                new_buf.extend(buf.chars().skip(e));
+                *buf = new_buf;
+                let new_pos = s + text.chars().count();
+                state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_pos))));
+                state.clone().store(&ctx, id);
+            }
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Select All").clicked() {
+            let len = buf.chars().count();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(0),
+                CCursor::new(len),
+            )));
+            state.clone().store(&ctx, id);
+            // Focus the field so the selection is visible.
+            ctx.memory_mut(|mem| mem.request_focus(id));
+            ui.close();
+        }
+    });
+}
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -562,6 +1054,7 @@ impl eframe::App for App {
         }
 
         self.poll_logs();
+        self.poll_dir_pick();
         self.refresh_from_global();
 
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -581,14 +1074,7 @@ impl eframe::App for App {
                         .stick_to_bottom(true)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for line in &self.console_lines {
-                                ui.label(
-                                    egui::RichText::new(line)
-                                        .monospace()
-                                        .size(CONSOLE_FONT_SIZE)
-                                        .color(CONSOLE_TEXT),
-                                );
-                            }
+                            self.draw_console_textedit(ui);
                         });
                 });
             });
@@ -641,17 +1127,16 @@ impl eframe::App for App {
                                 ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("Server").strong().color(AMBER));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.add_space(4.0);
-                                            if ui.small_button("More...").clicked() {
-                                                self.server_popup_open = true;
-                                            }
-                                        },
+                                    ui.label(
+                                        egui::RichText::new("(Changes Require Restart)")
+                                            .italics()
+                                            .color(AMBER_DIM),
                                     );
+                                    if right_aligned_small_button(ui, "Save and Restart") {
+                                        self.save_and_restart_all();
+                                    }
                                 });
-                                self.draw_server_controls(ui);
+                                self.draw_server_controls(ui, true);
                             });
                         },
                     );
@@ -667,6 +1152,9 @@ impl eframe::App for App {
                                     ui.label(egui::RichText::new("Security").strong().color(AMBER));
                                     ui.add_space(8.0);
                                     ui.checkbox(&mut self.cfg.security_enabled, "Require Login");
+                                    if right_aligned_small_button(ui, "Save") {
+                                        self.save_config_now();
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("Telnet").color(AMBER_DIM));
@@ -694,16 +1182,18 @@ impl eframe::App for App {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
-                                ui.label(egui::RichText::new("File Transfer (XMODEM)").strong().color(AMBER));
                                 ui.horizontal(|ui| {
-                                    ui.label("Dir:");
-                                    ui.text_edit_singleline(&mut self.cfg.transfer_dir);
+                                    ui.label(egui::RichText::new("File Transfer (XMODEM)").strong().color(AMBER));
+                                    ui.label(
+                                        egui::RichText::new("(More for YMODEM / ZMODEM)")
+                                            .italics()
+                                            .color(AMBER_DIM),
+                                    );
+                                    if right_aligned_small_button(ui, "Save") {
+                                        self.save_config_now();
+                                    }
                                 });
-                                ui.horizontal(|ui| {
-                                    labeled_field(ui, "Negotiate:", &mut self.negotiation_timeout_buf, 40.0);
-                                    labeled_field(ui, "Block:", &mut self.block_timeout_buf, 40.0);
-                                    labeled_field(ui, "Retries:", &mut self.max_retries_buf, 40.0);
-                                });
+                                self.draw_file_transfer_controls(ui, true);
                             });
                         },
                     );
@@ -715,14 +1205,19 @@ impl eframe::App for App {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
-                                ui.label(egui::RichText::new("AI Chat, Browser, and Weather").strong().color(AMBER));
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("AI Chat, Browser, and Weather").strong().color(AMBER));
+                                    if right_aligned_small_button(ui, "Save") {
+                                        self.save_config_now();
+                                    }
+                                });
                                 ui.horizontal(|ui| {
                                     ui.label("API Key:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.groq_api_key).password(true));
+                                    singleline_with_menu(ui, &mut self.cfg.groq_api_key, true, None);
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Home:");
-                                    ui.text_edit_singleline(&mut self.cfg.browser_homepage);
+                                    singleline_with_menu(ui, &mut self.cfg.browser_homepage, false, None);
                                     labeled_field(ui, "Zip:", &mut self.cfg.weather_zip, 60.0);
                                 });
                             });
@@ -744,17 +1239,11 @@ impl eframe::App for App {
                                     ui.label(egui::RichText::new("Serial Modem").strong().color(AMBER));
                                     ui.add_space(8.0);
                                     ui.checkbox(&mut self.cfg.serial_enabled, "Enabled");
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.add_space(4.0);
-                                            if ui.small_button("More...").clicked() {
-                                                self.serial_popup_open = true;
-                                            }
-                                        },
-                                    );
+                                    if right_aligned_small_button(ui, "Save") {
+                                        self.save_and_restart_serial();
+                                    }
                                 });
-                                self.draw_serial_controls(ui);
+                                self.draw_serial_controls(ui, true);
                             });
                         },
                     );
@@ -766,8 +1255,13 @@ impl eframe::App for App {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.set_min_height(row_h);
                                 ui.set_min_width(ui.available_width());
-                                ui.label(egui::RichText::new("General").strong().color(AMBER));
-                                ui.checkbox(&mut self.cfg.verbose, "Verbose XMODEM Logging");
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("General").strong().color(AMBER));
+                                    if right_aligned_small_button(ui, "Save") {
+                                        self.save_config_now();
+                                    }
+                                });
+                                ui.checkbox(&mut self.cfg.verbose, "Verbose Transfer Logging");
                                 ui.checkbox(&mut self.cfg.enable_console, "Show GUI on Startup");
                             });
                         },
@@ -775,34 +1269,6 @@ impl eframe::App for App {
                 });
                 ui.add_space(6.0);
 
-                // ── Save & Restart button ─────────────────────
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("Save and Restart Server")
-                                .strong()
-                                .size(16.0)
-                                .color(AMBER_BRIGHT),
-                        ))
-                        .clicked()
-                    {
-                        self.sync_numeric_fields();
-                        config::save_config(&self.cfg);
-                        self.last_synced_cfg = self.cfg.clone();
-                        self.dirty = false;
-                        logger::log("Configuration saved — restarting server...".into());
-                        // Set restart BEFORE shutdown so main loop sees the
-                        // intent to restart when it checks after join().
-                        self.restart.store(true, Ordering::SeqCst);
-                        self.shutdown.store(true, Ordering::SeqCst);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("Saves configuration and restarts the server.")
-                        .weak()
-                        .italics()
-                        .small(),
-                );
                 // ── User Manual button ────────────────────────
                 ui.horizontal(|ui| {
                     if ui
@@ -821,10 +1287,6 @@ impl eframe::App for App {
                 });
                 ui.add_space(20.0);
                 // ── Scripture (left) + Logo (right) ──────────
-                // Logo source is 432px tall; scale to 42.35% for the GUI.
-                // The 1.6 aspect ratio matches the original image proportions.
-                // The +84 / -84 offset on the right column shifts the logo
-                // upward without affecting the left column layout.
                 let logo_h = 432.0 * 0.4235;
                 let logo_w = logo_h * 1.6;
                 ui.horizontal_top(|ui| {
@@ -854,10 +1316,10 @@ impl eframe::App for App {
                     );
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(half, logo_h + 84.0),
+                        egui::vec2(half, logo_h + 32.0),
                         egui::Layout::top_down(egui::Align::Max),
                         |ui| {
-                            ui.add_space(-84.0);
+                            ui.add_space(-32.0);
                             ui.add(
                                 egui::Image::new(egui::include_image!("../xmodemlogo.png"))
                                     .fit_to_exact_size(egui::vec2(logo_w, logo_h)),
@@ -890,7 +1352,7 @@ impl eframe::App for App {
             .show(&ctx, |ui| {
                 // Lighter-green text-entry backgrounds scoped to this popup.
                 ui.visuals_mut().extreme_bg_color = POPUP_INPUT_BG;
-                self.draw_server_controls(ui);
+                self.draw_server_controls(ui, false);
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -921,7 +1383,7 @@ impl eframe::App for App {
             .frame(popup_frame)
             .show(&ctx, |ui| {
                 ui.visuals_mut().extreme_bg_color = POPUP_INPUT_BG;
-                self.draw_serial_controls(ui);
+                self.draw_serial_controls(ui, false);
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -943,6 +1405,41 @@ impl eframe::App for App {
             });
         self.serial_popup_open = serial_open;
 
+        let mut ft_open = self.file_transfer_popup_open;
+        egui::Window::new(
+            egui::RichText::new("File Transfer — More")
+                .strong()
+                .color(AMBER_BRIGHT),
+        )
+        .open(&mut ft_open)
+        .resizable(true)
+        .collapsible(false)
+        .default_width(520.0)
+        .frame(popup_frame)
+        .show(&ctx, |ui| {
+            ui.visuals_mut().extreme_bg_color = POPUP_INPUT_BG;
+            self.draw_file_transfer_controls(ui, false);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            self.draw_file_transfer_advanced(ui);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Save")
+                        .strong()
+                        .size(16.0)
+                        .color(AMBER_BRIGHT),
+                ))
+                .clicked()
+            {
+                self.save_config_now();
+            }
+        });
+        self.file_transfer_popup_open = ft_open;
+
         // Detect whether the user has unsaved edits.  Compare bound
         // config fields against the last-synced snapshot so that
         // refresh_from_global will not overwrite in-progress changes.
@@ -955,6 +1452,11 @@ impl eframe::App for App {
                 || self.negotiation_timeout_buf != self.last_synced_cfg.xmodem_negotiation_timeout.to_string()
                 || self.block_timeout_buf != self.last_synced_cfg.xmodem_block_timeout.to_string()
                 || self.max_retries_buf != self.last_synced_cfg.xmodem_max_retries.to_string()
+                || self.negotiation_retry_interval_buf != self.last_synced_cfg.xmodem_negotiation_retry_interval.to_string()
+                || self.zmodem_negotiation_timeout_buf != self.last_synced_cfg.zmodem_negotiation_timeout.to_string()
+                || self.zmodem_frame_timeout_buf != self.last_synced_cfg.zmodem_frame_timeout.to_string()
+                || self.zmodem_max_retries_buf != self.last_synced_cfg.zmodem_max_retries.to_string()
+                || self.zmodem_negotiation_retry_interval_buf != self.last_synced_cfg.zmodem_negotiation_retry_interval.to_string()
                 || self.serial_baud_buf != self.last_synced_cfg.serial_baud.to_string();
         }
     }
@@ -987,6 +1489,20 @@ mod tests {
         assert_eq!(app.negotiation_timeout_buf, app.cfg.xmodem_negotiation_timeout.to_string());
         assert_eq!(app.block_timeout_buf, app.cfg.xmodem_block_timeout.to_string());
         assert_eq!(app.max_retries_buf, app.cfg.xmodem_max_retries.to_string());
+        assert_eq!(
+            app.negotiation_retry_interval_buf,
+            app.cfg.xmodem_negotiation_retry_interval.to_string()
+        );
+        assert_eq!(
+            app.zmodem_negotiation_timeout_buf,
+            app.cfg.zmodem_negotiation_timeout.to_string()
+        );
+        assert_eq!(app.zmodem_frame_timeout_buf, app.cfg.zmodem_frame_timeout.to_string());
+        assert_eq!(app.zmodem_max_retries_buf, app.cfg.zmodem_max_retries.to_string());
+        assert_eq!(
+            app.zmodem_negotiation_retry_interval_buf,
+            app.cfg.zmodem_negotiation_retry_interval.to_string()
+        );
         assert_eq!(app.serial_baud_buf, app.cfg.serial_baud.to_string());
     }
 
@@ -1012,6 +1528,11 @@ mod tests {
         app.negotiation_timeout_buf = "60".into();
         app.block_timeout_buf = "30".into();
         app.max_retries_buf = "5".into();
+        app.negotiation_retry_interval_buf = "9".into();
+        app.zmodem_negotiation_timeout_buf = "90".into();
+        app.zmodem_frame_timeout_buf = "45".into();
+        app.zmodem_max_retries_buf = "7".into();
+        app.zmodem_negotiation_retry_interval_buf = "8".into();
         app.serial_baud_buf = "115200".into();
         app.sync_numeric_fields();
         assert_eq!(app.cfg.telnet_port, 8080);
@@ -1021,6 +1542,11 @@ mod tests {
         assert_eq!(app.cfg.xmodem_negotiation_timeout, 60);
         assert_eq!(app.cfg.xmodem_block_timeout, 30);
         assert_eq!(app.cfg.xmodem_max_retries, 5);
+        assert_eq!(app.cfg.xmodem_negotiation_retry_interval, 9);
+        assert_eq!(app.cfg.zmodem_negotiation_timeout, 90);
+        assert_eq!(app.cfg.zmodem_frame_timeout, 45);
+        assert_eq!(app.cfg.zmodem_max_retries, 7);
+        assert_eq!(app.cfg.zmodem_negotiation_retry_interval, 8);
         assert_eq!(app.cfg.serial_baud, 115200);
     }
 
@@ -1034,6 +1560,27 @@ mod tests {
         app.sync_numeric_fields();
         assert_eq!(app.cfg.telnet_port, orig_port);
         assert_eq!(app.cfg.serial_baud, orig_baud);
+    }
+
+    /// Invalid or zero ZMODEM buffers must not clobber the existing
+    /// config values.  Matches the xmodem_* buffer guarantees so the
+    /// two families behave identically for bad input.
+    #[test]
+    fn test_sync_zmodem_invalid_leaves_original() {
+        let mut app = test_app();
+        let orig_neg = app.cfg.zmodem_negotiation_timeout;
+        let orig_frame = app.cfg.zmodem_frame_timeout;
+        let orig_retries = app.cfg.zmodem_max_retries;
+        let orig_retry = app.cfg.zmodem_negotiation_retry_interval;
+        app.zmodem_negotiation_timeout_buf = "nope".into();
+        app.zmodem_frame_timeout_buf = "0".into(); // below min
+        app.zmodem_max_retries_buf = "-3".into(); // negative parse-fails as u32
+        app.zmodem_negotiation_retry_interval_buf = "0".into(); // below min
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.zmodem_negotiation_timeout, orig_neg);
+        assert_eq!(app.cfg.zmodem_frame_timeout, orig_frame);
+        assert_eq!(app.cfg.zmodem_max_retries, orig_retries);
+        assert_eq!(app.cfg.zmodem_negotiation_retry_interval, orig_retry);
     }
 
     #[test]

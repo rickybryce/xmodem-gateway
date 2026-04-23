@@ -565,9 +565,14 @@ phone-number slots are covered in chapter 9.
         <tr><td><code>browser_homepage</code></td><td>string</td><td><code>http://telnetbible.com</code></td><td>Page loaded when the browser opens.</td></tr>
         <tr><td><code>weather_zip</code></td><td>string</td><td>empty</td><td>Last-used US ZIP. Updated automatically.</td></tr>
         <tr><td><code>verbose</code></td><td>bool</td><td><code>false</code></td><td>Detailed XMODEM protocol diagnostics.</td></tr>
-        <tr><td><code>xmodem_negotiation_timeout</code></td><td>u64</td><td><code>45</code></td><td>Seconds to wait for the far-end sender/receiver to start.</td></tr>
+        <tr><td><code>xmodem_negotiation_timeout</code></td><td>u64</td><td><code>45</code></td><td>Seconds to wait for the far-end sender/receiver to start. Shared by XMODEM, XMODEM-1K, and YMODEM (same protocol code path).</td></tr>
         <tr><td><code>xmodem_block_timeout</code></td><td>u64</td><td><code>20</code></td><td>Per-block timeout.</td></tr>
         <tr><td><code>xmodem_max_retries</code></td><td>usize</td><td><code>10</code></td><td>NAK retry cap per block.</td></tr>
+        <tr><td><code>xmodem_negotiation_retry_interval</code></td><td>u64</td><td><code>7</code></td><td>Seconds between <code>C</code>/<code>NAK</code> pokes during the initial handshake. Christensen's XMODEM and Forsberg's reference implementations use ~10 s; 7 s is a compromise that starts quickly but avoids stockpiling extras in a slow-starting sender's input buffer.</td></tr>
+        <tr><td><code>zmodem_negotiation_timeout</code></td><td>u64</td><td><code>45</code></td><td>Seconds to wait for the ZRQINIT / ZRINIT handshake to complete.</td></tr>
+        <tr><td><code>zmodem_frame_timeout</code></td><td>u64</td><td><code>30</code></td><td>Per-frame read timeout once a transfer is live (headers / subpackets).</td></tr>
+        <tr><td><code>zmodem_max_retries</code></td><td>u32</td><td><code>10</code></td><td>Retry cap for ZRQINIT, ZRPOS, and ZDATA frames.</td></tr>
+        <tr><td><code>zmodem_negotiation_retry_interval</code></td><td>u64</td><td><code>5</code></td><td>Seconds between ZRINIT / ZRQINIT re-sends during the handshake. Analogous to <code>xmodem_negotiation_retry_interval</code> but for ZMODEM.</td></tr>
         <tr><td><code>serial_enabled</code></td><td>bool</td><td><code>false</code></td><td>Run the Hayes modem emulator on the configured serial port.</td></tr>
         <tr><td><code>serial_port</code></td><td>string</td><td>empty</td><td>Device path (e.g. <code>/dev/ttyUSB0</code>, <code>COM3</code>).</td></tr>
         <tr><td><code>serial_baud</code></td><td>u32</td><td><code>9600</code></td><td>Baud rate. Must be &ge; 300.</td></tr>
@@ -627,7 +632,7 @@ and a console panel at the bottom:
 <ul>
     <li><strong>Server</strong> — toggle telnet/SSH, set the ports, set the session cap, set the idle timeout. A <em>More&#8230;</em> button reveals the Telnet Gateway options popup.</li>
     <li><strong>Security</strong> — Require Login toggle, plus separate username and password fields for telnet and SSH.</li>
-    <li><strong>File Transfer (XMODEM)</strong> — transfer directory, negotiation timeout, per-block timeout, max retries.</li>
+    <li><strong>File Transfer (XMODEM)</strong> — transfer directory, XMODEM-family timeouts (negotiation, per-block, retries). The card's subtitle reads <em>(More for YMODEM / ZMODEM)</em>: a <em>More&#8230;</em> button opens a popup with the full per-protocol breakdown covering the XMODEM/XMODEM-1K/YMODEM shared keys and the independent ZMODEM tunables (handshake timeout, frame timeout, retry cap, and retry interval).</li>
     <li><strong>AI Chat, Browser, and Weather</strong> — Groq API key (rendered as a password field), browser homepage URL, and weather ZIP.</li>
     <li><strong>Serial Modem</strong> — Enabled checkbox, port dropdown with a refresh (&#8634;) button, baud, data bits, parity, stop bits, flow control. A <em>More&#8230;</em> button reveals the Hayes AT state popup.</li>
     <li><strong>General</strong> — Verbose XMODEM Logging, Show GUI on Startup.</li>
@@ -691,6 +696,25 @@ adds the full Hayes state that <code>AT&amp;W</code> persists:
     <li><strong>S-Registers</strong> — a comma-separated list of S0…S26 values, editable as free text. The format matches <code>serial_s_regs</code> in the config file.</li>
     <li><strong>Stored Phone Numbers</strong> — four text fields for slots <code>&amp;Z0</code> through <code>&amp;Z3</code>. Leave empty for unset. <code>ATDSn</code> dials these.</li>
 </ul>
+
+<h3>4.2.3 File Transfer — More</h3>
+
+<p>
+Mirrors the transfer directory row from the main card and then splits
+the protocol settings into two clearly-labelled sections so operators
+aren't surprised when editing one page changes another:
+</p>
+
+<ul>
+    <li><strong>XMODEM / XMODEM-1K / YMODEM</strong> — a banner explains these three protocols share the same code path, and therefore the same keys. Shown: <em>Negotiate&nbsp;(s)</em>, <em>Block&nbsp;(s)</em>, <em>Retries</em>, and <em>Retry&nbsp;interval&nbsp;(s)</em> (the last is the C/NAK poke cadence, with an inline hint noting the spec suggests ~10 s).</li>
+    <li><strong>ZMODEM</strong> — independent tunables. Shown: <em>Negotiate&nbsp;(s)</em>, <em>Frame&nbsp;(s)</em>, <em>Retries</em>, and <em>Retry&nbsp;interval&nbsp;(s)</em> (ZRINIT/ZRQINIT re-send gap, default 5).</li>
+</ul>
+
+<p>
+All values apply on the next file transfer — no server restart is
+required. The corresponding telnet-side pages live under
+<em>Configuration &rarr; F (File Transfer) &rarr; X / Y / Z</em>.
+</p>
 
 <h2 id="ch4-save">4.3 Saving and Restarting</h2>
 
@@ -1164,15 +1188,42 @@ instead of <code>ACK</code> is the same thing on the send side. Toggle
 <h2 id="ch8-tuning">8.7 Protocol Timeout Tunables</h2>
 
 <p>
-Three config keys control transfer behaviour:
+Transfer timings are grouped by protocol family. The
+<em>XMODEM-family</em> keys apply to classic XMODEM, XMODEM-1K, and
+YMODEM (which share a single send/receive code path in
+<code>xmodem.rs</code>). ZMODEM has its own independent set because
+its frame-based protocol has different cadence requirements.
 </p>
+
+<p>
+Each key can be changed from the telnet <em>Configuration &rarr; F
+File Transfer &rarr; X / Y / Z</em> menus, from the GUI <em>File
+Transfer &rarr; More&#8230;</em> popup, or by editing
+<code>xmodem.conf</code> directly. Changes take effect on the next
+file transfer — no restart required.
+</p>
+
+<h3>XMODEM family (XMODEM / XMODEM-1K / YMODEM)</h3>
 
 <table>
     <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
     <tbody>
         <tr><td><code>xmodem_negotiation_timeout</code></td><td>45 s</td><td>Maximum time the receiver will wait for the first <code>SOH</code>/<code>STX</code> header from the sender, and vice versa.</td></tr>
+        <tr><td><code>xmodem_negotiation_retry_interval</code></td><td>7 s</td><td>Gap between successive <code>C</code>/<code>NAK</code> pokes during the initial handshake. Christensen's original XMODEM and Forsberg's reference implementations specify ~10 s; 7 s is a compromise that starts quickly but avoids stockpiling extras in a slow-starting sender's buffer (which can be misinterpreted as "retry block 0" requests, causing spurious duplicate-block retransmissions).</td></tr>
         <tr><td><code>xmodem_block_timeout</code></td><td>20 s</td><td>Per-block timeout. If a block header does not arrive within this long after an <code>ACK</code>/<code>NAK</code>, the receiver retries.</td></tr>
         <tr><td><code>xmodem_max_retries</code></td><td>10</td><td>Maximum <code>NAK</code> retries per block before the receiver cancels the transfer with three <code>CAN</code>s.</td></tr>
+    </tbody>
+</table>
+
+<h3>ZMODEM</h3>
+
+<table>
+    <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+        <tr><td><code>zmodem_negotiation_timeout</code></td><td>45 s</td><td>Maximum time to complete the ZRQINIT / ZRINIT handshake before giving up on the session.</td></tr>
+        <tr><td><code>zmodem_negotiation_retry_interval</code></td><td>5 s</td><td>Gap between ZRINIT / ZRQINIT re-sends during the handshake. Analogous to the XMODEM retry interval but for ZMODEM's frame-based protocol.</td></tr>
+        <tr><td><code>zmodem_frame_timeout</code></td><td>30 s</td><td>Per-frame read timeout once a transfer is live. Applies to headers and subpackets alike.</td></tr>
+        <tr><td><code>zmodem_max_retries</code></td><td>10</td><td>Retry cap for ZRQINIT, ZRPOS, and ZDATA frames. Once exceeded, the session cancels with a ZABORT.</td></tr>
     </tbody>
 </table>
 
@@ -1180,7 +1231,10 @@ Three config keys control transfer behaviour:
 <span class="label">Verbose diagnostics</span>
 Set <code>verbose&nbsp;=&nbsp;true</code> to log every header byte, CRC
 result, block number, and timeout event. This is invaluable when a transfer
-fails on a specific block and you need to know which side hiccuped.
+fails on a specific block and you need to know which side hiccuped. The
+log identifies each event with its protocol prefix (<code>XMODEM recv:</code>,
+<code>ZMODEM send:</code>, etc.) so multi-protocol sessions remain
+traceable.
 </aside>
 
 <!-- ═══════════════════ 9. Hayes AT modem ═══════════════════ -->
@@ -1913,20 +1967,22 @@ telnet and SSH — retrying on the other protocol will not reset the counter.
     <li>On Windows, check Device Manager. Ports appear as <code>COM3</code>, <code>COM4</code>, etc.</li>
 </ul>
 
-<h2>16.4 XMODEM Transfer Times Out</h2>
+<h2>16.4 File Transfer Times Out</h2>
 
 <p>
 Turn on verbose mode (<code>verbose = true</code> in <code>xmodem.conf</code>,
-or the <em>Verbose XMODEM Logging</em> checkbox in the GUI General frame) and
-retry. The log will show every header byte, every CRC result, every timeout.
-Common causes:
+or the <em>Verbose Transfer Logging</em> checkbox in the GUI General frame)
+and retry. The log will show every header byte, every CRC result, every
+timeout, tagged with the protocol (<code>XMODEM recv:</code>,
+<code>ZMODEM send:</code>, etc.). Common causes:
 </p>
 
 <ul>
     <li>Client and server disagree on CRC vs. checksum — the client is very old and never implemented CRC. The gateway falls back to checksum automatically after two-thirds of the negotiation timeout.</li>
-    <li>Client uses ZMODEM autostart. The gateway aborts it cleanly and shows a notice — pick XMODEM, XMODEM-1K, or YMODEM instead.</li>
     <li>IAC escaping mismatch when transferring binary files with <code>0xFF</code> bytes over telnet. Toggle it with <span class="kbd">I</span> in the File Transfer menu.</li>
-    <li>Slow or unreliable serial link — raise <code>xmodem_block_timeout</code> and <code>xmodem_max_retries</code>.</li>
+    <li>Slow or unreliable serial link — raise <code>xmodem_block_timeout</code> and <code>xmodem_max_retries</code> for XMODEM/YMODEM, or <code>zmodem_frame_timeout</code> and <code>zmodem_max_retries</code> for ZMODEM.</li>
+    <li>Client is slow to start after you pick the protocol — raise <code>xmodem_negotiation_timeout</code> (XMODEM/YMODEM) or <code>zmodem_negotiation_timeout</code> (ZMODEM).</li>
+    <li>Log shows duplicate block 0 retransmissions during YMODEM setup — raise <code>xmodem_negotiation_retry_interval</code> toward the spec-recommended 10 s so fewer <code>C</code> pokes stack up in the sender's buffer before it starts responding.</li>
 </ul>
 
 <h2>16.5 SSH Won't Connect</h2>
@@ -2018,7 +2074,12 @@ numeric values fall back to the default.
         <tr><td><code>weather_zip</code></td><td>string</td><td>empty</td><td>5 digits</td><td>Last-used US ZIP. Updated automatically.</td></tr>
         <tr><td><code>xmodem_block_timeout</code></td><td>u64</td><td><code>20</code></td><td>&ge; 1 (seconds)</td><td>Per-block timeout during transfer.</td></tr>
         <tr><td><code>xmodem_max_retries</code></td><td>usize</td><td><code>10</code></td><td>&ge; 1</td><td>NAK retry cap per block.</td></tr>
+        <tr><td><code>xmodem_negotiation_retry_interval</code></td><td>u64</td><td><code>7</code></td><td>&ge; 1 (seconds)</td><td>Gap between C/NAK pokes during the XMODEM/YMODEM handshake.</td></tr>
         <tr><td><code>xmodem_negotiation_timeout</code></td><td>u64</td><td><code>45</code></td><td>&ge; 1 (seconds)</td><td>Initial negotiation timeout for XMODEM/YMODEM send/receive.</td></tr>
+        <tr><td><code>zmodem_frame_timeout</code></td><td>u64</td><td><code>30</code></td><td>&ge; 1 (seconds)</td><td>Per-frame read timeout during a ZMODEM transfer.</td></tr>
+        <tr><td><code>zmodem_max_retries</code></td><td>u32</td><td><code>10</code></td><td>&ge; 1</td><td>Retry cap for ZRQINIT / ZRPOS / ZDATA frames.</td></tr>
+        <tr><td><code>zmodem_negotiation_retry_interval</code></td><td>u64</td><td><code>5</code></td><td>&ge; 1 (seconds)</td><td>Gap between ZRINIT / ZRQINIT re-sends during the ZMODEM handshake.</td></tr>
+        <tr><td><code>zmodem_negotiation_timeout</code></td><td>u64</td><td><code>45</code></td><td>&ge; 1 (seconds)</td><td>Initial ZRQINIT / ZRINIT handshake timeout.</td></tr>
     </tbody>
 </table>
 

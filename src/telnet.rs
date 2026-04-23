@@ -114,6 +114,19 @@ enum TerminalType {
     Petscii,
 }
 
+/// Transfer protocol selected at upload time.  The XMODEM/YMODEM
+/// branch hands off to `xmodem_receive`, which auto-detects block
+/// size (SOH vs STX), CRC vs checksum, and the YMODEM block-0
+/// filename header.  The ZMODEM branch hands off to
+/// `zmodem_receive`, which emits ZRINIT and waits for ZFILE.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UploadProtocol {
+    /// XMODEM / YMODEM — receiver auto-detects variant.
+    XmodemYmodem,
+    /// ZMODEM — receiver initiates the session with ZRINIT.
+    Zmodem,
+}
+
 /// Transfer protocol selected at download time by the user.  Picked
 /// per-transfer via the `SELECT PROTOCOL` prompt; no persistent config.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,6 +140,9 @@ enum DownloadProtocol {
     /// YMODEM — block 0 with filename + size, then 1K-style data
     /// blocks.
     Ymodem,
+    /// ZMODEM — Forsberg ZMODEM with ZDLE escaping, hex + binary
+    /// headers, stop-and-wait 1K subpackets.
+    Zmodem,
 }
 
 // ─── Input mode ────────────────────────────────────────────
@@ -1382,6 +1398,12 @@ pub(crate) struct TelnetSession {
     // TTYPE result — set once via SB TTYPE IS. Prevents re-requesting
     // and lets detect_terminal_type skip the BACKSPACE prompt.
     ttype_matched: bool,
+    // Set the first time session_read_byte sees an IAC SB or
+    // WILL/WONT/DO/DONT from the peer.  Distinguishes a true telnet
+    // client (which participates in option negotiation, RFC 854/856)
+    // from a raw TCP client (netcat, retro firmware) that just pipes
+    // bytes.  Used to auto-enable IAC escaping only for real telnet.
+    telnet_negotiated: bool,
     // NAWS (window size), captured from SB NAWS. None if peer didn't
     // negotiate. Not yet wired into layout code.
     window_width: Option<u16>,
@@ -1430,6 +1452,7 @@ impl TelnetSession {
             neg_sent_wont: Box::new([false; 256]),
             neg_sent_dont: Box::new([false; 256]),
             ttype_matched: false,
+            telnet_negotiated: false,
             window_width: None,
             window_height: None,
         }
@@ -1474,6 +1497,7 @@ impl TelnetSession {
             neg_sent_wont: Box::new([false; 256]),
             neg_sent_dont: Box::new([false; 256]),
             ttype_matched: false,
+            telnet_negotiated: false,
             window_width: None,
             window_height: None,
         }
@@ -1702,6 +1726,7 @@ impl TelnetSession {
             match cmd {
                 IAC => return Ok(Some(IAC)), // escaped data 0xFF
                 SB => {
+                    self.telnet_negotiated = true;
                     let Some(payload) = self.read_subneg_payload().await? else {
                         return Ok(None);
                     };
@@ -1710,6 +1735,7 @@ impl TelnetSession {
                     }
                 }
                 WILL | WONT | DO | DONT => {
+                    self.telnet_negotiated = true;
                     if self.reader.read(&mut buf).await? == 0 {
                         return Ok(None);
                     }
@@ -2387,25 +2413,141 @@ impl TelnetSession {
     }
 
     /// Show a full-screen help page with a header and wait for a keypress.
+    /// Split help content into pages that each fit within `max_per_page`
+    /// lines.  Prefers breaking at **blank lines** so a logical group —
+    /// a section header plus its continuation lines, a letter-command
+    /// plus its description — stays together on a single page.  Falls
+    /// back to a hard split at `max_per_page` only if no blank exists
+    /// within the range; authors avoid that path by separating groups
+    /// with a blank line in the help content.
+    ///
+    /// The returned pages have trailing blanks stripped and leading
+    /// blanks skipped so each page renders cleanly without drifting
+    /// chrome.
+    fn paginate_help<'a>(
+        lines: &'a [&'a str],
+        max_per_page: usize,
+    ) -> Vec<Vec<&'a str>> {
+        assert!(max_per_page >= 1, "max_per_page must be ≥ 1");
+        fn is_blank(s: &str) -> bool {
+            s.trim().is_empty()
+        }
+        let mut pages: Vec<Vec<&'a str>> = Vec::new();
+        let mut remaining: &[&str] = lines;
+        while !remaining.is_empty() {
+            let take = remaining.len().min(max_per_page);
+            // Prefer splitting at the last blank line within `take`.
+            // Falling back to `take` only when no blank exists in range
+            // — authors should avoid this by separating groups with
+            // blanks, but we don't want to loop forever on malformed
+            // input.
+            let mut split = take;
+            for i in (1..=take).rev() {
+                if is_blank(remaining[i - 1]) {
+                    split = i;
+                    break;
+                }
+            }
+            // Emit the page with trailing blanks trimmed.
+            let mut page: Vec<&str> = remaining[..split].to_vec();
+            while page.last().is_some_and(|s| is_blank(s)) {
+                page.pop();
+            }
+            if !page.is_empty() {
+                pages.push(page);
+            }
+            // Skip leading blanks on the next page so the header isn't
+            // followed by an awkward empty line.
+            remaining = &remaining[split..];
+            while !remaining.is_empty() && is_blank(remaining[0]) {
+                remaining = &remaining[1..];
+            }
+        }
+        pages
+    }
+
     async fn show_help_page(
         &mut self,
         title: &str,
         lines: &[&str],
     ) -> Result<(), std::io::Error> {
-        self.clear_screen().await?;
-        let sep = self.separator();
-        self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow(title))).await?;
-        self.send_line(&sep).await?;
-        self.send_line("").await?;
-        for line in lines {
-            self.send_line(line).await?;
+        // Chrome is 6 rows: sep(1) + title(1) + sep(1) + blank(1) +
+        // blank(1) + footer(1).  PETSCII renders 22 usable rows on a
+        // 25-line Commodore 64, so 22 - 6 = 16 content rows.  We use 15
+        // to leave a little breathing room for terminals that occasionally
+        // push an extra line at the bottom.
+        const MAX_CONTENT_LINES: usize = 15;
+
+        let pages = Self::paginate_help(lines, MAX_CONTENT_LINES);
+        // Empty content is rare but possible; treat it as one blank page
+        // so the caller still gets the usual "Press any key" affordance.
+        let pages: Vec<Vec<&str>> = if pages.is_empty() {
+            vec![Vec::new()]
+        } else {
+            pages
+        };
+        let total = pages.len();
+
+        for (idx, page_lines) in pages.iter().enumerate() {
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow(title))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+            for line in page_lines {
+                self.send_line(line).await?;
+            }
+            self.send_line("").await?;
+
+            let is_last = idx + 1 == total;
+            let prompt = if total == 1 {
+                "  Press any key to continue.".to_string()
+            } else if is_last {
+                format!("  Page {}/{} - Press any key.", idx + 1, total)
+            } else {
+                format!("  Page {}/{} - next key, Q to quit", idx + 1, total)
+            };
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let key = self.wait_for_key_returning().await?;
+            // Early-exit on Q between pages.  ESC also bails out so the
+            // existing "escape twice means leave this screen" reflex
+            // works on help screens too.
+            if !is_last
+                && (matches!(key, b'q' | b'Q')
+                    || is_esc_key(key, self.terminal_type == TerminalType::Petscii))
+            {
+                break;
+            }
         }
-        self.send_line("").await?;
-        self.send("  Press any key to continue.").await?;
-        self.flush().await?;
-        self.wait_for_key().await?;
         Ok(())
+    }
+
+    /// Variant of `wait_for_key` that returns the byte that unblocked
+    /// it.  Used by paginated help screens so they can react to `Q`
+    /// (quit) or ESC during multi-page navigation.
+    async fn wait_for_key_returning(&mut self) -> Result<u8, std::io::Error> {
+        loop {
+            match self.read_byte_filtered().await? {
+                Some(b)
+                    if b >= 0x20
+                        || b == b'\r'
+                        || b == b'\n'
+                        || is_esc_key(b, self.terminal_type == TerminalType::Petscii) =>
+                {
+                    return Ok(b);
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "disconnected",
+                    ));
+                }
+                _ => continue,
+            }
+        }
     }
 
     // ─── Terminal detection ─────────────────────────────────
@@ -2694,18 +2836,19 @@ impl TelnetSession {
         if !self.is_serial && !self.is_ssh {
             self.detect_terminal_type().await?;
 
-            // Auto-set the IAC/CR-NUL transform default based on the
-            // detected terminal type.  RFC 854 requires all telnet
-            // clients to escape 0xFF on the wire, but many retro
-            // clients (IMP8, CCGMS, StrikeTerm, AltairDuino firmware,
-            // some dumb-terminal boards) don't — they treat a TCP
-            // connection to port 23 as raw bytes.  PETSCII and plain
-            // ASCII connections are overwhelmingly retro and shouldn't
-            // escape; ANSI connections are overwhelmingly modern
-            // (PuTTY, Tera Term, C-Kermit) and should.  The user can
-            // still override per-session with the I key on the File
-            // Transfer menu.
-            self.xmodem_iac = matches!(self.terminal_type, TerminalType::Ansi);
+            // Auto-set the IAC/CR-NUL transform default based on
+            // whether the client actually speaks the telnet protocol
+            // (RFC 854/856).  detect_terminal_type() has already sent
+            // our opening WILL/DO batch and drained the reply window,
+            // so session_read_byte has flipped telnet_negotiated on
+            // iff the peer answered with any option-negotiation or
+            // subnegotiation bytes.  Real telnet clients (PuTTY, Tera
+            // Term, C-Kermit, SecureCRT) always negotiate and need
+            // 0xFF escaped; raw TCP clients (netcat, IMP8, CCGMS,
+            // StrikeTerm, AltairDuino firmware) stay silent and get a
+            // transparent byte stream.  The I key on the File Transfer
+            // menu still lets the user override per-session.
+            self.xmodem_iac = self.telnet_negotiated;
 
             if cfg.security_enabled
                 && !self.authenticate().await?
@@ -2917,9 +3060,7 @@ impl TelnetSession {
                 self.gateway_telnet().await?;
             }
             "x" => {
-                self.send_line("").await?;
-                self.send_line("Goodbye!").await?;
-                self.flush().await?;
+                self.send_farewell().await?;
                 return Ok(false);
             }
             _ => {
@@ -2927,6 +3068,66 @@ impl TelnetSession {
             }
         }
         Ok(true)
+    }
+
+    /// Print John 3:16 (KJV) on a fresh page when the user quits from
+    /// the main menu, then block long enough for every byte to clock
+    /// out on even a 1200 baud link before the caller drops the
+    /// connection.  A 1200 baud 8N1 link carries 120 bytes/sec; we
+    /// tally the bytes we emit and sleep `bytes / 120 s + 1 s` so the
+    /// closing `TCP FIN` / SSH EOF doesn't truncate the final line on
+    /// slow retro terminals.
+    async fn send_farewell(&mut self) -> Result<(), std::io::Error> {
+        self.clear_screen().await?;
+
+        // Wrap width leaves a two-char indent on both layouts.  36/76
+        // rather than 38/78 keeps room for color-code padding without
+        // risking an overflow wrap on narrow PETSCII screens.
+        let wrap_width = if self.terminal_type == TerminalType::Petscii {
+            36
+        } else {
+            76
+        };
+        let verse = "For God so loved the world, that he gave his only \
+                     begotten Son, that whosoever believeth in him \
+                     should not perish, but have everlasting life.";
+
+        // `byte_count` is a running tally of everything we send after
+        // the clear-screen, so the transmit-delay calculation reflects
+        // what actually went down the wire.  The clear-screen prefix
+        // itself is a handful of bytes (ANSI ESC[2J ESC[H, PETSCII 0x93,
+        // or blank for ASCII); 16 is a safe ceiling.
+        let mut byte_count: usize = 16;
+
+        self.send_line("").await?;
+        byte_count += 2;
+
+        let header = format!("  {}", self.yellow("John 3:16 (KJV)"));
+        byte_count += header.len() + 2;
+        self.send_line(&header).await?;
+
+        self.send_line("").await?;
+        byte_count += 2;
+
+        for line in crate::aichat::wrap_line(verse, wrap_width) {
+            let out = format!("  {}", line);
+            byte_count += out.len() + 2;
+            self.send_line(&out).await?;
+        }
+
+        self.send_line("").await?;
+        byte_count += 2;
+        self.flush().await?;
+
+        // transmit_ms = bytes / 120 s, rounded up.  Adding 1 s of
+        // quiet before disconnect lets the final stop-bit settle
+        // before we close the socket.
+        let transmit_ms = (byte_count as u64).saturating_mul(1000).div_ceil(120);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            transmit_ms.saturating_add(1000),
+        ))
+        .await;
+        Ok(())
     }
 
     // ─── File Transfer menu ──────────────────────────────────
@@ -3018,18 +3219,53 @@ impl TelnetSession {
             }
             "h" => {
                 self.show_help_page("FILE TRANSFER HELP", &[
+                    "  Menu items:",
                     "  U  Upload a file to the server",
                     "  D  Download a file from server",
                     "  X  Delete a file on the server",
                     "  C  Change to a subdirectory",
-                    "  I  Toggle IAC escaping for",
-                    "     binary file transfers",
+                    "  I  Toggle IAC escaping on/off",
                     "  R  Refresh the screen",
                     "  Q  Back to the main menu",
                     "",
-                    "  On download you will be prompted",
-                    "  to pick XMODEM / XMODEM-1K /",
-                    "  YMODEM for that transfer.",
+                    "  Picking a protocol on upload:",
+                    "    X  XMODEM or YMODEM - variant",
+                    "       auto-detected from block 0.",
+                    "    Z  ZMODEM - full Forsberg",
+                    "       batch with ZSKIP handling.",
+                    "",
+                    "  Picking a protocol on download:",
+                    "    X  Classic XMODEM (128 B)",
+                    "    1  XMODEM-1K (1024 B blocks,",
+                    "       SOH fallback if peer NAKs)",
+                    "    Y  YMODEM (filename + size",
+                    "       header, then 1K data)",
+                    "    Z  ZMODEM (auto-starts in",
+                    "       most modern terminals)",
+                    "",
+                    "  IAC escaping (I toggle):",
+                    "    Telnet reserves byte 0xFF as",
+                    "    the IAC marker. When trans-",
+                    "    ferring binary files that may",
+                    "    contain 0xFF, enable IAC",
+                    "    escaping so the stream",
+                    "    survives the wire intact.",
+                    "    Both sides must agree on the",
+                    "    setting. Default is ON for",
+                    "    telnet clients, OFF for SSH",
+                    "    (which has no IAC layer).",
+                    "",
+                    "  Limits:",
+                    "    Maximum file size: 8 MB.",
+                    "    Filenames: 64 chars max,",
+                    "    letters/digits/._- only, may",
+                    "    not start with a dot or",
+                    "    contain '..' (path traversal",
+                    "    protection).",
+                    "",
+                    "  Timeouts and retry intervals",
+                    "  are tunable in Configuration >",
+                    "  File Transfer > X / Y / Z.",
                 ]).await?;
             }
             "r" => {} // Refresh — just re-render
@@ -3234,6 +3470,77 @@ impl TelnetSession {
 
     // ─── UPLOAD ─────────────────────────────────────────────
 
+    /// Prompt the user to pick the upload protocol on its own screen.
+    /// Returns `None` if the user pressed ESC / PETSCII `<-` to cancel
+    /// back to the file-transfer menu.  Parallel to
+    /// [`Self::prompt_download_protocol`] — same screen layout,
+    /// navigation keys, and petscii/ANSI handling.
+    async fn prompt_upload_protocol(
+        &mut self,
+    ) -> Result<Option<UploadProtocol>, std::io::Error> {
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+        let esc_label = if is_petscii { "<-" } else { "ESC" };
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!(
+            "  {}",
+            self.yellow("SELECT UPLOAD PROTOCOL")
+        ))
+        .await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}  XMODEM/YMODEM  (128/1K blocks, CRC-16 or checksum, auto)",
+            self.cyan("X")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  {}  ZMODEM         (1K subpackets, CRC-16, auto-start)",
+            self.cyan("Z")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send(&format!(
+            "  Pick one, or {} to cancel: ",
+            self.cyan(esc_label)
+        ))
+        .await?;
+        self.flush().await?;
+
+        loop {
+            let b = match self.read_byte_filtered().await? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            if is_esc_key(b, is_petscii) {
+                self.send_line("").await?;
+                return Ok(None);
+            }
+            let ch = if is_petscii {
+                (petscii_to_ascii_byte(b) as char).to_ascii_lowercase()
+            } else {
+                (b as char).to_ascii_lowercase()
+            };
+            // Accept 'Y' as a synonym for 'X' so a user thinking
+            // "YMODEM" doesn't have to hunt for the right key — the
+            // XMODEM/YMODEM receive path handles both.
+            let chosen = match ch {
+                'x' | 'y' => Some(UploadProtocol::XmodemYmodem),
+                'z' => Some(UploadProtocol::Zmodem),
+                _ => None,
+            };
+            if let Some(p) = chosen {
+                self.send_raw(&[b]).await?;
+                self.send_line("").await?;
+                self.flush().await?;
+                return Ok(Some(p));
+            }
+            // Invalid key — stay at the prompt.
+        }
+    }
+
     async fn file_transfer_upload(&mut self) -> Result<(), std::io::Error> {
         self.ensure_transfer_dir().await?;
 
@@ -3303,6 +3610,17 @@ impl TelnetSession {
             false
         };
 
+        // Ask the user which protocol their sender will use.  Putting
+        // this on its own screen after the filename + overwrite prompts
+        // mirrors the download flow (file → protocol → transfer) and
+        // gives the user as long as they need to browse menus on their
+        // terminal before committing to the transfer window.  ESC /
+        // PETSCII `<-` at the protocol prompt cancels cleanly.
+        let protocol = match self.prompt_upload_protocol().await? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
         self.send_line("").await?;
         self.send_line(&format!(
             "  Ready to receive: {}",
@@ -3317,9 +3635,24 @@ impl TelnetSession {
         self.send_line("").await?;
         self.send_line(&format!(
             "  {}",
-            self.green("Begin XMODEM send now.")
+            self.green(match protocol {
+                UploadProtocol::XmodemYmodem =>
+                    "Start XMODEM/YMODEM send from your terminal now.",
+                UploadProtocol::Zmodem =>
+                    "Start ZMODEM send from your terminal now.",
+            })
         ))
         .await?;
+        // Make it explicit that the action happens on the user's side.
+        // For ExtraPutty it's File Transfer → Zmodem → Send; other
+        // terminals have similar menu items.  Users who know the drill
+        // can ignore this — it's here for the first-timer path.
+        if matches!(protocol, UploadProtocol::Zmodem) {
+            self.send_line(
+                "  (ExtraPutty: File Transfer > Zmodem > Send. Other clients vary.)",
+            )
+            .await?;
+        }
         self.send_line(&format!("  Start transfer within {} seconds.",
             config::get_config().xmodem_negotiation_timeout))
             .await?;
@@ -3332,25 +3665,71 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        if config::get_config().verbose { glog!("XMODEM upload: IAC escaping={}", self.xmodem_iac); }
+        if config::get_config().verbose {
+            glog!("Upload: IAC escaping={} protocol={:?}", self.xmodem_iac, protocol);
+        }
         self.drain_input().await;
 
+        let verbose = config::get_config().verbose;
         let start = std::time::Instant::now();
         let mut writer_guard = self.writer.lock().await;
-        let verbose = config::get_config().verbose;
-        let result = crate::xmodem::xmodem_receive(
-            &mut self.reader,
-            &mut *writer_guard,
-            self.xmodem_iac,
-            self.terminal_type == TerminalType::Petscii,
-            verbose,
-        )
-        .await;
+        // Normalize both receive paths to a Vec of (sender-proposed
+        // filename, data).  XMODEM/YMODEM never carries a filename in
+        // the protocol, so we mark it as None and the user-entered
+        // name wins.  ZMODEM carries a filename per file; we keep it
+        // so batches can save files 2..N under their sender names.
+        type Received = Vec<(Option<String>, Vec<u8>)>;
+        // Decide callback for the ZMODEM receiver.  The first file
+        // (idx 0) is always accepted — the user typed a destination
+        // filename in the upload prompt, so they want this one saved
+        // regardless of what the sender called it.  Later files in a
+        // batch use the sender's name, which we sanitize through the
+        // same `validate_filename` rules as user input and reject with
+        // ZSKIP if they fail or collide with an existing file.  The
+        // path-existence check is a sync std::fs call — fast, no
+        // runtime-blocking concern.
+        let transfer_path = self.transfer_path();
+        let decide = |idx: usize,
+                      sender_name: &str,
+                      _size: Option<u64>|
+         -> bool {
+            if idx == 0 {
+                return true;
+            }
+            if Self::validate_filename(sender_name).is_err() {
+                return false;
+            }
+            !transfer_path.join(sender_name).exists()
+        };
+        let result: Result<Received, String> = match protocol {
+            UploadProtocol::Zmodem => crate::zmodem::zmodem_receive(
+                &mut self.reader,
+                &mut *writer_guard,
+                self.xmodem_iac,
+                verbose,
+                decide,
+            )
+            .await
+            .map(|rxs| {
+                rxs.into_iter()
+                    .map(|rx| (Some(rx.filename), rx.data))
+                    .collect()
+            }),
+            UploadProtocol::XmodemYmodem => crate::xmodem::xmodem_receive(
+                &mut self.reader,
+                &mut *writer_guard,
+                self.xmodem_iac,
+                self.terminal_type == TerminalType::Petscii,
+                verbose,
+            )
+            .await
+            .map(|data| vec![(None, data)]),
+        };
         drop(writer_guard);
         let elapsed = start.elapsed();
 
-        let data = match result {
-            Ok(d) => d,
+        let uploads = match result {
+            Ok(v) => v,
             Err(e) => {
                 self.post_transfer_settle().await;
                 self.show_error(&format!("Transfer failed: {}", e))
@@ -3359,56 +3738,136 @@ impl TelnetSession {
             }
         };
 
-        // If the user opted in to overwrite, truncate; otherwise still
-        // use `create_new` so a race-condition (another session racing
-        // to create the same name during our transfer) surfaces as an
-        // error rather than clobbering work.
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true);
-        if overwrite {
-            opts.create(true).truncate(true);
-        } else {
-            opts.create_new(true);
-        }
-        match opts.open(&filepath).await {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(&data).await {
-                    self.post_transfer_settle().await;
-                    self.show_error(&format!("Failed to save: {}", e))
-                        .await?;
-                    return Ok(());
+        // Save each file.  The first file goes to the user-entered
+        // path with the user-chosen overwrite behavior.  Any additional
+        // files (ZMODEM batch mode per Forsberg §4) go to the sender's
+        // own filename after the same `validate_filename` sanitation
+        // we apply to user input — and if the name collides with an
+        // existing file we skip rather than clobber.  Batch files
+        // share the transfer-complete window with the first file; we
+        // don't prompt per-file.
+        let mut saved: Vec<(String, usize)> = Vec::new();
+        let mut skipped: Vec<(String, &'static str)> = Vec::new();
+
+        for (idx, (sender_name, data)) in uploads.iter().enumerate() {
+            if idx == 0 {
+                // First file: user-entered filename, honor overwrite.
+                let mut opts = tokio::fs::OpenOptions::new();
+                opts.write(true);
+                if overwrite {
+                    opts.create(true).truncate(true);
+                } else {
+                    opts.create_new(true);
                 }
-                let _ = file.flush().await;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.post_transfer_settle().await;
-                self.show_error("File already exists.").await?;
-                return Ok(());
-            }
-            Err(e) => {
-                self.post_transfer_settle().await;
-                self.show_error(&format!("Failed to save: {}", e))
-                    .await?;
-                return Ok(());
+                match opts.open(&filepath).await {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(data).await {
+                            self.post_transfer_settle().await;
+                            self.show_error(&format!("Failed to save: {}", e))
+                                .await?;
+                            return Ok(());
+                        }
+                        let _ = file.flush().await;
+                        saved.push((filename.clone(), data.len()));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        self.post_transfer_settle().await;
+                        self.show_error("File already exists.").await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.post_transfer_settle().await;
+                        self.show_error(&format!("Failed to save: {}", e))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Batch file 2..N: save under sender's name.  Only ZMODEM
+                // can produce these (XMODEM/YMODEM always yields a single
+                // entry), so `sender_name` will be Some here.
+                let name = match sender_name {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                if Self::validate_filename(&name).is_err() {
+                    skipped.push((name, "invalid filename"));
+                    continue;
+                }
+                let batch_path = self.transfer_path().join(&name);
+                let mut opts = tokio::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                match opts.open(&batch_path).await {
+                    Ok(mut file) => {
+                        if file.write_all(data).await.is_err() {
+                            skipped.push((name, "write error"));
+                            continue;
+                        }
+                        let _ = file.flush().await;
+                        saved.push((name, data.len()));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        skipped.push((name, "already exists"));
+                    }
+                    Err(_) => {
+                        skipped.push((name, "I/O error"));
+                    }
+                }
             }
         }
 
         self.post_transfer_settle().await;
 
-        let blocks = data.len().div_ceil(crate::xmodem::XMODEM_BLOCK_SIZE);
+        // Transfer-complete summary.  Preserve the classic single-file
+        // "N bytes, M blocks, T seconds" format when exactly one file
+        // was transferred (by far the common case); expand to a
+        // per-file list only when we actually saw a batch.
         self.send_line("").await?;
-        self.send_line(&format!(
-            "  {}",
-            self.green("Upload complete!")
-        ))
-        .await?;
-        self.send_line(&format!(
-            "  {} bytes, {} blocks, {:.1}s",
-            data.len(),
-            blocks,
-            elapsed.as_secs_f64()
-        ))
-        .await?;
+        if uploads.len() == 1 {
+            let bytes = saved.first().map(|(_, n)| *n).unwrap_or(0);
+            let blocks = bytes.div_ceil(crate::xmodem::XMODEM_BLOCK_SIZE);
+            self.send_line(&format!(
+                "  {}",
+                self.green("Upload complete!")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {} bytes, {} blocks, {:.1}s",
+                bytes,
+                blocks,
+                elapsed.as_secs_f64()
+            ))
+            .await?;
+        } else {
+            self.send_line(&format!(
+                "  {}",
+                self.green(&format!(
+                    "Upload complete: {} saved, {} skipped, {:.1}s",
+                    saved.len(),
+                    skipped.len(),
+                    elapsed.as_secs_f64()
+                ))
+            ))
+            .await?;
+            for (name, bytes) in &saved {
+                self.send_line(&format!(
+                    "  {} {} ({} bytes)",
+                    self.green("*"),
+                    name,
+                    bytes
+                ))
+                .await?;
+            }
+            for (name, reason) in &skipped {
+                self.send_line(&format!(
+                    "  {} {} ({})",
+                    self.yellow("-"),
+                    name,
+                    reason
+                ))
+                .await?;
+            }
+        }
         self.send_line("").await?;
         self.send("  Press any key to continue.").await?;
         self.flush().await?;
@@ -3583,6 +4042,11 @@ impl TelnetSession {
             self.cyan("Y")
         ))
         .await?;
+        self.send_line(&format!(
+            "  {}  ZMODEM       (autostart, 1K subpackets)",
+            self.cyan("Z")
+        ))
+        .await?;
         self.send_line("").await?;
         self.send(&format!(
             "  Pick one, or {} to cancel: ",
@@ -3609,6 +4073,7 @@ impl TelnetSession {
                 'x' => Some(DownloadProtocol::Xmodem),
                 '1' => Some(DownloadProtocol::Xmodem1k),
                 'y' => Some(DownloadProtocol::Ymodem),
+                'z' => Some(DownloadProtocol::Zmodem),
                 _ => None,
             };
             if let Some(p) = chosen {
@@ -3669,6 +4134,7 @@ impl TelnetSession {
                 DownloadProtocol::Xmodem => "Start XMODEM receive now.",
                 DownloadProtocol::Xmodem1k => "Start XMODEM-1K receive now.",
                 DownloadProtocol::Ymodem => "Start YMODEM receive now.",
+                DownloadProtocol::Zmodem => "Start ZMODEM receive now.",
             })
         ))
         .await?;
@@ -3684,39 +4150,55 @@ impl TelnetSession {
         self.send_line("").await?;
         self.flush().await?;
 
-        if config::get_config().verbose { glog!("XMODEM download: IAC escaping={} protocol={:?}", self.xmodem_iac, protocol); }
+        if config::get_config().verbose {
+            glog!("Download: IAC escaping={} protocol={:?}", self.xmodem_iac, protocol);
+        }
         self.drain_input().await;
 
         let start = std::time::Instant::now();
         let cfg = config::get_config();
         let verbose = cfg.verbose;
-        // YMODEM always uses 1K data blocks; XMODEM-1K uses 1K blocks
-        // without the filename header; classic XMODEM uses 128-byte
-        // blocks only.
-        let use_1k = matches!(
-            protocol,
-            DownloadProtocol::Xmodem1k | DownloadProtocol::Ymodem,
-        );
-        let ymodem = if matches!(protocol, DownloadProtocol::Ymodem) {
-            Some(crate::xmodem::YmodemHeader {
-                filename: filename.to_string(),
-                size: file_size,
-            })
-        } else {
-            None
-        };
         let mut writer_guard = self.writer.lock().await;
-        let result = crate::xmodem::xmodem_send(
-            &mut self.reader,
-            &mut *writer_guard,
-            &data,
-            self.xmodem_iac,
-            self.terminal_type == TerminalType::Petscii,
-            verbose,
-            use_1k,
-            ymodem,
-        )
-        .await;
+        let result = if matches!(protocol, DownloadProtocol::Zmodem) {
+            // zmodem_send is batch-capable; download always sends
+            // exactly one file, so we pass a single-element slice.
+            let batch: [(&str, &[u8]); 1] = [(filename, &data)];
+            crate::zmodem::zmodem_send(
+                &mut self.reader,
+                &mut *writer_guard,
+                &batch,
+                self.xmodem_iac,
+                verbose,
+            )
+            .await
+        } else {
+            // YMODEM always uses 1K data blocks; XMODEM-1K uses 1K
+            // blocks without the filename header; classic XMODEM uses
+            // 128-byte blocks only.
+            let use_1k = matches!(
+                protocol,
+                DownloadProtocol::Xmodem1k | DownloadProtocol::Ymodem,
+            );
+            let ymodem = if matches!(protocol, DownloadProtocol::Ymodem) {
+                Some(crate::xmodem::YmodemHeader {
+                    filename: filename.to_string(),
+                    size: file_size,
+                })
+            } else {
+                None
+            };
+            crate::xmodem::xmodem_send(
+                &mut self.reader,
+                &mut *writer_guard,
+                &data,
+                self.xmodem_iac,
+                self.terminal_type == TerminalType::Petscii,
+                verbose,
+                use_1k,
+                ymodem,
+            )
+            .await
+        };
         drop(writer_guard);
         let elapsed = start.elapsed();
 
@@ -5139,12 +5621,47 @@ impl TelnetSession {
                 'q' => { return Ok(None); }
                 'h' => {
                     self.show_help_page("AI CHAT HELP", &[
+                        "  Navigation:",
                         "  P    Previous page of answer",
                         "  N    Next page of answer",
                         "  Q    Done, return to main menu",
                         "",
                         "  Or type a new question and",
                         "  press Enter to ask again.",
+                        "  The model keeps conversational",
+                        "  context within a single AI Chat",
+                        "  session.",
+                        "",
+                        "  About the service:",
+                        "  Powered by Groq (groq.com), a",
+                        "  free LLM inference API. The",
+                        "  model is Llama 3.3 70B",
+                        "  Versatile, a capable general-",
+                        "  purpose assistant.",
+                        "",
+                        "  Getting a key:",
+                        "  1. Visit console.groq.com and",
+                        "     create a free account.",
+                        "  2. Generate an API key (starts",
+                        "     with gsk_...).",
+                        "  3. Set it in Configuration >",
+                        "     Other Settings > A, or paste",
+                        "     into xmodem.conf as",
+                        "     groq_api_key = gsk_...",
+                        "  4. Restart the server.",
+                        "",
+                        "  Rate limits:",
+                        "  Free-tier limits are generous",
+                        "  for interactive use but rate-",
+                        "  throttle on sustained high",
+                        "  traffic. See groq.com for the",
+                        "  current limits.",
+                        "",
+                        "  Privacy:",
+                        "  Questions and answers are sent",
+                        "  to Groq's API and subject to",
+                        "  their terms of service. Don't",
+                        "  paste sensitive information.",
                     ]).await?;
                 }
                 _ => {
@@ -6502,49 +7019,124 @@ impl TelnetSession {
             &[
                 "  This server emulates a Hayes-",
                 "  compatible modem on the serial",
-                "  port. Connect your retro",
-                "  hardware and use AT commands:",
+                "  port. Connect retro hardware",
+                "  and use AT commands.",
                 "",
+                "  Dialing:",
                 "  ATDT xmodem-gateway",
                 "    Connect to this gateway",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
-                "  ATDL   Redial last number",
-                "  AT&Zn=s  Store number in slot n",
+                "  ATDL     Redial last number",
+                "",
+                "  Stored numbers:",
+                "  AT&Zn=s  Store number in slot",
                 "  ATDSn    Dial stored slot 0-3",
-                "  ATIn     Info 0-7 (model, config)",
+                "",
+                "  Control:",
+                "  ATH      Hang up",
+                "  +++      Return to cmd mode",
+                "  ATO      Return online",
                 "  A/       Repeat last command",
-                "  AT&V   Show settings",
-                "  AT&W   Save settings",
-                "  +++    Return to command mode",
-                "  ATO    Return online",
-                "  ATH    Hang up",
+                "",
+                "  Information:",
+                "  ATIn     Info 0-7 (model, ROM)",
+                "  AT&V     Show settings",
+                "  ATSn?    Query S-register n",
+                "",
+                "  Configuration:",
+                "  ATXn     Result-code level 0-4",
+                "  AT&Cn    DCD mode (0-1)",
+                "  AT&Dn    DTR handling (0-3)",
+                "  AT&Kn    Flow control (0-4)",
+                "  AT&W     Save settings",
+                "  ATZ      Reload saved settings",
+                "  AT&F     Reset to gateway",
+                "           defaults",
+                "",
+                "  Gateway-friendly defaults:",
+                "  S7=15  (50 s Hayes; faster",
+                "         failed-dial recovery)",
+                "  &D0    (ignore DTR; retro",
+                "         clients often don't",
+                "         wire it correctly)",
+                "  &K0    (no modem flow control;",
+                "         port-level serial flow",
+                "         is still honored)",
+                "",
+                "  Override any of these with the",
+                "  matching AT command and AT&W.",
             ]
         } else {
             &[
                 "  This server emulates a Hayes-compatible",
                 "  modem on the configured serial port.",
                 "  Connect retro hardware (Commodore 64,",
-                "  CP/M, etc.) and use AT commands:",
+                "  CP/M, Altair, RC2014, etc.) and drive",
+                "  it with standard AT commands.",
                 "",
+                "  Dialing:",
                 "  ATDT xmodem-gateway",
                 "    Connect to this gateway's menus",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
-                "  ATDL       Redial last number",
-                "  AT&Zn=str  Store number in slot n (0-3)",
+                "  ATDL       Redial the last number",
+                "  ATDP ...   Same as ATDT (no pulse/tone",
+                "             distinction on TCP)",
+                "",
+                "  Stored numbers (4 slots, persistent):",
+                "  AT&Zn=str  Store number/host in slot n",
                 "  ATDSn      Dial stored slot 0-3",
-                "  ATIn       Info queries 0-7 (model,",
-                "             config, ROM checksum, etc.)",
-                "  ATXn       Result-code level 0-4",
-                "  AT&Cn/&Dn/&Kn  DCD / DTR / flow mode",
-                "  A/         Repeat the last AT command",
-                "  AT&V       Show current settings",
-                "  AT&W       Save settings to config",
-                "  ATSn?      Query S-register",
-                "  +++        Return to command mode",
+                "  AT&V       Shows the active table",
+                "",
+                "  Control:",
+                "  ATH        Hang up the active connection",
+                "  +++        Return to command mode with",
+                "             S2/S12 Hayes guard-time timing",
                 "  ATO        Return to online mode",
-                "  ATH        Hang up connection",
+                "  A/         Repeat the last AT command",
+                "             (no CR needed)",
+                "",
+                "  Information queries:",
+                "  ATIn       0-7: model, config, ROM sum,",
+                "             ROM test, firmware, OEM, etc.",
+                "  AT&V       Show every current setting",
+                "  ATSn?      Query S-register n",
+                "",
+                "  Configuration:",
+                "  ATEn       Echo off/on (E0 / E1)",
+                "  ATVn       Numeric/verbose result codes",
+                "  ATQn       Quiet (Q1 suppresses results)",
+                "  ATXn       Result-code level 0-4 (see",
+                "             README for the table)",
+                "  AT&Cn      DCD: 0=always on, 1=carrier",
+                "  AT&Dn      DTR handling 0-3",
+                "  AT&Kn      Flow control 0-4",
+                "  ATSn=v     Set S-register n to v",
+                "  AT&W       Save settings to xmodem.conf",
+                "  ATZ        Reload saved settings",
+                "  AT&F       Reset to gateway defaults",
+                "",
+                "  Gateway-friendly default deviations:",
+                "  S7=15      Wait-for-carrier (Hayes: 50 s).",
+                "             Keeps failed TCP dials snappy.",
+                "  &D0        Ignore DTR (Hayes: &D2 hangs up",
+                "             on DTR drop).  Retro clients",
+                "             often don't drive DTR correctly,",
+                "             which would cause spurious",
+                "             disconnects.",
+                "  &K0        No modem-level flow control",
+                "             (Hayes: &K3 RTS/CTS).  Port-level",
+                "             flow is still honored via",
+                "             serial_flowcontrol in xmodem.conf.",
+                "",
+                "  Override any of these with the matching AT",
+                "  command and AT&W to persist.",
+                "",
+                "  Commands the emulator can't meaningfully",
+                "  implement on TCP (ATB, ATC, ATL, ATM,",
+                "  AT&B/&G/&J/&S/&T/&Y) return OK so legacy",
+                "  init strings run to completion.",
             ]
         };
         self.show_help_page("MODEM EMULATOR HELP", lines).await
@@ -6583,8 +7175,8 @@ impl TelnetSession {
             ))
             .await?;
             self.send_line(&format!(
-                "  {}  XMODEM Settings",
-                self.cyan("X")
+                "  {}  File Transfer",
+                self.cyan("F")
             ))
             .await?;
             self.send_line(&format!(
@@ -6630,8 +7222,8 @@ impl TelnetSession {
                 "s" => {
                     self.server_configuration().await?;
                 }
-                "x" => {
-                    self.xmodem_settings().await?;
+                "f" => {
+                    self.file_transfer_settings().await?;
                 }
                 "r" => {
                     self.config_reset_defaults().await?;
@@ -6639,45 +7231,84 @@ impl TelnetSession {
                 "h" => {
                     let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
                         &[
+                            "  Configuration submenus:",
+                            "",
                             "  E  Security: require login,",
                             "     set usernames and passwords",
+                            "",
                             "  G  Gateway: configure outbound",
                             "     Telnet and SSH Gateway menus",
+                            "",
                             "  M  Modem: configure the serial",
                             "     port for modem emulation",
+                            "",
                             "  S  Server: enable/disable",
                             "     services, set ports, and",
                             "     restart the server",
-                            "  X  XMODEM: set transfer dir,",
-                            "     timeouts, and retry limit",
+                            "",
+                            "  F  File Transfer: per-protocol",
+                            "     XMODEM, YMODEM, ZMODEM setup",
+                            "     plus the transfer directory",
+                            "",
                             "  O  Other: AI key, logging,",
                             "     and general settings",
-                            "  R  Reset all settings to their",
-                            "     default values",
+                            "",
+                            "  R  Reset all settings to",
+                            "     default values (asks first)",
+                            "",
+                            "  What needs a restart:",
+                            "    S (ports, enable/disable)",
+                            "    E (credentials, login",
+                            "       requirement)",
+                            "    O > G (GUI on startup)",
+                            "",
+                            "  Everything else applies at",
+                            "  the next session / transfer.",
                         ]
                     } else {
                         &[
+                            "  Configuration submenus:",
+                            "",
                             "  E  Security: require login, set",
                             "     usernames and passwords",
+                            "",
                             "  G  Gateway: configure the outbound",
                             "     Telnet and SSH Gateway menus",
+                            "     (proxy to remote servers)",
+                            "",
                             "  M  Modem: configure the serial port",
                             "     for modem emulation",
+                            "",
                             "  S  Server: enable/disable services,",
                             "     set ports, and restart the server",
-                            "  X  XMODEM: set transfer directory,",
-                            "     timeouts, and retry limit",
+                            "",
+                            "  F  File Transfer: per-protocol",
+                            "     XMODEM/YMODEM/ZMODEM tuning",
+                            "     plus the shared transfer directory",
+                            "",
                             "  O  Other: AI key, logging, and",
                             "     general settings",
+                            "",
                             "  R  Reset all settings to their",
-                            "     default values",
+                            "     factory defaults (confirms first)",
+                            "",
+                            "  Which changes need a restart:",
+                            "    S changes (ports, enable/disable)",
+                            "    E changes (credentials, login toggle)",
+                            "    O > G toggle (GUI on startup)",
+                            "",
+                            "  Everything else (file-transfer",
+                            "  timings, gateway mode, modem AT",
+                            "  settings, AI key, homepage, weather",
+                            "  zip) applies at the next session or",
+                            "  transfer without a restart.",
                         ]
                     };
                     self.show_help_page("CONFIGURATION HELP", lines).await?;
                 }
                 "q" => return Ok(()),
                 _ => {
-                    self.show_error("Press E, G, M, O, S, X, R, H, or Q.").await?;
+                    self.show_error("Press E, F, G, M, O, S, R, H, or Q.").await?;
                 }
             }
         }
@@ -6750,7 +7381,7 @@ impl TelnetSession {
             ))
             .await?;
             self.send_line(&format!(
-                "  {}  Toggle verbose XMODEM logging",
+                "  {}  Toggle verbose transfer logging",
                 self.cyan("V")
             ))
             .await?;
@@ -6904,7 +7535,7 @@ impl TelnetSession {
                 "     the built-in web browser",
                 "  W  Default zip code for the",
                 "     weather feature",
-                "  V  Toggle verbose XMODEM log",
+                "  V  Toggle verbose transfer log",
                 "  G  Toggle GUI on startup",
                 "     (requires restart)",
                 "  R  Restart the server",
@@ -6916,7 +7547,7 @@ impl TelnetSession {
                 "  B  Default homepage URL for the",
                 "     built-in web browser",
                 "  W  Default zip code for weather",
-                "  V  Toggle verbose XMODEM logging",
+                "  V  Toggle verbose transfer logging",
                 "  G  Toggle GUI on startup (requires",
                 "     a server restart)",
                 "  R  Restart the server",
@@ -7107,22 +7738,48 @@ impl TelnetSession {
             &[
                 "  Configure login security.",
                 "",
-                "  L  Toggle whether a login is",
-                "     required to access server",
+                "  Menu items:",
+                "  L  Toggle login requirement",
                 "  U  Set the telnet username",
                 "  P  Set the telnet password",
                 "  S  Set the SSH username",
                 "  W  Set the SSH password",
                 "  R  Restart the server",
                 "",
+                "  Credentials:",
                 "  Telnet and SSH have separate",
-                "  credentials. Changes require",
-                "  a server restart.",
+                "  usernames/passwords; changing",
+                "  one doesn't affect the other.",
+                "  Both are stored in plaintext",
+                "  in xmodem.conf - don't reuse",
+                "  sensitive passwords here.",
+                "",
+                "  When security is OFF:",
+                "  Only private-range IPs can",
+                "  connect (RFC 1918, loopback,",
+                "  link-local, IPv6 unique-local).",
+                "  Public IPs are refused, and",
+                "  gateway addresses (*.*.*.1)",
+                "  are rejected defensively.",
+                "",
+                "  When security is ON:",
+                "  Any IP may connect, but must",
+                "  authenticate. 3 failed logins",
+                "  from the same IP triggers a",
+                "  5-minute lockout for that IP.",
+                "",
+                "  Telnet transmits credentials",
+                "  in cleartext. Use SSH for any",
+                "  non-local access.",
+                "",
+                "  Changes are saved immediately",
+                "  but require a server restart.",
             ]
         } else {
             &[
                 "  Configure login security.",
                 "",
+                "  Menu items:",
                 "  L  Toggle whether a login is required",
                 "  U  Set the telnet login username",
                 "  P  Set the telnet login password",
@@ -7130,10 +7787,37 @@ impl TelnetSession {
                 "  W  Set the SSH login password",
                 "  R  Restart the server",
                 "",
-                "  Telnet and SSH have separate",
-                "  credentials. Changes are saved",
-                "  immediately but require a server",
-                "  restart to take effect.",
+                "  Credentials:",
+                "  Telnet and SSH have separate usernames",
+                "  and passwords; changing one doesn't",
+                "  affect the other. Both are stored in",
+                "  plaintext in xmodem.conf - don't reuse",
+                "  sensitive passwords on this server.",
+                "",
+                "  When security is OFF (default):",
+                "  Only private-range IPs are allowed to",
+                "  connect (RFC 1918 10/172.16/192.168,",
+                "  loopback 127.0.0.0/8, link-local",
+                "  169.254.0.0/16, IPv6 ::1, fe80::/10,",
+                "  and fd00::/8). Public IPs get a refusal",
+                "  message, and gateway addresses (those",
+                "  ending in .1) are rejected to guard",
+                "  against accidental router exposure.",
+                "",
+                "  When security is ON:",
+                "  Any IP may connect but must authenticate.",
+                "  After 3 failed login attempts from the",
+                "  same IP, that address is locked out for",
+                "  5 minutes. Credentials are compared in",
+                "  constant time to resist timing attacks.",
+                "",
+                "  Telnet transmits every byte (including",
+                "  the password) in cleartext. For any",
+                "  non-local access, use the SSH interface",
+                "  instead (Configuration > Server > S).",
+                "",
+                "  Changes are saved immediately but",
+                "  require a server restart to take effect.",
             ]
         };
         self.show_help_page("SECURITY HELP", lines).await
@@ -7388,18 +8072,45 @@ impl TelnetSession {
         let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
             &[
                 "  Configure the outbound Telnet",
-                "  and SSH Gateway menus.",
+                "  and SSH Gateway menus (the S",
+                "  and T main-menu items that",
+                "  proxy to remote servers).",
                 "",
                 "  Telnet mode:",
-                "    Telnet - parse IAC (default)",
-                "    Raw    - raw TCP, no IAC",
+                "    Telnet - parse IAC option",
+                "             negotiation; works",
+                "             with real telnet",
+                "             servers. Default.",
+                "    Raw    - raw TCP byte stream,",
+                "             no IAC. Use for MUDs",
+                "             and hand-rolled BBS",
+                "             software that don't",
+                "             speak telnet.",
+                "",
+                "  Telnet mode options:",
+                "    Cooperative - proactively offers",
+                "      TTYPE, NAWS, DO ECHO so BBSes",
+                "      that wait for the client to",
+                "      ask first still get full-",
+                "      screen behavior. Enable for",
+                "      cooperative telnet servers;",
+                "      disable for raw-TCP services.",
                 "",
                 "  SSH auth:",
-                "    Key      - gateway Ed25519 key",
-                "    Password - prompt each time",
+                "    Key      - offer the gateway's",
+                "               Ed25519 client key.",
+                "               Paste the public half",
+                "               into the remote's",
+                "               ~/.ssh/authorized_keys",
+                "               first. Passwordless.",
+                "    Password - prompt for the remote",
+                "               account's password on",
+                "               each connect.",
                 "",
-                "  Changes take effect on the",
-                "  next gateway connection.",
+                "  Both settings are saved to",
+                "  xmodem.conf and take effect on",
+                "  the next gateway connection.",
+                "  No server restart is required.",
             ]
         } else {
             &[
@@ -7409,19 +8120,42 @@ impl TelnetSession {
                 "",
                 "  Telnet mode:",
                 "    Telnet  - parse IAC option negotiation",
-                "              (default; works with real",
-                "              telnet servers)",
-                "    Raw     - raw TCP byte stream, no IAC",
-                "              (for MUDs and hand-rolled BBS",
-                "              software that aren't telnet)",
+                "              (default; works with every real",
+                "              telnet server). IAC bytes in",
+                "              data are escaped as IAC IAC.",
+                "    Raw     - raw TCP byte stream, no IAC.",
+                "              Use for MUDs and hand-rolled",
+                "              BBS software that aren't telnet.",
+                "              Bytes pass through unmodified.",
+                "",
+                "  Cooperative mode (Telnet only):",
+                "    When on, the gateway sends WILL TTYPE,",
+                "    WILL NAWS, and DO ECHO proactively so",
+                "    BBSes that wait for the client to ask",
+                "    first still get echo cooperation,",
+                "    terminal-type adaptation, and full-screen",
+                "    window sizing. Off by default so raw-TCP",
+                "    services aren't spammed with IAC bytes",
+                "    they can't parse.",
                 "",
                 "  SSH auth:",
                 "    Key      - offer the gateway's Ed25519",
-                "               client key (paste the public",
-                "               half into the remote's",
-                "               ~/.ssh/authorized_keys first)",
-                "    Password - prompt for the remote account",
-                "               password on each connect",
+                "               client key. Copy the public",
+                "               half (shown under Server >",
+                "               More in the GUI) into the",
+                "               remote's authorized_keys file.",
+                "               Passwordless once installed.",
+                "    Password - prompt for the remote account's",
+                "               password on each connect. No",
+                "               key is offered.",
+                "",
+                "  Host keys:",
+                "    On first dial, the gateway displays the",
+                "    remote's SHA-256 fingerprint and asks",
+                "    whether to trust it (TOFU). Accepted",
+                "    fingerprints are saved to gateway_hosts;",
+                "    a changed key triggers a prominent",
+                "    HOST KEY CHANGED warning.",
                 "",
                 "  Changes are saved immediately and take",
                 "  effect on the next gateway connection.",
@@ -7603,16 +8337,23 @@ impl TelnetSession {
         self.show_help_page("SERVER CONFIGURATION HELP", lines).await
     }
 
-    // ─── XMODEM SETTINGS ────────────────────────────────────
+    // ─── FILE TRANSFER SETTINGS ─────────────────────────────
+    //
+    // Top-level submenu under Configuration > File Transfer.  Holds
+    // the shared transfer-directory setting plus a per-protocol
+    // selector that drills into XMODEM / YMODEM / ZMODEM settings
+    // pages.  Each protocol page edits only the keys that apply to
+    // that protocol; XMODEM and YMODEM share the `xmodem_*` keys
+    // because they share a single protocol code path in `xmodem.rs`.
 
-    async fn xmodem_settings(&mut self) -> Result<(), std::io::Error> {
+    async fn file_transfer_settings(&mut self) -> Result<(), std::io::Error> {
         loop {
             let cfg = config::get_config();
 
             self.clear_screen().await?;
             let sep = self.separator();
             self.send_line(&sep).await?;
-            self.send_line(&format!("  {}", self.yellow("XMODEM SETTINGS")))
+            self.send_line(&format!("  {}", self.yellow("FILE TRANSFER")))
                 .await?;
             self.send_line(&sep).await?;
             self.send_line("").await?;
@@ -7620,21 +8361,6 @@ impl TelnetSession {
             self.send_line(&format!(
                 "  Transfer dir:  {}",
                 self.amber(&cfg.transfer_dir)
-            ))
-            .await?;
-            self.send_line(&format!(
-                "  Negotiate:     {} s",
-                self.amber(&cfg.xmodem_negotiation_timeout.to_string())
-            ))
-            .await?;
-            self.send_line(&format!(
-                "  Block timeout: {} s",
-                self.amber(&cfg.xmodem_block_timeout.to_string())
-            ))
-            .await?;
-            self.send_line(&format!(
-                "  Max retries:   {}",
-                self.amber(&cfg.xmodem_max_retries.to_string())
             ))
             .await?;
             self.send_line("").await?;
@@ -7645,8 +8371,183 @@ impl TelnetSession {
             ))
             .await?;
             self.send_line(&format!(
+                "  {}  XMODEM settings",
+                self.cyan("X")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  YMODEM settings",
+                self.cyan("Y")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  ZMODEM settings",
+                self.cyan("Z")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/xfer"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "d" => {
+                    self.xmodem_set_dir(&cfg.transfer_dir).await?;
+                }
+                "x" => {
+                    self.xmodem_settings().await?;
+                }
+                "y" => {
+                    self.ymodem_settings().await?;
+                }
+                "z" => {
+                    self.zmodem_settings().await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.file_transfer_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press D, X, Y, Z, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn file_transfer_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure file-transfer options.",
+                "",
+                "  D  Transfer directory: where",
+                "     uploads land and downloads",
+                "     are served from",
+                "  X  XMODEM settings",
+                "  Y  YMODEM settings",
+                "  Z  ZMODEM settings",
+                "  R  Restart the server",
+                "",
+                "  XMODEM, XMODEM-1K, and YMODEM",
+                "  share the same timeouts.",
+                "  ZMODEM has its own.",
+            ]
+        } else {
+            &[
+                "  Configure file-transfer options.",
+                "",
+                "  D  Transfer directory: where uploads",
+                "     land and downloads are served from",
+                "  X  XMODEM settings (XMODEM + XMODEM-1K)",
+                "  Y  YMODEM settings (shared with XMODEM)",
+                "  Z  ZMODEM settings",
+                "  R  Restart the server",
+                "",
+                "  XMODEM, XMODEM-1K, and YMODEM share",
+                "  the same timeouts because they share",
+                "  the same protocol code path. ZMODEM",
+                "  has its own independent tunables.",
+            ]
+        };
+        self.show_help_page("FILE TRANSFER HELP", lines).await
+    }
+
+    // ─── XMODEM SETTINGS ────────────────────────────────────
+    //
+    // These settings also govern XMODEM-1K and YMODEM because all
+    // three protocols share the same `xmodem_*` config keys and the
+    // same send/receive code path in `xmodem.rs`.
+
+    async fn xmodem_settings(&mut self) -> Result<(), std::io::Error> {
+        self.xmodem_family_settings(
+            "XMODEM SETTINGS",
+            "xmodem/config/xfer/xmodem",
+            "XMODEM family",
+        )
+        .await
+    }
+
+    async fn ymodem_settings(&mut self) -> Result<(), std::io::Error> {
+        self.xmodem_family_settings(
+            "YMODEM SETTINGS",
+            "xmodem/config/xfer/ymodem",
+            "XMODEM family (shared)",
+        )
+        .await
+    }
+
+    /// Shared renderer for the XMODEM / YMODEM settings pages.  Both
+    /// protocols edit the same `xmodem_*` config keys, so the page
+    /// differs only in its heading and breadcrumb.  A note under the
+    /// status block calls out the shared-family behavior so operators
+    /// aren't surprised when editing either page changes the other.
+    async fn xmodem_family_settings(
+        &mut self,
+        header: &str,
+        breadcrumb: &str,
+        applies_to: &str,
+    ) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow(header))).await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  Negotiate:      {} s",
+                self.amber(&cfg.xmodem_negotiation_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Retry interval: {} s",
+                self.amber(&cfg.xmodem_negotiation_retry_interval.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Block timeout:  {} s",
+                self.amber(&cfg.xmodem_block_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Max retries:    {}",
+                self.amber(&cfg.xmodem_max_retries.to_string())
+            ))
+            .await?;
+            self.send_line(&format!("  Applies to:     {}", self.dim(applies_to)))
+                .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
                 "  {}  Set negotiation timeout",
                 self.cyan("N")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set retry interval",
+                self.cyan("I")
             ))
             .await?;
             self.send_line(&format!(
@@ -7672,7 +8573,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/xmodem"));
+            let prompt = format!("{}> ", self.cyan(breadcrumb));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -7682,9 +8583,6 @@ impl TelnetSession {
             };
 
             match input.as_str() {
-                "d" => {
-                    self.xmodem_set_dir(&cfg.transfer_dir).await?;
-                }
                 "n" => {
                     self.xmodem_set_numeric(
                         "Negotiation timeout",
@@ -7692,6 +8590,17 @@ impl TelnetSession {
                         cfg.xmodem_negotiation_timeout,
                         1,
                         300,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "i" => {
+                    self.xmodem_set_numeric(
+                        "Retry interval",
+                        "xmodem_negotiation_retry_interval",
+                        cfg.xmodem_negotiation_retry_interval,
+                        1,
+                        60,
                         "seconds",
                     )
                     .await?;
@@ -7726,10 +8635,188 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 _ => {
-                    self.show_error("Press D, N, B, M, R, H, or Q.").await?;
+                    self.show_error("Press N, I, B, M, R, H, or Q.").await?;
                 }
             }
         }
+    }
+
+    // ─── ZMODEM SETTINGS ────────────────────────────────────
+
+    async fn zmodem_settings(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("ZMODEM SETTINGS")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  Negotiate:      {} s",
+                self.amber(&cfg.zmodem_negotiation_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Retry interval: {} s",
+                self.amber(&cfg.zmodem_negotiation_retry_interval.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Frame timeout:  {} s",
+                self.amber(&cfg.zmodem_frame_timeout.to_string())
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Max retries:    {}",
+                self.amber(&cfg.zmodem_max_retries.to_string())
+            ))
+            .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Set negotiation timeout",
+                self.cyan("N")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set retry interval",
+                self.cyan("I")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set frame timeout",
+                self.cyan("F")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Set max retries",
+                self.cyan("M")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Restart server",
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("xmodem/config/xfer/zmodem"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "n" => {
+                    self.xmodem_set_numeric(
+                        "Negotiation timeout",
+                        "zmodem_negotiation_timeout",
+                        cfg.zmodem_negotiation_timeout,
+                        1,
+                        300,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "i" => {
+                    self.xmodem_set_numeric(
+                        "Retry interval",
+                        "zmodem_negotiation_retry_interval",
+                        cfg.zmodem_negotiation_retry_interval,
+                        1,
+                        60,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "f" => {
+                    self.xmodem_set_numeric(
+                        "Frame timeout",
+                        "zmodem_frame_timeout",
+                        cfg.zmodem_frame_timeout,
+                        1,
+                        120,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "m" => {
+                    self.xmodem_set_numeric(
+                        "Max retries",
+                        "zmodem_max_retries",
+                        cfg.zmodem_max_retries as u64,
+                        1,
+                        100,
+                        "retries",
+                    )
+                    .await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.zmodem_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press N, I, F, M, R, H, or Q.").await?;
+                }
+            }
+        }
+    }
+
+    async fn zmodem_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure ZMODEM file transfer",
+                "  settings.",
+                "",
+                "  N  Negotiation timeout: how",
+                "     long to wait for ZRQINIT /",
+                "     ZRINIT handshake",
+                "  I  Retry interval: ZRINIT/",
+                "     ZRQINIT re-send gap (def 5)",
+                "  F  Frame timeout: per-frame",
+                "     read timeout in transfer",
+                "  M  Max retries for ZRQINIT /",
+                "     ZRPOS / ZDATA frames",
+                "  R  Restart the server",
+                "",
+                "  Takes effect on next transfer.",
+            ]
+        } else {
+            &[
+                "  Configure ZMODEM file transfer",
+                "  settings.",
+                "",
+                "  N  Negotiation timeout: how long to",
+                "     wait for the ZRQINIT / ZRINIT",
+                "     handshake",
+                "  I  Retry interval: seconds between",
+                "     ZRINIT / ZRQINIT re-sends (def 5)",
+                "  F  Frame timeout: per-frame read",
+                "     timeout once a transfer is live",
+                "  M  Max retries: retry cap for ZRQINIT,",
+                "     ZRPOS, and ZDATA frames",
+                "  R  Restart the server",
+                "",
+                "  Takes effect on next transfer.",
+            ]
+        };
+        self.show_help_page("ZMODEM SETTINGS HELP", lines).await
     }
 
     async fn xmodem_set_dir(&mut self, current: &str) -> Result<(), std::io::Error> {
@@ -7821,44 +8908,65 @@ impl TelnetSession {
     async fn xmodem_show_help(&mut self) -> Result<(), std::io::Error> {
         let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
             &[
-                "  Configure XMODEM file transfer",
-                "  settings.",
+                "  Configure XMODEM family transfer",
+                "  settings. Shared with XMODEM-1K",
+                "  and YMODEM.",
                 "",
-                "  D  Transfer directory where",
-                "     files are stored",
                 "  N  Negotiation timeout: how",
                 "     long to wait for transfer",
                 "     to begin",
+                "  I  Retry interval: C/NAK poke",
+                "     gap (spec ~10 s, def 7 s)",
                 "  B  Block timeout: how long to",
                 "     wait for each block",
                 "  M  Max retries per block",
                 "  R  Restart the server",
                 "",
-                "  Changes take effect on the",
-                "  next file transfer.",
+                "  Takes effect on next transfer.",
             ]
         } else {
             &[
-                "  Configure XMODEM file transfer",
-                "  settings.",
+                "  Configure XMODEM family transfer",
+                "  settings. Shared with XMODEM-1K and",
+                "  YMODEM (same protocol code path).",
                 "",
-                "  D  Transfer directory where files",
-                "     are stored on the server",
                 "  N  Negotiation timeout: how long to",
                 "     wait for a transfer to begin",
+                "  I  Retry interval: seconds between",
+                "     C/NAK pokes during the handshake",
+                "     (spec suggests ~10, default 7)",
                 "  B  Block timeout: how long to wait",
                 "     for each data block",
                 "  M  Max retries: retry limit per block",
                 "  R  Restart the server",
                 "",
-                "  Changes take effect on the next file",
-                "  transfer (no restart required).",
+                "  Takes effect on next transfer.",
             ]
         };
         self.show_help_page("XMODEM SETTINGS HELP", lines).await
     }
 
     // ─── TROUBLESHOOTING ────────────────────────────────────
+
+    fn client_type_label(&self) -> &'static str {
+        if self.is_ssh {
+            "SSH"
+        } else if self.is_serial {
+            "Serial modem"
+        } else if self.telnet_negotiated {
+            "Telnet"
+        } else {
+            "Raw TCP"
+        }
+    }
+
+    fn terminal_type_label(&self) -> &'static str {
+        match self.terminal_type {
+            TerminalType::Petscii => "PETSCII",
+            TerminalType::Ansi => "ANSI",
+            TerminalType::Ascii => "ASCII",
+        }
+    }
 
     async fn troubleshooting(&mut self) -> Result<(), std::io::Error> {
         self.clear_screen().await?;
@@ -7870,6 +8978,22 @@ impl TelnetSession {
         ))
         .await?;
         self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Client:   {}",
+            self.cyan(self.client_type_label())
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Terminal: {}",
+            self.cyan(self.terminal_type_label())
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  IAC esc:  {}",
+            self.cyan(if self.xmodem_iac { "On" } else { "Off" })
+        ))
+        .await?;
         self.send_line("").await?;
         self.send_line("  Press any key to see its hex value.")
             .await?;
@@ -8883,15 +10007,17 @@ pub fn start_server(
                                     lockouts: lo,
                                     peer_addr: Some(addr.ip()),
                                     transfer_subdir: String::new(),
-                                    // Telnet wire requires 0xFF to be doubled as IAC IAC
-                                    // in both directions (RFC 854/856).  PuTTY/ExtraPuTTY,
-                                    // Tera Term, C-Kermit, and SecureCRT all escape the
-                                    // complement byte 0xFF during XMODEM/YMODEM.  Without
-                                    // this default on, the unescaped second 0xFF is eaten
-                                    // as payload[0] and every block's CRC fails.  The I
-                                    // toggle in the File Transfer menu still lets a
-                                    // (rare) non-escaping client flip it off.
-                                    xmodem_iac: true,
+                                    // Start with IAC escaping off; session_read_byte
+                                    // flips telnet_negotiated on as soon as the client
+                                    // sends any telnet option negotiation, and run()
+                                    // sets xmodem_iac from that flag after terminal
+                                    // detection.  Real telnet clients (PuTTY, Tera Term,
+                                    // C-Kermit, SecureCRT) always negotiate and get
+                                    // IAC escaping; raw TCP clients (netcat, retro
+                                    // firmware) don't and get a transparent byte
+                                    // stream.  The I toggle in the File Transfer menu
+                                    // still lets the user override per-session.
+                                    xmodem_iac: false,
                                     web_lines: Vec::new(),
                                     web_scroll: 0,
                                     web_links: Vec::new(),
@@ -8909,6 +10035,7 @@ pub fn start_server(
                                     neg_sent_wont: Box::new([false; 256]),
                                     neg_sent_dont: Box::new([false; 256]),
                                     ttype_matched: false,
+                                    telnet_negotiated: false,
                                     window_width: None,
                                     window_height: None,
                                 };
@@ -9296,6 +10423,7 @@ mod tests {
             neg_sent_wont: Box::new([false; 256]),
             neg_sent_dont: Box::new([false; 256]),
             ttype_matched: false,
+            telnet_negotiated: false,
             window_width: None,
             window_height: None,
         }
@@ -9343,6 +10471,7 @@ mod tests {
             neg_sent_wont: Box::new([false; 256]),
             neg_sent_dont: Box::new([false; 256]),
             ttype_matched: false,
+            telnet_negotiated: false,
             window_width: None,
             window_height: None,
         };
@@ -9878,13 +11007,17 @@ mod tests {
             "Mapping saved.",
             "No other mappings defined.",
             // Configuration
-            "Press E, M, O, S, X, R, H, or Q.",
+            "Press E, F, G, M, O, S, R, H, or Q.",
             // Other settings
             "Press A, B, W, V, G, R, H, or Q.",
             // Security
             "Press L, U, P, S, W, R, H, or Q.",
-            // XMODEM settings
-            "Press D, N, B, M, R, H, or Q.",
+            // File transfer submenu
+            "Press D, X, Y, Z, R, H, or Q.",
+            // XMODEM / YMODEM settings
+            "Press N, I, B, M, R, H, or Q.",
+            // ZMODEM settings
+            "Press N, I, F, M, R, H, or Q.",
             "Press T, P, S, O, R, H, or Q.",
             "Invalid port number.",
         ];
@@ -9930,14 +11063,14 @@ mod tests {
             "  E  Security",
             "  M  Modem Emulator",
             "  S  Server Configuration",
-            "  X  XMODEM Settings",
+            "  F  File Transfer",
             "  O  Other Settings",
             "  R  Reset Defaults",
             // Other settings menu
             "  A  Set AI API key (Groq)",
             "  B  Set browser homepage",
             "  W  Set weather zip code",
-            "  V  Toggle verbose XMODEM logging",
+            "  V  Toggle verbose transfer logging",
             "  G  Toggle GUI on startup",
             // Security menu
             "  L  Toggle require login",
@@ -9945,11 +11078,19 @@ mod tests {
             "  P  Set telnet password",
             "  S  Set SSH username",
             "  W  Set SSH password",
-            // XMODEM settings menu
+            // File transfer submenu
             "  D  Change transfer directory",
+            "  X  XMODEM settings",
+            "  Y  YMODEM settings",
+            "  Z  ZMODEM settings",
+            // XMODEM / YMODEM settings menu
             "  N  Set negotiation timeout",
+            "  I  Set retry interval",
             "  B  Set block timeout",
             "  M  Set max retries",
+            // ZMODEM settings menu
+            "  F  Set frame timeout",
+            // Shared by XMODEM/YMODEM/ZMODEM pages
             "  R  Restart server",
             // Server configuration menu
             "  T  Toggle telnet",
@@ -10326,7 +11467,7 @@ mod tests {
             "     the built-in web browser",
             "  W  Default zip code for the",
             "     weather feature",
-            "  V  Toggle verbose XMODEM log",
+            "  V  Toggle verbose transfer log",
             "  G  Toggle GUI on startup",
             "     (requires restart)",
             "  R  Restart the server",
@@ -10350,36 +11491,250 @@ mod tests {
         assert!(rows <= 22, "other help screen is {} rows, exceeds 22", rows);
     }
 
-    /// XMODEM settings menu row count:
-    /// header(3) + blank + 4 values + blank + 5 items + blank + Q/H + prompt = 17
+    /// File Transfer settings submenu row count:
+    /// header(3) + blank + 1 value + blank + 5 items + blank + Q/H + prompt = 14
+    #[test]
+    fn test_file_transfer_settings_menu_row_count() {
+        let rows = 3 + 1 + 1 + 1 + 5 + 1 + 1 + 1; // 14
+        assert!(rows <= 22, "file transfer settings menu is {} rows, exceeds 22", rows);
+    }
+
+    // ─── paginate_help ─────────────────────────────────────
+    //
+    // `show_help_page` delegates paging to `TelnetSession::paginate_help`.
+    // These tests lock in the blank-line-respecting behavior so groups
+    // of related lines (section header + continuations) stay together
+    // on a single page — regressions here would split a letter-command
+    // from its description, which is exactly what we don't want.
+
+    /// Content that fits within one page passes through unchanged (no
+    /// trailing blanks, no split).
+    #[test]
+    fn test_paginate_help_single_page() {
+        let lines = ["  A  line one", "  B  line two", "  C  line three"];
+        let pages = TelnetSession::paginate_help(&lines, 15);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0], lines);
+    }
+
+    /// Empty content produces zero pages — `show_help_page` handles
+    /// that by substituting a single empty page.
+    #[test]
+    fn test_paginate_help_empty() {
+        let pages = TelnetSession::paginate_help(&[], 15);
+        assert!(pages.is_empty());
+    }
+
+    /// When content overflows, split at the last blank line within the
+    /// page-size budget. Trailing blanks are stripped so each page
+    /// starts and ends on a real content line.
+    #[test]
+    fn test_paginate_help_splits_at_blank_line() {
+        // 20 lines total with a blank at index 9. Budget = 15, so the
+        // splitter should pick the blank at position 10 (1-indexed),
+        // strip it, and emit page 1 = lines 0..9, page 2 = lines 10..19.
+        let lines = [
+            "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "",
+            "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10",
+        ];
+        let pages = TelnetSession::paginate_help(&lines, 15);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], &["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"]);
+        assert_eq!(
+            pages[1],
+            &["b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10"]
+        );
+    }
+
+    /// When no blank line exists within the budget, fall back to a
+    /// hard split at `max_per_page`. Authors should avoid this by
+    /// adding blank lines between groups — but we don't want to loop
+    /// forever on malformed input either.
+    #[test]
+    fn test_paginate_help_force_split_when_no_blank() {
+        let lines = [
+            "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+            "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        ];
+        let pages = TelnetSession::paginate_help(&lines, 10);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), 10);
+        assert_eq!(pages[1].len(), 7);
+    }
+
+    /// A section header + its indented continuation lines must stay
+    /// together when separated from other groups by blank lines. This
+    /// is the guarantee the user asked for.
+    #[test]
+    fn test_paginate_help_keeps_section_groups_together() {
+        let lines = [
+            "  A  alpha header",
+            "     first continuation",
+            "     second continuation",
+            "",
+            "  B  beta header",
+            "     beta continuation",
+            "",
+            "  C  gamma header",
+            "     gamma continuation",
+            "     gamma continuation 2",
+        ];
+        // Budget of 5 forces a split — but NEVER in the middle of a
+        // group.  With a blank at index 3 and 6, the splitter picks
+        // the latest blank inside the first 5: index 3.  Page 1 gets
+        // lines 0..3 (the A group). Page 2 has 6 lines remaining,
+        // still over budget, so it splits at the next blank (index 2
+        // of the remainder): the B group alone (2 lines).  Page 3:
+        // the C group (3 lines).
+        let pages = TelnetSession::paginate_help(&lines, 5);
+        assert_eq!(pages.len(), 3, "expected 3 pages, got {:?}", pages);
+        assert_eq!(pages[0].len(), 3); // A + 2 continuations
+        assert_eq!(pages[0][0], "  A  alpha header");
+        assert_eq!(pages[1].len(), 2); // B + 1 continuation
+        assert_eq!(pages[1][0], "  B  beta header");
+        assert_eq!(pages[2].len(), 3); // C + 2 continuations
+        assert_eq!(pages[2][0], "  C  gamma header");
+    }
+
+    /// Multiple consecutive blanks between groups collapse on page
+    /// boundaries — the next page starts on the next real content
+    /// line, not on a floating blank.
+    #[test]
+    fn test_paginate_help_skips_leading_blanks() {
+        let lines = ["a", "a", "a", "", "", "", "b", "b"];
+        let pages = TelnetSession::paginate_help(&lines, 3);
+        // Page 1 is the three a's; the three blanks get swallowed at
+        // the split; page 2 starts cleanly on "b" with no stray
+        // leading blanks.
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], &["a", "a", "a"]);
+        assert_eq!(pages[1], &["b", "b"]);
+    }
+
+    /// Invalid `max_per_page` of 0 should panic (debug only — the
+    /// caller in show_help_page passes a compile-time constant, so
+    /// this can never happen in practice, but the assertion guards
+    /// against a future typo).
+    #[test]
+    #[should_panic(expected = "max_per_page")]
+    fn test_paginate_help_zero_max_panics() {
+        let _ = TelnetSession::paginate_help(&["a"], 0);
+    }
+
+    /// The paging footer string must fit PETSCII width (40 cols).
+    /// If this test fails, update the `show_help_page` footer format
+    /// string.
+    #[test]
+    fn test_paging_footer_fits_petscii() {
+        let examples = [
+            "  Page 1/2 - next key, Q to quit",
+            "  Page 10/99 - next key, Q to quit",
+            "  Page 2/2 - Press any key.",
+            "  Press any key to continue.",
+        ];
+        for s in &examples {
+            assert!(
+                s.len() <= PETSCII_WIDTH,
+                "paging footer '{}' is {} chars, exceeds {}",
+                s, s.len(), PETSCII_WIDTH
+            );
+        }
+    }
+
+    /// XMODEM / YMODEM settings menu row count (shared renderer):
+    /// header(3) + blank + 5 values + blank + 5 items + blank + Q/H + prompt = 18
     #[test]
     fn test_xmodem_settings_menu_row_count() {
-        let rows = 3 + 1 + 4 + 1 + 5 + 1 + 1 + 1; // 17
+        let rows = 3 + 1 + 5 + 1 + 5 + 1 + 1 + 1; // 18
         assert!(rows <= 22, "xmodem settings menu is {} rows, exceeds 22", rows);
+    }
+
+    /// ZMODEM settings menu row count:
+    /// header(3) + blank + 4 values + blank + 5 items + blank + Q/H + prompt = 17
+    #[test]
+    fn test_zmodem_settings_menu_row_count() {
+        let rows = 3 + 1 + 4 + 1 + 5 + 1 + 1 + 1; // 17
+        assert!(rows <= 22, "zmodem settings menu is {} rows, exceeds 22", rows);
     }
 
     /// XMODEM settings help lines (PETSCII) must fit 40 cols.
     #[test]
     fn test_xmodem_help_lines_fit_petscii() {
         let lines = [
-            "  Configure XMODEM file transfer",
-            "  settings.",
-            "  D  Transfer directory where",
-            "     files are stored",
+            "  Configure XMODEM family transfer",
+            "  settings. Shared with XMODEM-1K",
+            "  and YMODEM.",
             "  N  Negotiation timeout: how",
             "     long to wait for transfer",
             "     to begin",
+            "  I  Retry interval: C/NAK poke",
+            "     gap (spec ~10 s, def 7 s)",
             "  B  Block timeout: how long to",
             "     wait for each block",
             "  M  Max retries per block",
             "  R  Restart the server",
-            "  Changes take effect on the",
-            "  next file transfer.",
+            "  Takes effect on next transfer.",
         ];
         for line in &lines {
             assert!(
                 line.len() <= PETSCII_WIDTH,
                 "xmodem help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// ZMODEM settings help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_zmodem_help_lines_fit_petscii() {
+        let lines = [
+            "  Configure ZMODEM file transfer",
+            "  settings.",
+            "  N  Negotiation timeout: how",
+            "     long to wait for ZRQINIT /",
+            "     ZRINIT handshake",
+            "  I  Retry interval: ZRINIT/",
+            "     ZRQINIT re-send gap (def 5)",
+            "  F  Frame timeout: per-frame",
+            "     read timeout in transfer",
+            "  M  Max retries for ZRQINIT /",
+            "     ZRPOS / ZDATA frames",
+            "  R  Restart the server",
+            "  Takes effect on next transfer.",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "zmodem help '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// File transfer help lines (PETSCII) must fit 40 cols.
+    #[test]
+    fn test_file_transfer_help_lines_fit_petscii() {
+        let lines = [
+            "  Configure file-transfer options.",
+            "  D  Transfer directory: where",
+            "     uploads land and downloads",
+            "     are served from",
+            "  X  XMODEM settings",
+            "  Y  YMODEM settings",
+            "  Z  ZMODEM settings",
+            "  R  Restart the server",
+            "  XMODEM, XMODEM-1K, and YMODEM",
+            "  share the same timeouts.",
+            "  ZMODEM has its own.",
+        ];
+        for line in &lines {
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "file transfer help '{}' is {} chars, exceeds {}",
                 line,
                 line.len(),
                 PETSCII_WIDTH,
@@ -10393,6 +11748,72 @@ mod tests {
     fn test_xmodem_help_screen_row_count() {
         let rows = 3 + 1 + 15 + 1 + 1; // 21
         assert!(rows <= 22, "xmodem help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// ZMODEM help screen (PETSCII): header(3) + blank + 15 content +
+    /// blank + "Press any key" = 21 rows.  Content grew by +2 rows (Retry
+    /// interval) but we trimmed the footer by -2, net 0.
+    #[test]
+    fn test_zmodem_help_screen_row_count() {
+        let rows = 3 + 1 + 15 + 1 + 1; // 21
+        assert!(rows <= 22, "zmodem help screen is {} rows, exceeds 22", rows);
+    }
+
+    /// File Transfer help screen (PETSCII): header(3) + blank + 13 content
+    /// + blank + "Press any key" = 19 rows.
+    #[test]
+    fn test_file_transfer_help_screen_row_count() {
+        let rows = 3 + 1 + 13 + 1 + 1; // 19
+        assert!(
+            rows <= 22,
+            "file transfer help screen is {} rows, exceeds 22",
+            rows,
+        );
+    }
+
+    /// The breadcrumb prompts for the File Transfer submenu and each
+    /// per-protocol page must fit PETSCII width (40 cols) when the
+    /// "> " suffix is appended.
+    #[test]
+    fn test_file_transfer_breadcrumbs_fit_petscii() {
+        // These mirror the literal strings passed to `self.cyan(...)`
+        // in the submenu and per-protocol pages.  Keep this list in
+        // sync with the code; a rename in one place will trigger a
+        // test failure if not updated here.
+        let breadcrumbs = [
+            "xmodem/config/xfer",
+            "xmodem/config/xfer/xmodem",
+            "xmodem/config/xfer/ymodem",
+            "xmodem/config/xfer/zmodem",
+        ];
+        for b in &breadcrumbs {
+            let prompt = format!("{}> ", b);
+            assert!(
+                prompt.len() <= PETSCII_WIDTH,
+                "breadcrumb prompt '{}' is {} chars, exceeds {}",
+                prompt,
+                prompt.len(),
+                PETSCII_WIDTH,
+            );
+        }
+    }
+
+    /// Every per-protocol settings page must render its status rows
+    /// (value column) within PETSCII width.  The longest rendered
+    /// status line is `  Applies to:    <applies_to>`, with the
+    /// `applies_to` values below plugged into `xmodem_family_settings`.
+    #[test]
+    fn test_xmodem_family_applies_to_lines_fit_petscii() {
+        for applies_to in &["XMODEM family", "XMODEM family (shared)"] {
+            let line = format!("  Applies to:    {}", applies_to);
+            assert!(
+                line.len() <= PETSCII_WIDTH,
+                "'Applies to' line '{}' is {} chars, exceeds {}",
+                line,
+                line.len(),
+                PETSCII_WIDTH,
+            );
+        }
     }
 
     /// Modem help screen (ANSI): header(3) + blank + 16 content lines +
@@ -10438,8 +11859,8 @@ mod tests {
             "  S  Server: enable/disable",
             "     services, set ports, and",
             "     restart the server",
-            "  X  XMODEM: set transfer dir,",
-            "     timeouts, and retry limit",
+            "  F  File Transfer: per-protocol",
+            "     XMODEM, YMODEM, ZMODEM setup",
             "  O  Other: AI key, logging,",
             "     and general settings",
             "  R  Reset all settings to their",
@@ -10451,7 +11872,7 @@ mod tests {
             "     the built-in web browser",
             "  W  Default zip code for the",
             "     weather feature",
-            "  V  Toggle verbose XMODEM log",
+            "  V  Toggle verbose transfer log",
             "  G  Toggle GUI on startup",
             "     (requires restart)",
             "  R  Restart the server",
@@ -10468,19 +11889,19 @@ mod tests {
             "  credentials. Changes require",
             "  a server restart.",
             // XMODEM settings help
-            "  Configure XMODEM file transfer",
-            "  settings.",
-            "  D  Transfer directory where",
-            "     files are stored",
+            "  Configure XMODEM family transfer",
+            "  settings. Shared with XMODEM-1K",
+            "  and YMODEM.",
             "  N  Negotiation timeout: how",
             "     long to wait for transfer",
             "     to begin",
+            "  I  Retry interval: C/NAK poke",
+            "     gap (spec ~10 s, def 7 s)",
             "  B  Block timeout: how long to",
             "     wait for each block",
             "  M  Max retries per block",
             "  R  Restart the server",
-            "  Changes take effect on the",
-            "  next file transfer.",
+            "  Takes effect on next transfer.",
             // File transfer help
             "  U  Upload a file to the server",
             "  D  Download a file from server",
@@ -11010,6 +12431,9 @@ mod tests {
     fn test_troubleshooting_lines_fit_petscii() {
         let lines = [
             "  CHARACTER TROUBLESHOOTING",
+            "  Client:   Serial modem",
+            "  Terminal: PETSCII",
+            "  IAC esc:  Off",
             "  Press any key to see its hex value.",
             "  Press <- twice to return to menu.",
             "  Key: 0x1B ( 27) = ESC",

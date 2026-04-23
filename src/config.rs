@@ -51,6 +51,29 @@ const DEFAULT_SERIAL_FLOWCONTROL: &str = "none";
 const DEFAULT_XMODEM_NEGOTIATION_TIMEOUT: u64 = 45;
 const DEFAULT_XMODEM_BLOCK_TIMEOUT: u64 = 20;
 const DEFAULT_XMODEM_MAX_RETRIES: usize = 10;
+/// How long the XMODEM/YMODEM receiver waits between successive
+/// `C` / NAK pokes during the initial handshake.  Christensen's original
+/// XMODEM.DOC and Forsberg's reference implementations use ~10 s; 7 s is
+/// a compromise that starts quickly when the sender misses a poke but
+/// avoids stockpiling extras in a slow-starting sender's input buffer.
+const DEFAULT_XMODEM_NEGOTIATION_RETRY_INTERVAL: u64 = 7;
+/// ZMODEM negotiation timeout: how long the sender/receiver keeps
+/// retrying ZRQINIT / ZRINIT before giving up.  Analogous to the
+/// XMODEM negotiation timeout but for ZMODEM's handshake frames.
+const DEFAULT_ZMODEM_NEGOTIATION_TIMEOUT: u64 = 45;
+/// ZMODEM per-frame read timeout in seconds.  Applied once a transfer
+/// has started — bounds how long we wait for the next header after
+/// sending a response frame.
+const DEFAULT_ZMODEM_FRAME_TIMEOUT: u64 = 30;
+/// ZMODEM max retries for ZRQINIT, ZRPOS, and ZDATA frames.
+const DEFAULT_ZMODEM_MAX_RETRIES: u32 = 10;
+/// Seconds between successive ZRINIT / ZRQINIT re-sends during the
+/// ZMODEM negotiation handshake.  Analogous to the XMODEM family's
+/// C-retry interval: long enough that a slow-starting peer doesn't
+/// stockpile extras, short enough that a dropped poke doesn't stall
+/// the session for long.  The per-session budget is still bounded by
+/// `zmodem_negotiation_timeout`.
+const DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL: u64 = 5;
 const DEFAULT_SERIAL_ECHO: bool = true;
 const DEFAULT_SERIAL_VERBOSE: bool = true;
 const DEFAULT_SERIAL_QUIET: bool = false;
@@ -116,12 +139,29 @@ pub struct Config {
     pub weather_zip: String,
     /// Enable verbose XMODEM protocol logging to stderr.
     pub verbose: bool,
-    /// XMODEM negotiation timeout in seconds.
+    /// XMODEM negotiation timeout in seconds.  Shared with XMODEM-1K
+    /// and YMODEM — they use the same protocol code path.
     pub xmodem_negotiation_timeout: u64,
-    /// XMODEM per-block timeout in seconds.
+    /// XMODEM per-block timeout in seconds.  Shared with XMODEM-1K
+    /// and YMODEM.
     pub xmodem_block_timeout: u64,
-    /// XMODEM maximum retries per block.
+    /// XMODEM maximum retries per block.  Shared with XMODEM-1K and YMODEM.
     pub xmodem_max_retries: usize,
+    /// Seconds between successive `C` / NAK pokes during the initial
+    /// XMODEM/YMODEM negotiation handshake.  Shared with XMODEM-1K and
+    /// YMODEM.  Kept short enough to recover quickly on lost pokes,
+    /// long enough that a slow-starting sender doesn't stockpile extras.
+    pub xmodem_negotiation_retry_interval: u64,
+    /// ZMODEM negotiation timeout in seconds.
+    pub zmodem_negotiation_timeout: u64,
+    /// ZMODEM per-frame read timeout in seconds.
+    pub zmodem_frame_timeout: u64,
+    /// ZMODEM max retries for ZRQINIT / ZRPOS / ZDATA frames.
+    pub zmodem_max_retries: u32,
+    /// Seconds between ZRINIT / ZRQINIT re-sends during the ZMODEM
+    /// negotiation handshake.  Analogous to
+    /// `xmodem_negotiation_retry_interval` for the XMODEM family.
+    pub zmodem_negotiation_retry_interval: u64,
     /// Enable serial modem emulation.
     pub serial_enabled: bool,
     /// Serial port device (e.g. /dev/ttyUSB0, COM3). Empty = not configured.
@@ -191,6 +231,11 @@ impl Default for Config {
             xmodem_negotiation_timeout: DEFAULT_XMODEM_NEGOTIATION_TIMEOUT,
             xmodem_block_timeout: DEFAULT_XMODEM_BLOCK_TIMEOUT,
             xmodem_max_retries: DEFAULT_XMODEM_MAX_RETRIES,
+            xmodem_negotiation_retry_interval: DEFAULT_XMODEM_NEGOTIATION_RETRY_INTERVAL,
+            zmodem_negotiation_timeout: DEFAULT_ZMODEM_NEGOTIATION_TIMEOUT,
+            zmodem_frame_timeout: DEFAULT_ZMODEM_FRAME_TIMEOUT,
+            zmodem_max_retries: DEFAULT_ZMODEM_MAX_RETRIES,
+            zmodem_negotiation_retry_interval: DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL,
             serial_enabled: DEFAULT_SERIAL_ENABLED,
             serial_port: DEFAULT_SERIAL_PORT.into(),
             serial_baud: DEFAULT_SERIAL_BAUD,
@@ -352,6 +397,31 @@ fn read_config_file(path: &str) -> Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &usize| v >= 1)
             .unwrap_or(DEFAULT_XMODEM_MAX_RETRIES),
+        xmodem_negotiation_retry_interval: map
+            .get("xmodem_negotiation_retry_interval")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_XMODEM_NEGOTIATION_RETRY_INTERVAL),
+        zmodem_negotiation_timeout: map
+            .get("zmodem_negotiation_timeout")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_ZMODEM_NEGOTIATION_TIMEOUT),
+        zmodem_frame_timeout: map
+            .get("zmodem_frame_timeout")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_ZMODEM_FRAME_TIMEOUT),
+        zmodem_max_retries: map
+            .get("zmodem_max_retries")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u32| v >= 1)
+            .unwrap_or(DEFAULT_ZMODEM_MAX_RETRIES),
+        zmodem_negotiation_retry_interval: map
+            .get("zmodem_negotiation_retry_interval")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL),
         serial_enabled: map
             .get("serial_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -538,10 +608,28 @@ weather_zip = {}
 # Verbose logging: set to true for detailed XMODEM protocol diagnostics
 verbose = {}
 
-# XMODEM protocol timeouts
+# XMODEM-family protocol timeouts (apply to XMODEM, XMODEM-1K, and YMODEM).
+# xmodem_negotiation_timeout:      seconds to wait for the peer to start sending.
+# xmodem_block_timeout:            seconds to wait for each data block.
+# xmodem_max_retries:              retry limit per block.
+# xmodem_negotiation_retry_interval: seconds between C/NAK pokes during
+#                                    the initial handshake (spec suggests 10 s,
+#                                    default 7 s).
 xmodem_negotiation_timeout = {}
 xmodem_block_timeout = {}
 xmodem_max_retries = {}
+xmodem_negotiation_retry_interval = {}
+
+# ZMODEM protocol tunables.
+# zmodem_negotiation_timeout:       seconds to wait for ZRQINIT / ZRINIT handshake.
+# zmodem_frame_timeout:             seconds to wait for each header / subpacket.
+# zmodem_max_retries:               retry limit for ZRQINIT / ZRPOS / ZDATA frames.
+# zmodem_negotiation_retry_interval: seconds between ZRINIT / ZRQINIT re-sends
+#                                    during the handshake (default 5 s).
+zmodem_negotiation_timeout = {}
+zmodem_frame_timeout = {}
+zmodem_max_retries = {}
+zmodem_negotiation_retry_interval = {}
 
 # Serial modem emulation (Hayes AT commands)
 # Set serial_enabled = true and configure the port to activate.
@@ -621,6 +709,11 @@ ssh_gateway_auth = {}
         cfg.xmodem_negotiation_timeout,
         cfg.xmodem_block_timeout,
         cfg.xmodem_max_retries,
+        cfg.xmodem_negotiation_retry_interval,
+        cfg.zmodem_negotiation_timeout,
+        cfg.zmodem_frame_timeout,
+        cfg.zmodem_max_retries,
+        cfg.zmodem_negotiation_retry_interval,
         cfg.serial_enabled,
         sanitize_value(&cfg.serial_port),
         cfg.serial_baud,
@@ -742,6 +835,31 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
         "xmodem_max_retries" => {
             if let Ok(v) = value.parse::<usize>() && v >= 1 {
                 cfg.xmodem_max_retries = v;
+            }
+        }
+        "xmodem_negotiation_retry_interval" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.xmodem_negotiation_retry_interval = v;
+            }
+        }
+        "zmodem_negotiation_timeout" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.zmodem_negotiation_timeout = v;
+            }
+        }
+        "zmodem_frame_timeout" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.zmodem_frame_timeout = v;
+            }
+        }
+        "zmodem_max_retries" => {
+            if let Ok(v) = value.parse::<u32>() && v >= 1 {
+                cfg.zmodem_max_retries = v;
+            }
+        }
+        "zmodem_negotiation_retry_interval" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.zmodem_negotiation_retry_interval = v;
             }
         }
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
@@ -962,6 +1080,11 @@ mod tests {
         assert_eq!(cfg.xmodem_negotiation_timeout, 45);
         assert_eq!(cfg.xmodem_block_timeout, 20);
         assert_eq!(cfg.xmodem_max_retries, 10);
+        assert_eq!(cfg.xmodem_negotiation_retry_interval, 7);
+        assert_eq!(cfg.zmodem_negotiation_timeout, 45);
+        assert_eq!(cfg.zmodem_frame_timeout, 30);
+        assert_eq!(cfg.zmodem_max_retries, 10);
+        assert_eq!(cfg.zmodem_negotiation_retry_interval, 5);
         assert!(!cfg.serial_enabled);
         assert_eq!(cfg.serial_port, "");
         assert_eq!(cfg.serial_baud, 9600);
@@ -1132,6 +1255,11 @@ mod tests {
             xmodem_negotiation_timeout: 120,
             xmodem_block_timeout: 30,
             xmodem_max_retries: 15,
+            xmodem_negotiation_retry_interval: 9,
+            zmodem_negotiation_timeout: 90,
+            zmodem_frame_timeout: 45,
+            zmodem_max_retries: 7,
+            zmodem_negotiation_retry_interval: 8,
             serial_enabled: true,
             serial_port: "/dev/ttyUSB0".into(),
             serial_baud: 115200,
@@ -1183,6 +1311,17 @@ mod tests {
         assert_eq!(loaded.xmodem_negotiation_timeout, original.xmodem_negotiation_timeout);
         assert_eq!(loaded.xmodem_block_timeout, original.xmodem_block_timeout);
         assert_eq!(loaded.xmodem_max_retries, original.xmodem_max_retries);
+        assert_eq!(
+            loaded.xmodem_negotiation_retry_interval,
+            original.xmodem_negotiation_retry_interval
+        );
+        assert_eq!(loaded.zmodem_negotiation_timeout, original.zmodem_negotiation_timeout);
+        assert_eq!(loaded.zmodem_frame_timeout, original.zmodem_frame_timeout);
+        assert_eq!(loaded.zmodem_max_retries, original.zmodem_max_retries);
+        assert_eq!(
+            loaded.zmodem_negotiation_retry_interval,
+            original.zmodem_negotiation_retry_interval
+        );
         assert_eq!(loaded.serial_enabled, original.serial_enabled);
         assert_eq!(loaded.serial_port, original.serial_port);
         assert_eq!(loaded.serial_baud, original.serial_baud);
@@ -1390,9 +1529,108 @@ mod tests {
         apply_config_key(&mut cfg, "xmodem_max_retries", "15");
         assert_eq!(cfg.xmodem_max_retries, 15);
 
+        apply_config_key(&mut cfg, "xmodem_negotiation_retry_interval", "9");
+        assert_eq!(cfg.xmodem_negotiation_retry_interval, 9);
+        // Zero rejected (min 1)
+        apply_config_key(&mut cfg, "xmodem_negotiation_retry_interval", "0");
+        assert_eq!(cfg.xmodem_negotiation_retry_interval, 9);
+
         // Invalid values should be ignored
         apply_config_key(&mut cfg, "xmodem_negotiation_timeout", "notanumber");
         assert_eq!(cfg.xmodem_negotiation_timeout, 60);
+
+        apply_config_key(&mut cfg, "zmodem_negotiation_timeout", "90");
+        assert_eq!(cfg.zmodem_negotiation_timeout, 90);
+
+        apply_config_key(&mut cfg, "zmodem_frame_timeout", "45");
+        assert_eq!(cfg.zmodem_frame_timeout, 45);
+
+        apply_config_key(&mut cfg, "zmodem_max_retries", "7");
+        assert_eq!(cfg.zmodem_max_retries, 7);
+
+        apply_config_key(&mut cfg, "zmodem_negotiation_retry_interval", "8");
+        assert_eq!(cfg.zmodem_negotiation_retry_interval, 8);
+        apply_config_key(&mut cfg, "zmodem_negotiation_retry_interval", "0");
+        assert_eq!(cfg.zmodem_negotiation_retry_interval, 8);
+
+        // Invalid zmodem values ignored; zero also rejected (min >=1)
+        apply_config_key(&mut cfg, "zmodem_frame_timeout", "0");
+        assert_eq!(cfg.zmodem_frame_timeout, 45);
+        apply_config_key(&mut cfg, "zmodem_max_retries", "abc");
+        assert_eq!(cfg.zmodem_max_retries, 7);
+        apply_config_key(&mut cfg, "zmodem_negotiation_timeout", "0");
+        assert_eq!(cfg.zmodem_negotiation_timeout, 90);
+        apply_config_key(&mut cfg, "zmodem_negotiation_timeout", "-5");
+        assert_eq!(cfg.zmodem_negotiation_timeout, 90);
+    }
+
+    /// The zmodem_* defaults must match the values that were hardcoded
+    /// as `FRAME_TIMEOUT_SECS` / `Z*_MAX_RETRIES` constants in zmodem.rs
+    /// before those became runtime-configurable.  If someone ever tweaks
+    /// these defaults they should do so deliberately — the assertion
+    /// below forces that decision to be explicit rather than accidental.
+    #[test]
+    fn test_zmodem_defaults_match_previously_hardcoded_values() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.zmodem_negotiation_timeout, 45,
+            "default must match xmodem_negotiation_timeout which was the prior source"
+        );
+        assert_eq!(
+            cfg.zmodem_frame_timeout, 30,
+            "default must match the previously-hardcoded FRAME_TIMEOUT_SECS"
+        );
+        assert_eq!(
+            cfg.zmodem_max_retries, 10,
+            "default must match the previously-hardcoded Z*_MAX_RETRIES"
+        );
+    }
+
+    /// Reading a config file that includes zmodem keys must round-trip
+    /// those keys into the Config struct.  Separate from the full
+    /// write/reread test so a failure here localizes to zmodem parsing.
+    #[test]
+    fn test_read_config_parses_zmodem_keys() {
+        let dir = std::env::temp_dir().join("xmodem_test_zmodem_keys");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("z.conf");
+        let mut f = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        writeln!(f, "zmodem_negotiation_timeout = 77").unwrap();
+        writeln!(f, "zmodem_frame_timeout = 22").unwrap();
+        writeln!(f, "zmodem_max_retries = 4").unwrap();
+        drop(f);
+
+        let cfg = read_config_file(path.to_str().unwrap());
+        assert_eq!(cfg.zmodem_negotiation_timeout, 77);
+        assert_eq!(cfg.zmodem_frame_timeout, 22);
+        assert_eq!(cfg.zmodem_max_retries, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When zmodem keys are absent from the file, defaults kick in.
+    /// Covers the rollout case where an existing xmodem.conf predates
+    /// the zmodem_* additions.
+    #[test]
+    fn test_read_config_missing_zmodem_keys_fall_back_to_defaults() {
+        let dir = std::env::temp_dir().join("xmodem_test_zmodem_missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("legacy.conf");
+        let mut f = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        // Pre-zmodem config: only the xmodem-family keys.
+        writeln!(f, "xmodem_negotiation_timeout = 99").unwrap();
+        drop(f);
+
+        let cfg = read_config_file(path.to_str().unwrap());
+        let defaults = Config::default();
+        assert_eq!(cfg.xmodem_negotiation_timeout, 99);
+        assert_eq!(cfg.zmodem_negotiation_timeout, defaults.zmodem_negotiation_timeout);
+        assert_eq!(cfg.zmodem_frame_timeout, defaults.zmodem_frame_timeout);
+        assert_eq!(cfg.zmodem_max_retries, defaults.zmodem_max_retries);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

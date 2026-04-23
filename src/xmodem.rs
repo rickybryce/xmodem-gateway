@@ -73,6 +73,7 @@ pub(crate) async fn xmodem_receive(
     let negotiation_timeout = cfg.xmodem_negotiation_timeout;
     let block_timeout = cfg.xmodem_block_timeout;
     let max_retries = cfg.xmodem_max_retries;
+    let negotiation_retry_interval = cfg.xmodem_negotiation_retry_interval;
 
     let mut file_data = Vec::new();
     let mut expected_block: u8 = 1;
@@ -98,7 +99,8 @@ pub(crate) async fn xmodem_receive(
     let mut attempt: u32 = 0;
 
     // Send CRC requests for 2/3 of the negotiation time, then fall back to checksum.
-    let crc_attempts = (negotiation_timeout * 2 / 3 / 3).max(3) as u32;
+    let crc_attempts =
+        (negotiation_timeout * 2 / 3 / negotiation_retry_interval).max(3) as u32;
     let max_negotiation_attempts = crc_attempts + max_retries as u32;
     loop {
         if tokio::time::Instant::now() >= negotiation_deadline {
@@ -117,7 +119,7 @@ pub(crate) async fn xmodem_receive(
         raw_write_byte(writer, request, is_tcp).await?;
 
         match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(negotiation_retry_interval),
             nvt_read_byte(reader, is_tcp, state),
         )
         .await

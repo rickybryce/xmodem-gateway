@@ -15,6 +15,7 @@ mod ssh;
 mod telnet;
 mod webbrowser;
 mod xmodem;
+mod zmodem;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
