@@ -1,0 +1,8 @@
+# ZMODEM wire-capture fixtures and their payload inputs are binary —
+# they contain raw protocol bytes with specific line endings that must
+# survive a Windows checkout unchanged.  Without this, git's autocrlf
+# normalizes LF → CRLF inside the payload files, and the Windows CI job
+# fails the `test_lrzsz_replay_*` and `test_upload_save_integration_*`
+# tests with a CRLF-in-left / LF-in-right assertion mismatch.
+tests/fixtures/*.bin       binary
+tests/fixtures/*.payload   binary
