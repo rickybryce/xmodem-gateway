@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.3.5] - 2026-04-23
+
+### Added
+
+#### ZMODEM protocol support
+- **Full ZMODEM send and receive** implemented per the Forsberg 1988
+  specification in `src/zmodem.rs` — ZDLE escape layer, hex / binary16 /
+  binary32 headers, CRC-16 and CRC-32, batch transfer per §4, receiver
+  `ZSKIP` to decline individual files per §7, and `rz\r` auto-start
+  trigger so Qodem, ZOC, and other auto-detecting terminals begin the
+  transfer without a separate `rz` command.
+- **File transfer menu entry** for ZMODEM alongside XMODEM / XMODEM-1K /
+  YMODEM. Stop-and-wait flow control (ZCRCQ mid-frame + ZCRCE
+  end-of-frame); our `ZRINIT` advertises `CANFDX|CANOVIO|CANFC32` without
+  requiring streaming.
+- **Additional file-transfer configuration options** surfaced in the
+  Gateway Configuration menu.
+
+### Fixed
+
+- **Windows CI**: ZMODEM fixture binaries are now marked as binary in
+  `.gitattributes` so the CRLF auto-conversion on Windows runners does
+  not corrupt them. Fixes the sporadic Windows CI failure on
+  `test_lrzsz_rz_zskip_interop` and the captured-wire replay tests.
+- **CI runner configuration**: resolved transient runner errors that
+  were preventing reliable green builds.
+- **GUI**: copy/paste now works as expected in the configuration editor
+  text fields.
+
+### Documentation
+
+- README updated with NULL-modem adapter guidance and a clarified telnet
+  command example.
+- User manual extended with ZMODEM coverage alongside the existing
+  XMODEM / YMODEM sections.
+
+### Tests
+
+- **+46 tests** added for the ZMODEM implementation (CRC vectors, ZDLE
+  round-trips, header round-trips, subpacket round-trips, ZFILE parser,
+  full send↔receive round-trips, batch / skip handling, ZABORT, non-zero
+  `ZRPOS` resume, proptest fuzzers on adversarial bytes) plus two
+  `#[ignore]` lrzsz subprocess interop tests. Total: **617** unit +
+  proptest tests, all green.
+
 ## [0.3.4] - 2026-04-18
 
 ### Fixed
