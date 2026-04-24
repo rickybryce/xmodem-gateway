@@ -1264,7 +1264,7 @@ pub(crate) async fn zmodem_send(
             }
 
             match tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
+                tokio::time::Duration::from_secs(frame_timeout),
                 read_header(reader, is_tcp, &mut state, verbose),
             )
             .await
@@ -1453,13 +1453,13 @@ pub(crate) async fn zmodem_send(
 
     // ─── Phase 5: ZFIN handshake (once, after all files) ────
     //
-    // Wait for the receiver's ZFIN under a single 10 s wall-clock
-    // deadline.  We loop so that any leftover non-ZFIN frames in the
-    // read buffer (e.g. trailing ZRINITs from post-ZEOF in the batch)
-    // don't cause us to give up prematurely.
+    // Wait for the receiver's ZFIN under a single wall-clock deadline
+    // of `frame_timeout`.  We loop so that any leftover non-ZFIN frames
+    // in the read buffer (e.g. trailing ZRINITs from post-ZEOF in the
+    // batch) don't cause us to give up prematurely.
     send_zfin(writer, is_tcp, verbose).await?;
-    let zfin_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let zfin_deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(frame_timeout);
     loop {
         let remaining =
             zfin_deadline.saturating_duration_since(tokio::time::Instant::now());

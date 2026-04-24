@@ -740,27 +740,31 @@ ssh_gateway_auth = {}
         sanitize_value(&cfg.ssh_gateway_auth),
     );
 
-    // Write to a per-PID temporary file and rename into place.  The PID
-    // suffix avoids clobbering another instance's tmp file in the same
-    // working directory and closes a small TOCTOU window against
-    // symlink tricks on a shared path.
+    // Write to a per-PID temporary file, chmod it to owner-only, then
+    // rename into place.  The PID suffix avoids clobbering another
+    // instance's tmp file in the same working directory and closes a
+    // small TOCTOU window against symlink tricks on a shared path.
+    // Setting the mode *before* the rename means the file is never
+    // visible at its final path with default-umask permissions — the
+    // config holds plaintext credentials (telnet password, SSH
+    // password, Groq API key).  Windows users on multi-user systems
+    // should place the binary in a per-user folder to get equivalent
+    // NTFS ACL protection.
     let tmp = format!("{}.{}.tmp", path, std::process::id());
-    if let Err(e) = std::fs::write(&tmp, &content).and_then(|()| std::fs::rename(&tmp, path)) {
-        glog!("Warning: could not write {}: {}", path, e);
-        let _ = std::fs::remove_file(&tmp);
-    } else {
-        // Restrict to owner-only on Unix — the config holds plaintext
-        // credentials (telnet password, SSH password, Groq API key).
-        // Windows users on multi-user systems should place the binary
-        // in a per-user folder to get equivalent NTFS ACL protection.
+    let write_result = std::fs::write(&tmp, &content).and_then(|()| {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                path,
+            std::fs::set_permissions(
+                &tmp,
                 std::fs::Permissions::from_mode(0o600),
-            );
+            )?;
         }
+        std::fs::rename(&tmp, path)
+    });
+    if let Err(e) = write_result {
+        glog!("Warning: could not write {}: {}", path, e);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
