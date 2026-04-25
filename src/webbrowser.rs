@@ -1546,4 +1546,273 @@ mod tests {
         const _: () = assert!(GOPHER_TIMEOUT_SECS > 0);
         const _: () = assert!(GOPHER_MAX_BODY > 0);
     }
+
+    // ─── End-to-end tests against an in-process server ────────
+    //
+    // These tests bind a `std::net::TcpListener` to 127.0.0.1:0, get
+    // the OS-assigned port, and run a one-shot handler in a background
+    // thread that serves a hand-rolled response.  Hermetic — no
+    // external network, no flakes from public servers — so they run
+    // in the standard `cargo test` suite (no `#[ignore]`).
+
+    /// Spawn a one-shot TCP test server on 127.0.0.1:0.  The handler
+    /// runs on a background thread, accepts one connection, runs to
+    /// completion, then exits.  Returns the allocated port.
+    fn spawn_oneshot_server<F>(handler: F) -> u16
+    where
+        F: FnOnce(std::net::TcpStream) + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                handler(stream);
+            }
+        });
+        port
+    }
+
+    /// Read an HTTP request from a server-side stream until the client
+    /// stops sending.  Uses a short read timeout so we don't depend on
+    /// ureq closing the connection (it doesn't until it has read our
+    /// response).  Localhost messages are small enough that 200 ms is
+    /// plenty.
+    fn read_request_blob(stream: &std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut s = stream;
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Stop once we've seen end-of-headers and any
+                    // declared Content-Length body bytes.
+                    if let Some(headers_end) = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    {
+                        let headers = &buf[..headers_end];
+                        let cl = std::str::from_utf8(headers)
+                            .ok()
+                            .and_then(|h| {
+                                h.lines().find_map(|l| {
+                                    let lower = l.to_ascii_lowercase();
+                                    lower
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().to_string())
+                                })
+                            })
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= headers_end + 4 + cl {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    /// Build an HTTP/1.1 200 response with `Connection: close` so the
+    /// client knows when the body ends.  Used by every HTTP e2e test.
+    fn http_200(content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            content_type,
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn test_e2e_gopher_text_file() {
+        let port = spawn_oneshot_server(|mut stream| {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 256];
+            let _ = stream.read(&mut buf); // selector + CRLF
+            let body = "Line one of the text file.\r\n\
+                        Line two has more content.\r\n\
+                        The third line ends here.\r\n";
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        let url = format!("gopher://127.0.0.1:{}/0/about.txt", port);
+        let page = fetch_gopher(&url, 73).unwrap();
+        assert_eq!(page.title.as_deref(), Some("about.txt"));
+        assert!(page.lines.iter().any(|l| l.contains("Line one")));
+        assert!(page.lines.iter().any(|l| l.contains("third line")));
+        assert!(page.links.is_empty());
+        assert_eq!(page.url, url);
+    }
+
+    #[test]
+    fn test_e2e_gopher_directory() {
+        // Hand-rolled gopher menu: itype + display + \t + selector +
+        // \t + host + \t + port + CRLF.  Mix of informational ('i'),
+        // text file ('0'), directory ('1'), and search ('7') items.
+        let port = spawn_oneshot_server(|mut stream| {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 256];
+            let _ = stream.read(&mut buf);
+            let port = stream.local_addr().unwrap().port();
+            let body = format!(
+                "iWelcome to the test server.\t\terror.host\t1\r\n\
+                 0Read the README\t/0/readme.txt\t127.0.0.1\t{port}\r\n\
+                 1Subdirectory\t/1/sub\t127.0.0.1\t{port}\r\n\
+                 7Search the index\t/7/search\t127.0.0.1\t{port}\r\n\
+                 .\r\n"
+            );
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        let url = format!("gopher://127.0.0.1:{}/", port);
+        let page = fetch_gopher(&url, 73).unwrap();
+        assert_eq!(page.links.len(), 3, "expected 3 actionable links");
+        assert!(page.links[0].contains("/0/readme.txt"));
+        assert!(page.links[1].contains("/1/sub"));
+        assert!(
+            page.links[2].ends_with("?search"),
+            "type-7 search link should end with ?search marker, got {}",
+            page.links[2]
+        );
+        assert!(page.lines.iter().any(|l| l.contains("Welcome")));
+    }
+
+    #[test]
+    fn test_e2e_http_basic_page() {
+        let port = spawn_oneshot_server(|mut stream| {
+            use std::io::Write;
+            let _ = read_request_blob(&stream);
+            let body = "<!DOCTYPE html><html><head><title>Test Page</title></head>\
+                        <body>\
+                        <p>This is a paragraph.</p>\
+                        <p>Visit <a href=\"http://example.org/\">example.org</a> for info.</p>\
+                        </body></html>";
+            stream
+                .write_all(http_200("text/html; charset=utf-8", body).as_bytes())
+                .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{}/", port);
+        let page = fetch_and_render(&url, 73).unwrap();
+        assert_eq!(page.title.as_deref(), Some("Test Page"));
+        assert!(page.lines.iter().any(|l| l.contains("paragraph")));
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0], "http://example.org/");
+    }
+
+    #[test]
+    fn test_e2e_http_plain_text() {
+        let port = spawn_oneshot_server(|mut stream| {
+            use std::io::Write;
+            let _ = read_request_blob(&stream);
+            let body = "Plain text line 1.\n\
+                        Plain text line 2.\n\
+                        Plain text line 3.\n";
+            stream
+                .write_all(http_200("text/plain; charset=utf-8", body).as_bytes())
+                .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{}/", port);
+        let page = fetch_and_render(&url, 73).unwrap();
+        // text/plain bypasses HTML parsing — no <title>, no link
+        // extraction, no form discovery.
+        assert!(page.title.is_none());
+        assert!(page.lines.iter().any(|l| l.contains("Plain text line 1")));
+        assert!(page.lines.iter().any(|l| l.contains("Plain text line 3")));
+        assert!(page.links.is_empty());
+        assert!(page.forms.is_empty());
+    }
+
+    #[test]
+    fn test_e2e_http_form_submit_post() {
+        // Two-connection flow: GET returns a form page; POST returns a
+        // confirmation page and we capture the request body to verify
+        // the form-encoded payload.
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let captured_handler = Arc::clone(&captured);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // First conn: serve the form page.
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_blob(&stream);
+            let body = "<html><head><title>Form Page</title></head><body>\
+                        <form method=\"post\" action=\"/submit\">\
+                        <label for=\"q\">Query:</label>\
+                        <input type=\"text\" name=\"q\" id=\"q\" value=\"initial\">\
+                        <input type=\"submit\" value=\"Go\">\
+                        </form></body></html>";
+            stream
+                .write_all(http_200("text/html", body).as_bytes())
+                .unwrap();
+            drop(stream);
+
+            // Second conn: capture POST body, return confirmation.
+            let (mut stream, _) = listener.accept().unwrap();
+            let req = read_request_blob(&stream);
+            captured_handler.lock().unwrap().extend_from_slice(&req);
+            let body =
+                "<html><head><title>Submitted</title></head><body>OK</body></html>";
+            stream
+                .write_all(http_200("text/html", body).as_bytes())
+                .unwrap();
+        });
+
+        let base = format!("http://127.0.0.1:{}/", port);
+
+        // Round 1: fetch form, mutate the text field, submit.
+        let page = fetch_and_render(&base, 73).unwrap();
+        assert_eq!(page.forms.len(), 1, "expected 1 form on the page");
+        let mut form = page.forms[0].clone();
+        assert_eq!(form.method, "post");
+        for f in form.fields.iter_mut() {
+            if let FormField::Text { name, value, .. } = f {
+                if name == "q" {
+                    *value = "hello world".to_string();
+                }
+            }
+        }
+        let confirm = submit_form(&base, &form, 73).unwrap();
+        assert_eq!(confirm.title.as_deref(), Some("Submitted"));
+
+        // Round 2: verify what the server received.  url-form-encoded
+        // pairs use '+' for space; a standards-friendly URL-encoder
+        // could also emit %20 — accept either.
+        let req = captured.lock().unwrap();
+        let s = std::str::from_utf8(&req).unwrap();
+        assert!(
+            s.starts_with("POST /submit "),
+            "expected POST /submit, got: {}",
+            s.lines().next().unwrap_or("(empty)")
+        );
+        assert!(
+            s.to_ascii_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded"),
+            "expected form-urlencoded Content-Type"
+        );
+        let body_start = s
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .expect("request had no body");
+        let body = &s[body_start..];
+        assert!(
+            body.contains("q=hello+world") || body.contains("q=hello%20world"),
+            "expected q=hello world (URL-encoded), got body: {:?}",
+            body
+        );
+    }
 }
