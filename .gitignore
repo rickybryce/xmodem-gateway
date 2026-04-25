@@ -1,5 +1,5 @@
 /target
-xmodem.conf
+vgateway.conf
 *.swp
 *.swo
 *~

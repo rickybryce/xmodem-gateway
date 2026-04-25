@@ -16,7 +16,7 @@ use crate::logger;
 
 // ── Retro amber-on-dark color palette (telnetbible.com inspired) ──
 
-const BG_DARKEST: Color32 = Color32::from_rgb(0x05, 0x0e, 0x1a); // matches logo background
+const BG_DARKEST: Color32 = Color32::from_rgb(0x00, 0x05, 0x10); // matches logo background
 const BG_DARK: Color32 = Color32::from_rgb(0x10, 0x1c, 0x3a);   // panel/frame bg
 const BG_MID: Color32 = Color32::from_rgb(0x18, 0x28, 0x48);    // input fields
 const BG_LIGHT: Color32 = Color32::from_rgb(0x22, 0x36, 0x5a);  // hover
@@ -42,14 +42,14 @@ pub fn run(cfg: Config, shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title(format!("XMODEM Gateway v{}", env!("CARGO_PKG_VERSION")))
+                .with_title(format!("Vintage Gateway v{}", env!("CARGO_PKG_VERSION")))
                 .with_inner_size([1120.0, 810.0])
                 .with_min_inner_size([640.0, 480.0]),
             ..Default::default()
         };
 
         eframe::run_native(
-            "XMODEM Gateway",
+            "Vintage Gateway",
             options,
             Box::new(|cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -1092,7 +1092,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.heading(
                         egui::RichText::new(format!(
-                            "XMODEM Gateway v{}",
+                            "Vintage Gateway v{}",
                             env!("CARGO_PKG_VERSION")
                         ))
                         .strong()
@@ -1281,14 +1281,14 @@ impl eframe::App for App {
                         .clicked()
                     {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
-                            "https://github.com/rickybryce/xmodem-gateway/blob/master/usermanual.pdf",
+                            "https://github.com/rickybryce/vintage-gateway/blob/master/usermanual.pdf",
                         ));
                     }
                 });
                 ui.add_space(20.0);
                 // ── Scripture (left) + Logo (right) ──────────
                 let logo_h = 432.0 * 0.4235;
-                let logo_w = logo_h * 1.6;
+                let logo_w = logo_h * 2.0;
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(half, logo_h),
@@ -1321,7 +1321,13 @@ impl eframe::App for App {
                         |ui| {
                             ui.add_space(-32.0);
                             ui.add(
-                                egui::Image::new(egui::include_image!("../xmodemlogo.png"))
+                                egui::Image::new(egui::include_image!("../vintagelogo.png"))
+                                    .texture_options(egui::TextureOptions {
+                                        magnification: egui::TextureFilter::Linear,
+                                        minification: egui::TextureFilter::Linear,
+                                        mipmap_mode: Some(egui::TextureFilter::Linear),
+                                        ..Default::default()
+                                    })
                                     .fit_to_exact_size(egui::vec2(logo_w, logo_h)),
                             );
                         },
@@ -1755,7 +1761,7 @@ mod tests {
     #[test]
     fn test_logo_dimensions_are_reasonable() {
         let logo_h = 432.0_f32 * 0.4235;
-        let logo_w = logo_h * 1.6;
+        let logo_w = logo_h * 2.0;
         // Logo should fit within a reasonable GUI panel
         assert!(logo_h > 50.0 && logo_h < 400.0);
         assert!(logo_w > 80.0 && logo_w < 600.0);

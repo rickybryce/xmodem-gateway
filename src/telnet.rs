@@ -165,9 +165,9 @@ enum Menu {
 impl Menu {
     fn path(&self) -> &'static str {
         match self {
-            Menu::Main => "xmodem",
-            Menu::FileTransfer => "xmodem/xfer",
-            Menu::Browser => "xmodem/web",
+            Menu::Main => "vintage",
+            Menu::FileTransfer => "vintage/xfer",
+            Menu::Browser => "vintage/web",
         }
     }
 }
@@ -2726,7 +2726,7 @@ impl TelnetSession {
         let sep = self.separator();
         self.clear_screen().await?;
         self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("XMODEM GATEWAY")))
+        self.send_line(&format!("  {}", self.yellow("VINTAGE GATEWAY")))
             .await?;
         self.send_line(&sep).await?;
         self.send_line("").await?;
@@ -2861,7 +2861,7 @@ impl TelnetSession {
         self.clear_screen().await?;
         let sep = self.separator();
         self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("XMODEM GATEWAY")))
+        self.send_line(&format!("  {}", self.yellow("VINTAGE GATEWAY")))
             .await?;
         self.send_line(&sep).await?;
         self.send_line("").await?;
@@ -2946,7 +2946,7 @@ impl TelnetSession {
         self.clear_screen().await?;
         let sep = self.separator();
         self.send_line(&sep).await?;
-        self.send_line(&format!("  {}", self.yellow("XMODEM GATEWAY")))
+        self.send_line(&format!("  {}", self.yellow("VINTAGE GATEWAY")))
             .await?;
         self.send_line(&sep).await?;
         self.send_line("").await?;
@@ -5705,7 +5705,7 @@ impl TelnetSession {
                         "     with gsk_...).",
                         "  3. Set it in Configuration >",
                         "     Other Settings > A, or paste",
-                        "     into xmodem.conf as",
+                        "     into vgateway.conf as",
                         "     groq_api_key = gsk_...",
                         "  4. Restart the server.",
                         "",
@@ -6074,7 +6074,7 @@ impl TelnetSession {
             self.send_line(&format!(
                 "     {} = {}",
                 self.cyan("1001000"),
-                self.amber("xmodem-gateway")
+                self.amber("vintage-gateway")
             ))
             .await?;
 
@@ -6125,7 +6125,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/dialup"));
+            let prompt = format!("{}> ", self.cyan("vintage/dialup"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -6376,7 +6376,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/modem"));
+            let prompt = format!("{}> ", self.cyan("vintage/modem"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -7082,7 +7082,7 @@ impl TelnetSession {
                 "  and use AT commands.",
                 "",
                 "  Dialing:",
-                "  ATDT xmodem-gateway",
+                "  ATDT vintage-gateway",
                 "    Connect to this gateway",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
@@ -7135,7 +7135,7 @@ impl TelnetSession {
                 "  it with standard AT commands.",
                 "",
                 "  Dialing:",
-                "  ATDT xmodem-gateway",
+                "  ATDT vintage-gateway",
                 "    Connect to this gateway's menus",
                 "  ATDT host:port",
                 "    Dial a remote telnet host",
@@ -7172,7 +7172,7 @@ impl TelnetSession {
                 "  AT&Dn      DTR handling 0-3",
                 "  AT&Kn      Flow control 0-4",
                 "  ATSn=v     Set S-register n to v",
-                "  AT&W       Save settings to xmodem.conf",
+                "  AT&W       Save settings to vgateway.conf",
                 "  ATZ        Reload saved settings",
                 "  AT&F       Reset to gateway defaults",
                 "",
@@ -7187,7 +7187,7 @@ impl TelnetSession {
                 "  &K0        No modem-level flow control",
                 "             (Hayes: &K3 RTS/CTS).  Port-level",
                 "             flow is still honored via",
-                "             serial_flowcontrol in xmodem.conf.",
+                "             serial_flowcontrol in vgateway.conf.",
                 "",
                 "  Override any of these with the matching AT",
                 "  command and AT&W to persist.",
@@ -7256,7 +7256,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config"));
+            let prompt = format!("{}> ", self.cyan("vintage/config"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -7462,7 +7462,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/other"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/other"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -7698,7 +7698,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/security"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/security"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -7810,7 +7810,7 @@ impl TelnetSession {
                 "  usernames/passwords; changing",
                 "  one doesn't affect the other.",
                 "  Both are stored in plaintext",
-                "  in xmodem.conf - don't reuse",
+                "  in vgateway.conf - don't reuse",
                 "  sensitive passwords here.",
                 "",
                 "  When security is OFF:",
@@ -7850,7 +7850,7 @@ impl TelnetSession {
                 "  Telnet and SSH have separate usernames",
                 "  and passwords; changing one doesn't",
                 "  affect the other. Both are stored in",
-                "  plaintext in xmodem.conf - don't reuse",
+                "  plaintext in vgateway.conf - don't reuse",
                 "  sensitive passwords on this server.",
                 "",
                 "  When security is OFF (default):",
@@ -7982,7 +7982,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/server"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/server"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -8036,7 +8036,7 @@ impl TelnetSession {
     //
     // Submenu of Server Configuration.  Edits the two persistent
     // outbound-gateway modes so the user doesn't have to touch the GUI
-    // or `xmodem.conf` for these settings.  Changes take effect on the
+    // or `vgateway.conf` for these settings.  Changes take effect on the
     // next gateway connection — no server restart needed.
     async fn gateway_configuration(&mut self) -> Result<(), std::io::Error> {
         loop {
@@ -8084,7 +8084,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/server/gateway"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/server/gateway"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -8167,7 +8167,7 @@ impl TelnetSession {
                 "               each connect.",
                 "",
                 "  Both settings are saved to",
-                "  xmodem.conf and take effect on",
+                "  vgateway.conf and take effect on",
                 "  the next gateway connection.",
                 "  No server restart is required.",
             ]
@@ -8457,7 +8457,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/xfer"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/xfer"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -8539,7 +8539,7 @@ impl TelnetSession {
     async fn xmodem_settings(&mut self) -> Result<(), std::io::Error> {
         self.xmodem_family_settings(
             "XMODEM SETTINGS",
-            "xmodem/config/xfer/xmodem",
+            "vintage/config/xfer/xmodem",
             "XMODEM family",
         )
         .await
@@ -8548,7 +8548,7 @@ impl TelnetSession {
     async fn ymodem_settings(&mut self) -> Result<(), std::io::Error> {
         self.xmodem_family_settings(
             "YMODEM SETTINGS",
-            "xmodem/config/xfer/ymodem",
+            "vintage/config/xfer/ymodem",
             "XMODEM family (shared)",
         )
         .await
@@ -8769,7 +8769,7 @@ impl TelnetSession {
             ))
             .await?;
 
-            let prompt = format!("{}> ", self.cyan("xmodem/config/xfer/zmodem"));
+            let prompt = format!("{}> ", self.cyan("vintage/config/xfer/zmodem"));
             self.send(&prompt).await?;
             self.flush().await?;
 
@@ -10429,8 +10429,8 @@ mod tests {
 
     #[test]
     fn test_menu_paths() {
-        assert_eq!(Menu::Main.path(), "xmodem");
-        assert_eq!(Menu::FileTransfer.path(), "xmodem/xfer");
+        assert_eq!(Menu::Main.path(), "vintage");
+        assert_eq!(Menu::FileTransfer.path(), "vintage/xfer");
     }
 
     // ─── Color helpers ───────────────────────────────────
@@ -11840,10 +11840,10 @@ mod tests {
         // sync with the code; a rename in one place will trigger a
         // test failure if not updated here.
         let breadcrumbs = [
-            "xmodem/config/xfer",
-            "xmodem/config/xfer/xmodem",
-            "xmodem/config/xfer/ymodem",
-            "xmodem/config/xfer/zmodem",
+            "vintage/config/xfer",
+            "vintage/config/xfer/xmodem",
+            "vintage/config/xfer/ymodem",
+            "vintage/config/xfer/zmodem",
         ];
         for b in &breadcrumbs {
             let prompt = format!("{}> ", b);
@@ -12020,7 +12020,7 @@ mod tests {
             "  compatible modem on the serial",
             "  port. Connect your retro",
             "  hardware and use AT commands:",
-            "  ATDT xmodem-gateway",
+            "  ATDT vintage-gateway",
             "    Connect to this gateway",
             "  ATDT host:port",
             "    Dial a remote telnet host",
@@ -12218,7 +12218,7 @@ mod tests {
 
     #[test]
     fn test_browser_menu_path() {
-        assert_eq!(Menu::Browser.path(), "xmodem/web");
+        assert_eq!(Menu::Browser.path(), "vintage/web");
     }
 
     #[test]

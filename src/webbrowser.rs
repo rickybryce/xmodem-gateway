@@ -124,7 +124,7 @@ pub(crate) fn fetch_and_render(url: &str, width: usize) -> Result<WebPage, Strin
     // Try the request; if HTTPS fails with a TLS error, retry with HTTP
     let response = match agent
         .get(url)
-        .header("User-Agent", "XmodemGateway/1.0 (text-mode browser)")
+        .header("User-Agent", "VintageGateway/1.0 (text-mode browser)")
         .header("Accept", "text/html, text/plain;q=0.9, */*;q=0.1")
         .call()
     {
@@ -133,7 +133,7 @@ pub(crate) fn fetch_and_render(url: &str, width: usize) -> Result<WebPage, Strin
             let http_url = format!("http://{}", &url["https://".len()..]);
             agent
                 .get(&http_url)
-                .header("User-Agent", "XmodemGateway/1.0 (text-mode browser)")
+                .header("User-Agent", "VintageGateway/1.0 (text-mode browser)")
                 .header("Accept", "text/html, text/plain;q=0.9, */*;q=0.1")
                 .call()
                 .map_err(|e2| format!("{}", e2))?
@@ -226,7 +226,7 @@ pub(crate) fn submit_form(base_url: &str, form: &WebForm, width: usize) -> Resul
     if form.method == "post" {
         let response = match agent
             .post(&action_url)
-            .header("User-Agent", "XmodemGateway/1.0 (text-mode browser)")
+            .header("User-Agent", "VintageGateway/1.0 (text-mode browser)")
             .send_form(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         {
             Ok(r) => r,
@@ -234,7 +234,7 @@ pub(crate) fn submit_form(base_url: &str, form: &WebForm, width: usize) -> Resul
                 let http_url = format!("http://{}", &action_url["https://".len()..]);
                 agent
                     .post(&http_url)
-                    .header("User-Agent", "XmodemGateway/1.0 (text-mode browser)")
+                    .header("User-Agent", "VintageGateway/1.0 (text-mode browser)")
                     .send_form(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .map_err(|e2| format!("{}", e2))?
             }
