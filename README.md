@@ -1,8 +1,8 @@
 # Vintage Gateway
 
-A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible
-modem emulator for serial-attached retro hardware, text-mode web browser,
-and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI,
+A telnet-based XMODEM/YMODEM/ZMODEM file transfer server, SSH gateway,
+Hayes-compatible modem emulator for serial-attached retro hardware,
+text-mode web browser, and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI,
 and ASCII terminals. Designed for local network use with retro and modern
 terminal clients.
 

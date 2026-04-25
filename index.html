@@ -897,7 +897,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                 <div class="instructions">
                     <h3>Public-Key Authentication</h3>
                     <ol>
-                        <li>On first outbound dial, the gateway auto-generates an Ed25519 client keypair and stores it as <code>xmodem_gateway_ssh_key</code> (0o600 on Unix)</li>
+                        <li>On first outbound dial, the gateway auto-generates an Ed25519 client keypair and stores it as <code>vintage_gateway_ssh_key</code> (0o600 on Unix)</li>
                         <li>From the SSH Gateway menu, press <strong>K</strong> &mdash; the public key is displayed in OpenSSH <code>ssh-ed25519 AAAA&hellip;</code> format</li>
                         <li>Copy that single line into the remote server's <code>~/.ssh/authorized_keys</code></li>
                         <li>Future dials to that host skip the password prompt entirely</li>
@@ -916,8 +916,8 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                 <div class="callout callout-info">
                     <strong>Three SSH key files exist, do not confuse them:</strong>
                     <ul style="margin: 0.5em 0;">
-                        <li><code>xmodem_ssh_host_key</code> &mdash; this gateway's <em>own</em> SSH server host key (used when clients connect <em>to</em> us over SSH)</li>
-                        <li><code>xmodem_gateway_ssh_key</code> &mdash; this gateway's outgoing client keypair (used when we dial <em>out</em> to remote SSH servers)</li>
+                        <li><code>vintage_ssh_host_key</code> &mdash; this gateway's <em>own</em> SSH server host key (used when clients connect <em>to</em> us over SSH)</li>
+                        <li><code>vintage_gateway_ssh_key</code> &mdash; this gateway's outgoing client keypair (used when we dial <em>out</em> to remote SSH servers)</li>
                         <li><code>gateway_hosts</code> &mdash; trusted remote-server fingerprints (analogous to OpenSSH's <code>known_hosts</code>)</li>
                     </ul>
                 </div>
@@ -1265,7 +1265,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                     <tr><th>Detail</th><th>Value</th></tr>
                     <tr><td>Default port</td><td>2222</td></tr>
                     <tr><td>Host key algorithm</td><td>Ed25519</td></tr>
-                    <tr><td>Host key file</td><td><code>xmodem_ssh_host_key</code></td></tr>
+                    <tr><td>Host key file</td><td><code>vintage_ssh_host_key</code></td></tr>
                     <tr><td>Key format</td><td>OpenSSH</td></tr>
                     <tr><td>File permissions</td><td>0600 (Unix)</td></tr>
                     <tr><td>Authentication</td><td>Password only</td></tr>
@@ -1464,8 +1464,8 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                 <div class="instructions">
                     <ul>
                         <li><code>vgateway.conf</code> &mdash; contains telnet/SSH passwords and the Groq API key</li>
-                        <li><code>xmodem_ssh_host_key</code> &mdash; the gateway's SSH server private host key</li>
-                        <li><code>xmodem_gateway_ssh_key</code> &mdash; the gateway's outgoing SSH client key</li>
+                        <li><code>vintage_ssh_host_key</code> &mdash; the gateway's SSH server private host key</li>
+                        <li><code>vintage_gateway_ssh_key</code> &mdash; the gateway's outgoing SSH client key</li>
                         <li><code>gateway_hosts</code> &mdash; remote-server host keys (privacy: reveals dial history)</li>
                         <li><code>dialup.conf</code> &mdash; phone-to-host mapping</li>
                     </ul>
