@@ -863,6 +863,29 @@ where
             ZABORT => {
                 return Err("ZMODEM: sender aborted".into());
             }
+            ZSINIT => {
+                // Per Forsberg §11.3: sender announces its escape
+                // requirements (TESCCTL bit in ZF0) and its Attn
+                // sequence in a small ZDLE-escaped subpacket.  We
+                // must drain the subpacket and respond with ZACK,
+                // otherwise the sender stalls waiting for our reply.
+                // We don't act on the Attn sequence — it's only used
+                // by senders that want the receiver to interrupt them
+                // mid-stream, which isn't part of our use case.
+                let _ = read_subpacket(
+                    reader,
+                    is_tcp,
+                    &mut state,
+                    hdr.crc_kind,
+                    32, // ZATTNLEN cap per spec
+                )
+                .await;
+                send_zack(writer, is_tcp, 1, verbose).await?;
+                if verbose {
+                    glog!("ZMODEM recv: ACKed ZSINIT (escape-mode negotiation)");
+                }
+                continue;
+            }
             other => {
                 if verbose {
                     glog!("ZMODEM recv: ignoring header type 0x{:02X}", other);
@@ -1249,7 +1272,7 @@ pub(crate) async fn zmodem_send(
         let mut zfile_attempts: u32 = 0;
         let start_pos: u32;
         let mut skipped = false;
-        loop {
+        'zfile: loop {
             if zfile_attempts >= max_retries {
                 send_cancel(writer, is_tcp).await.ok();
                 return Err("ZMODEM: no ZRPOS from receiver".into());
@@ -1263,46 +1286,56 @@ pub(crate) async fn zmodem_send(
                 glog!("ZMODEM send: sent ZFILE + subpacket for '{}'", filename);
             }
 
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
-                read_header(reader, is_tcp, &mut state, verbose),
-            )
-            .await
-            {
-                Ok(Ok(h)) if h.frame == ZRPOS => {
-                    start_pos = h.position();
-                    break;
-                }
-                Ok(Ok(h)) if h.frame == ZSKIP => {
-                    // Receiver rejects this file (Forsberg §7) — skip
-                    // to the next one without sending ZDATA/ZEOF.
-                    if verbose {
-                        glog!(
-                            "ZMODEM send: receiver sent ZSKIP for '{}', skipping",
-                            filename
-                        );
+            // Drain stale ZRINITs queued by the receiver (lrzsz emits
+            // multiple at startup before processing our first ZFILE)
+            // without retransmitting — every ZFILE we send produces a
+            // matching ZRPOS/ZSKIP, and a duplicate would leak into the
+            // next file's exchange.  On a true timeout we fall through
+            // to the outer loop, which retransmits ZFILE.
+            loop {
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(frame_timeout),
+                    read_header(reader, is_tcp, &mut state, verbose),
+                )
+                .await
+                {
+                    Ok(Ok(h)) if h.frame == ZRPOS => {
+                        start_pos = h.position();
+                        break 'zfile;
                     }
-                    skipped = true;
-                    start_pos = 0;
-                    break;
-                }
-                Ok(Ok(h)) if h.frame == ZRINIT => {
-                    // Receiver wants us to re-send ZFILE.
-                    continue;
-                }
-                Ok(Ok(h)) if h.frame == ZABORT => {
-                    return Err("ZMODEM: receiver aborted".into());
-                }
-                Ok(Ok(h)) => {
-                    if verbose {
-                        glog!(
-                            "ZMODEM send: unexpected frame 0x{:02X} while awaiting ZRPOS",
-                            h.frame
-                        );
+                    Ok(Ok(h)) if h.frame == ZSKIP => {
+                        // Receiver rejects this file (Forsberg §7) —
+                        // skip to the next without sending ZDATA/ZEOF.
+                        if verbose {
+                            glog!(
+                                "ZMODEM send: receiver sent ZSKIP for '{}', skipping",
+                                filename
+                            );
+                        }
+                        skipped = true;
+                        start_pos = 0;
+                        break 'zfile;
                     }
-                    continue;
+                    Ok(Ok(h)) if h.frame == ZRINIT => {
+                        if verbose {
+                            glog!("ZMODEM send: draining stale ZRINIT after ZFILE");
+                        }
+                        continue;
+                    }
+                    Ok(Ok(h)) if h.frame == ZABORT => {
+                        return Err("ZMODEM: receiver aborted".into());
+                    }
+                    Ok(Ok(h)) => {
+                        if verbose {
+                            glog!(
+                                "ZMODEM send: unexpected frame 0x{:02X} while awaiting ZRPOS",
+                                h.frame
+                            );
+                        }
+                        continue 'zfile;
+                    }
+                    _ => continue 'zfile,
                 }
-                _ => continue,
             }
         }
 
@@ -1453,13 +1486,13 @@ pub(crate) async fn zmodem_send(
 
     // ─── Phase 5: ZFIN handshake (once, after all files) ────
     //
-    // Wait for the receiver's ZFIN under a single 10 s wall-clock
-    // deadline.  We loop so that any leftover non-ZFIN frames in the
-    // read buffer (e.g. trailing ZRINITs from post-ZEOF in the batch)
-    // don't cause us to give up prematurely.
+    // Wait for the receiver's ZFIN under a single wall-clock deadline
+    // of `frame_timeout`.  We loop so that any leftover non-ZFIN frames
+    // in the read buffer (e.g. trailing ZRINITs from post-ZEOF in the
+    // batch) don't cause us to give up prematurely.
     send_zfin(writer, is_tcp, verbose).await?;
-    let zfin_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let zfin_deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(frame_timeout);
     loop {
         let remaining =
             zfin_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2808,6 +2841,624 @@ mod tests {
         assert_eq!(new_after, new_content);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: our sender → real `rz`, batch happy path ─
+    //
+    // Three files with shapes that hit different sender code paths:
+    // a sub-subpacket payload (single ZCRCE end-frame), an exact-1024
+    // payload (single ZCRCE at the boundary), and a multi-subpacket
+    // payload (ZCRCQ mid-frame ACK loop + final ZCRCE).  Validates
+    // that real lrzsz `rz` accepts our sender's frames in the most
+    // common production path — no `-p`, no `-y`, just batch receive.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_rz_basic_batch() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_basic_batch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let small = b"short text payload\n".to_vec();
+        let exact_1k: Vec<u8> =
+            (0..SUBPACKET_DATA_SIZE).map(|i| (i & 0xFF) as u8).collect();
+        let multi_1k: Vec<u8> = (0..SUBPACKET_DATA_SIZE * 3 + 17)
+            .map(|i| ((i.wrapping_mul(31)) & 0xFF) as u8)
+            .collect();
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let batch: [(&str, &[u8]); 3] = [
+            ("small.dat", &small),
+            ("exact_1k.dat", &exact_1k),
+            ("multi_1k.dat", &multi_1k),
+        ];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, true).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed");
+
+        assert_eq!(std::fs::read(tmp.join("small.dat")).unwrap(), small);
+        assert_eq!(std::fs::read(tmp.join("exact_1k.dat")).unwrap(), exact_1k);
+        assert_eq!(std::fs::read(tmp.join("multi_1k.dat")).unwrap(), multi_1k);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: live `sz` → our receiver ─────────────
+    //
+    // Counterpart to the static `test_lrzsz_replay_*` tests: those
+    // replay captured `sz` bytes through our receiver, which can't
+    // catch regressions where our receiver's response timing is now
+    // wrong (because the captured bytes don't depend on our replies).
+    // This drives a live `sz` subprocess, so any change to our
+    // ZRPOS/ZACK timing or ZRINIT scheduling shows up immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_sz_to_us_live() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_sz_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 16 KB so we cross multiple subpackets and exercise the
+        // mid-frame ZCRCQ ACK path on sz's side.
+        let payload: Vec<u8> = (0..16384u32)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
+        let payload_path = tmp.join("payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sz = Command::new("sz")
+            .arg("-b")
+            .arg("-q")
+            .arg("--disable-timeouts")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sz");
+
+        let mut sz_stdin = sz.stdin.take().unwrap();
+        let mut sz_stdout = sz.stdout.take().unwrap();
+
+        let recv_result = zmodem_receive(
+            &mut sz_stdout,
+            &mut sz_stdin,
+            false,
+            true,
+            |_, _, _| true,
+        )
+        .await;
+        let _ = sz.wait().await;
+        let received = recv_result.expect("zmodem_receive against sz failed");
+
+        assert_eq!(
+            received.len(),
+            1,
+            "sz with one file should produce a 1-entry batch"
+        );
+        assert_eq!(received[0].data, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: `rz -y` (force overwrite) ────────────
+    //
+    // Complements the `-p` (skip) test: `-y` is the opposite policy —
+    // accept and clobber.  Validates the sender's normal ZRPOS path
+    // when the receiver explicitly chooses to overwrite an existing
+    // file.  Different code path inside lrzsz from `-p`; would catch
+    // a regression that only shows up when rz reopens an existing
+    // file for write rather than declining via ZSKIP.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_rz_overwrite() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_overwrite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let old_content = b"OLD content -- this MUST be replaced";
+        std::fs::write(tmp.join("target.dat"), old_content).unwrap();
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-y") // yes: clobber any existing files with the same name
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let new_content = b"NEW content -- overwrite must succeed";
+        let batch: [(&str, &[u8]); 1] = [("target.dat", new_content)];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, true).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed");
+
+        let after = std::fs::read(tmp.join("target.dat")).unwrap();
+        assert_eq!(
+            after, new_content,
+            "rz -y should have overwritten target.dat with new content"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: `sz -e` (force-escape) → our receiver ─
+    //
+    // `sz -e` forces sz to ZDLE-escape control characters that aren't
+    // normally escaped (the `Zctlesc` toggle in lrzsz).  This stresses
+    // our receiver's `read_escaped_byte` path against the maximum-
+    // escaping version of a real sender, which the recorded-replay
+    // fixtures don't cover (they use sz's default escape set).  A
+    // payload of every byte 0..=255 forces every escapable byte to
+    // appear at least once.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_sz_force_escape() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_sz_force_escape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Every byte value, repeated enough times to span multiple
+        // subpackets — forces every escapable byte through the wire
+        // many times each.
+        let payload: Vec<u8> = (0..=255u8).cycle().take(8192).collect();
+        let payload_path = tmp.join("all_bytes.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sz = Command::new("sz")
+            .arg("-b")
+            .arg("-e") // force-escape all control chars
+            .arg("-q")
+            .arg("--disable-timeouts")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sz -e");
+
+        let mut sz_stdin = sz.stdin.take().unwrap();
+        let mut sz_stdout = sz.stdout.take().unwrap();
+
+        let recv_result = zmodem_receive(
+            &mut sz_stdout,
+            &mut sz_stdin,
+            false,
+            true,
+            |_, _, _| true,
+        )
+        .await;
+        let _ = sz.wait().await;
+        let received = recv_result.expect("zmodem_receive against sz -e failed");
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: 1 MB payload through real `rz` ───────
+    //
+    // Our internal large-file round-trip uses 64 KB.  This drives a
+    // 1 MB pseudorandom payload through a real `rz` subprocess so we
+    // exercise lrzsz's actual buffering, ACK pacing (32 KB default
+    // bufsize), and disk I/O.  Multi-thread runtime so the OS-pipe
+    // I/O on rz's side doesn't starve our send loop.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn test_lrzsz_rz_large_file() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_large_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Deterministic 1 MB pseudorandom payload — using a tiny LCG
+        // so the test is reproducible without pulling in `rand`.
+        let size = 1 << 20;
+        let mut payload: Vec<u8> = Vec::with_capacity(size);
+        let mut rng: u32 = 0xDEAD_BEEF;
+        for _ in 0..size {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            payload.push((rng >> 16) as u8);
+        }
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let batch: [(&str, &[u8]); 1] = [("large.bin", &payload)];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, false).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed for 1 MB file");
+
+        let received = std::fs::read(tmp.join("large.bin")).unwrap();
+        assert_eq!(received.len(), payload.len(), "size mismatch");
+        assert_eq!(received, payload, "content mismatch");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── ZMODEM (Forsberg 1988) spec conformance tests ───────
+    //
+    // Lock down the byte-exact wire layout per Forsberg's "zmodem.txt"
+    // (Rev Oct-14-88).  Each test cites the spec section it locks
+    // down so future readers can audit our output against the spec
+    // directly.  Complements the existing round-trip tests (which
+    // verify mutual encode/decode) by asserting the wire format
+    // matches the spec byte-for-byte.
+
+    #[test]
+    fn test_forsberg_section10_zdle_byte_value() {
+        // §10 ZDLE = "ZMODEM Data Link Escape" = 0x18.  Same byte as
+        // ASCII CAN, intentionally — the protocol reuses CAN as its
+        // escape byte so a spurious CAN aborts neatly.
+        const _: () = assert!(ZDLE == 0x18);
+    }
+
+    #[test]
+    fn test_forsberg_section10_zdlee_xor_value() {
+        // §10: a literal ZDLE byte (0x18) in data is escaped as
+        // ZDLE ZDLEE.  ZDLEE = ZDLE ^ 0x40 = 0x58 = ASCII 'X'.
+        const _: () = assert!(ZDLEE == 0x18 ^ 0x40);
+        const _: () = assert!(ZDLEE == 0x58);
+    }
+
+    #[test]
+    fn test_forsberg_section7_zpad_byte_value() {
+        // §7: ZPAD = 0x2A = ASCII '*'.  Frames begin with one or two
+        // ZPAD bytes followed by ZDLE — the receiver synchronizes on
+        // this signature.
+        const _: () = assert!(ZPAD == b'*');
+        const _: () = assert!(ZPAD == 0x2A);
+    }
+
+    #[test]
+    fn test_forsberg_section8_header_format_introducer_bytes() {
+        // §8 frame format introducer bytes (the byte after ZDLE):
+        //   'A' (ZBIN)   = binary header with CRC-16
+        //   'B' (ZHEX)   = hex header with CRC-16
+        //   'C' (ZBIN32) = binary header with CRC-32
+        const _: () = assert!(ZBIN == b'A');
+        const _: () = assert!(ZHEX == b'B');
+        const _: () = assert!(ZBIN32 == b'C');
+    }
+
+    #[test]
+    fn test_forsberg_section9_subpacket_terminator_bytes() {
+        // §9 subpacket end-frame markers:
+        //   ZCRCE = 'h' (0x68) — end of frame, no more subpackets
+        //   ZCRCG = 'i' (0x69) — more subpackets, no ACK required
+        //   ZCRCQ = 'j' (0x6A) — more subpackets, ACK required
+        //   ZCRCW = 'k' (0x6B) — last subpacket of frame, ACK required
+        const _: () = assert!(ZCRCE == b'h');
+        const _: () = assert!(ZCRCG == b'i');
+        const _: () = assert!(ZCRCQ == b'j');
+        const _: () = assert!(ZCRCW == b'k');
+    }
+
+    #[test]
+    fn test_forsberg_section11_frame_type_byte_values() {
+        // §11 frame type byte values for the 13 frames we use,
+        // plus our internal ZCAN sentinel (0x10).  Forsberg also
+        // defines ZCRC/ZCHALLENGE/ZCOMPL/ZFREECNT/ZCOMMAND/ZSTDERR
+        // (0x0D..0x13) but we don't issue or recognize them.  Lock
+        // down the exact bytes — a refactor that renumbers any of
+        // these would break wire compatibility with every other
+        // ZMODEM implementation.
+        const _: () = assert!(ZRQINIT == 0x00);
+        const _: () = assert!(ZRINIT == 0x01);
+        const _: () = assert!(ZSINIT == 0x02);
+        const _: () = assert!(ZACK == 0x03);
+        const _: () = assert!(ZFILE == 0x04);
+        const _: () = assert!(ZSKIP == 0x05);
+        const _: () = assert!(ZNAK == 0x06);
+        const _: () = assert!(ZABORT == 0x07);
+        const _: () = assert!(ZFIN == 0x08);
+        const _: () = assert!(ZRPOS == 0x09);
+        const _: () = assert!(ZDATA == 0x0A);
+        const _: () = assert!(ZEOF == 0x0B);
+        const _: () = assert!(ZFERR == 0x0C);
+        const _: () = assert!(ZCAN == 0x10);
+    }
+
+    #[test]
+    fn test_forsberg_section11_capability_flag_bits() {
+        // §11.2 ZRINIT capability flags (ZF0 byte):
+        //   CANFDX  = 0x01 — full-duplex link
+        //   CANOVIO = 0x02 — sender can overlap I/O with output
+        //   CANFC32 = 0x20 — receiver can decode CRC-32 frames
+        const _: () = assert!(CANFDX == 0x01);
+        const _: () = assert!(CANOVIO == 0x02);
+        const _: () = assert!(CANFC32 == 0x20);
+    }
+
+    #[test]
+    fn test_forsberg_section8_hex_header_starts_with_zpad_zpad_zdle_b() {
+        // §8 hex frame leader: ZPAD ZPAD ZDLE 'B' (= '*' '*' 0x18 'B').
+        // Distinguishes hex frames from binary (ZPAD ZDLE 'A'/'C').
+        let bytes = build_hex_header(ZRPOS, [0, 0, 0, 0]);
+        assert_eq!(&bytes[..4], &[ZPAD, ZPAD, ZDLE, ZHEX]);
+    }
+
+    #[test]
+    fn test_forsberg_section8_hex_header_appends_xon_after_normal_frame() {
+        // §8: hex frames are followed by CR LF, then XON (0x11).
+        // The XON keeps the line awake so the receiver doesn't
+        // mistakenly XOFF the sender mid-session.
+        let bytes = build_hex_header(ZRPOS, [0, 0, 0, 0]);
+        assert_eq!(&bytes[bytes.len() - 3..], &[b'\r', b'\n', 0x11]);
+    }
+
+    #[test]
+    fn test_forsberg_section8_hex_header_omits_xon_for_zack_zfin() {
+        // §8 footnote: ZACK and ZFIN frames must NOT be followed by
+        // XON — a stray XON would confuse the post-ZFIN OO trailer.
+        for ty in [ZACK, ZFIN] {
+            let bytes = build_hex_header(ty, [0, 0, 0, 0]);
+            assert_eq!(
+                &bytes[bytes.len() - 2..],
+                b"\r\n",
+                "frame type 0x{:02X} must end with CR LF (no XON)",
+                ty
+            );
+            assert_ne!(
+                bytes[bytes.len() - 1],
+                0x11,
+                "frame type 0x{:02X} must not end with XON",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn test_forsberg_section8_hex_header_uses_lowercase_hex() {
+        // §8: hex headers use ASCII lowercase a-f, not uppercase.
+        // Build a header containing every nibble value 0..=0xF and
+        // verify each emitted hex digit is lowercase.
+        let bytes = build_hex_header(0xAB, [0xCD, 0xEF, 0x01, 0x23]);
+        // The hex payload begins right after ZPAD ZPAD ZDLE 'B' and
+        // ends before CR LF.  Every byte in that range must be a
+        // lowercase hex digit (0-9 or a-f).
+        let payload = &bytes[4..bytes.len() - 3]; // strip trailing CR LF XON
+        for &b in payload {
+            assert!(
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+                "non-lowercase-hex byte in hex header: 0x{:02X}",
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_forsberg_section8_hex_header_total_length() {
+        // §8 hex header byte budget:
+        //   ZPAD ZPAD ZDLE 'B'           = 4
+        //   5 payload bytes as hex chars = 10
+        //   16-bit CRC as 4 hex chars    = 4
+        //   CR LF                        = 2
+        //   XON (omitted for ZACK/ZFIN)  = 1
+        //                              total = 21 (or 20 without XON)
+        assert_eq!(build_hex_header(ZRPOS, [0; 4]).len(), 21);
+        assert_eq!(build_hex_header(ZACK, [0; 4]).len(), 20);
+        assert_eq!(build_hex_header(ZFIN, [0; 4]).len(), 20);
+    }
+
+    #[test]
+    fn test_forsberg_section8_bin16_header_starts_with_zpad_zdle_a() {
+        // §8 binary-16 frame leader: ZPAD ZDLE 'A' (one ZPAD only,
+        // distinguishing it from hex frames which use two).
+        let bytes = build_bin16_header(ZFILE, [0, 0, 0, 0]);
+        assert_eq!(&bytes[..3], &[ZPAD, ZDLE, ZBIN]);
+    }
+
+    #[test]
+    fn test_forsberg_section8_bin16_payload_bytes_are_zdle_escaped() {
+        // §10: payload bytes inside a binary frame must be ZDLE-
+        // escaped if they're flow-control characters.  Build a
+        // header containing 0x11 (XON) and verify it's escaped.
+        let bytes = build_bin16_header(0x11, [0, 0, 0, 0]);
+        // Payload starts after ZPAD ZDLE 'A'.  The frame-type byte
+        // is 0x11 which must be escaped — so we expect ZDLE followed
+        // by 0x11 ^ 0x40 = 0x51 ('Q').
+        assert_eq!(bytes[3], ZDLE);
+        assert_eq!(bytes[4], 0x11 ^ 0x40);
+    }
+
+    /// §11.1 ZRQINIT carries no payload data — all four ZP0..ZP3
+    /// bytes are zero.  This is the very first frame the sender
+    /// emits, used to wake up the receiver and trigger ZRINIT.
+    #[test]
+    fn test_forsberg_section11_1_zrqinit_payload_all_zero() {
+        let bytes = build_hex_header(ZRQINIT, [0, 0, 0, 0]);
+        // After ZPAD ZPAD ZDLE 'B' (4 bytes) and 2 hex digits for
+        // the frame type (offsets 4-5), the four data bytes occupy
+        // offsets 6..14 as eight ASCII hex digits.
+        for (i, b) in bytes[6..14].iter().enumerate() {
+            assert_eq!(
+                *b, b'0',
+                "ZRQINIT data nibble {} must be ASCII '0', got 0x{:02X}",
+                i, b
+            );
+        }
+    }
+
+    /// §11.8 ZFIN ends the session.  Both peers exchange ZFIN
+    /// before the sender emits the "OO" trailer.  ZP0..ZP3 are
+    /// unused and zero.
+    #[test]
+    fn test_forsberg_section11_8_zfin_payload_all_zero() {
+        let bytes = build_hex_header(ZFIN, [0, 0, 0, 0]);
+        for (i, b) in bytes[6..14].iter().enumerate() {
+            assert_eq!(
+                *b, b'0',
+                "ZFIN data nibble {} must be ASCII '0', got 0x{:02X}",
+                i, b
+            );
+        }
+    }
+
+    /// §11.4 ZRPOS data is a 4-byte little-endian file offset.
+    /// Build a ZRPOS at position 0x12345678 and verify the hex
+    /// nibbles encode the bytes in little-endian order: 78 56 34 12.
+    #[test]
+    fn test_forsberg_section11_4_zrpos_position_little_endian() {
+        let pos: u32 = 0x12345678;
+        let bytes = build_hex_header(ZRPOS, pos.to_le_bytes());
+        // After ZPAD ZPAD ZDLE 'B' (4 bytes) and 2 hex digits for
+        // frame type (offsets 4-5), the position bytes are at
+        // offsets 6, 8, 10, 12 (each as 2 hex chars).
+        let to_byte = |hi: u8, lo: u8| -> u8 {
+            let nib = |c: u8| if c.is_ascii_digit() { c - b'0' } else { c - b'a' + 10 };
+            (nib(hi) << 4) | nib(lo)
+        };
+        assert_eq!(to_byte(bytes[6], bytes[7]), 0x78, "P0 (LSB)");
+        assert_eq!(to_byte(bytes[8], bytes[9]), 0x56, "P1");
+        assert_eq!(to_byte(bytes[10], bytes[11]), 0x34, "P2");
+        assert_eq!(to_byte(bytes[12], bytes[13]), 0x12, "P3 (MSB)");
+    }
+
+    /// §11.2 ZRINIT advertises receiver capabilities in ZF0.  We
+    /// always advertise CANFDX | CANOVIO | CANFC32 = 0x23, the
+    /// modern minimum that Qodem/Tera Term/lrzsz all expect.
+    #[test]
+    fn test_forsberg_section11_2_zrinit_capability_flags_byte() {
+        let flags = CANFDX | CANOVIO | CANFC32;
+        assert_eq!(
+            flags, 0x23,
+            "ZRINIT capability flag byte must be 0x23 (CANFDX|CANOVIO|CANFC32)"
+        );
+    }
+
+    #[test]
+    fn test_forsberg_canonical_crc16_xmodem_vector() {
+        // §8 ZMODEM uses the same CRC-16 polynomial as XMODEM
+        // (poly 0x1021, init 0).  Canonical vector: "123456789" =>
+        // 0x31C3.
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn test_forsberg_canonical_crc32_vector() {
+        // CRC-32 for ZMODEM uses the standard PKZIP/IEEE polynomial
+        // (0xEDB88320 reflected, init 0xFFFFFFFF, output XOR
+        // 0xFFFFFFFF).  Canonical vector: "123456789" => 0xCBF43926.
+        assert_eq!(crc32(b"123456789"), 0xCBF43926);
     }
 
     // ─── Property-based fuzz tests ──────────────────────────

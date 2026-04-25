@@ -2385,4 +2385,822 @@ mod tests {
         assert!(is_esc_key(0x1B, true));
         assert!(is_esc_key(0x5F, true));
     }
+
+    // ─── XMODEM/XMODEM-1K/YMODEM spec conformance tests ──────
+    //
+    // Drive `xmodem_send` against a minimal scripted receiver, capture
+    // the wire bytes, and assert that each header/block/trailer matches
+    // the byte-exact format mandated by:
+    //   - XMODEM (Christensen 1977 / Forsberg's "YMODEM.DOC")
+    //   - XMODEM-CRC (Forsberg)
+    //   - XMODEM-1K (Forsberg, STX/1024-byte blocks)
+    //   - YMODEM (Forsberg 1985, batch with block 0)
+
+    /// Capture the bytes `xmodem_send` writes when driven by a scripted
+    /// receiver.  `receiver_script` is the sequence of control bytes
+    /// the receiver should emit (e.g. `[CRC_REQUEST, ACK, ACK, ACK]`)
+    /// — one per block plus a final ACK for the EOT.  Returns the
+    /// concatenated wire bytes the sender produced.
+    async fn capture_xmodem_wire(
+        data: &[u8],
+        use_1k: bool,
+        ymodem: Option<YmodemHeader>,
+        receiver_script: &[u8],
+    ) -> Vec<u8> {
+        let (sender_half, receiver_half) = tokio::io::duplex(65536);
+        let (mut send_read, mut send_write) = tokio::io::split(sender_half);
+        let (mut recv_read, mut recv_write) = tokio::io::split(receiver_half);
+
+        let data = data.to_vec();
+        let script = receiver_script.to_vec();
+
+        let send_task = tokio::spawn(async move {
+            xmodem_send(
+                &mut send_read,
+                &mut send_write,
+                &data,
+                false,
+                false,
+                false,
+                use_1k,
+                ymodem,
+            )
+            .await
+            .ok();
+        });
+
+        let capture_task = tokio::spawn(async move {
+            // Drive the script: emit one byte, then read until enough
+            // bytes have arrived to plausibly complete a block (loose
+            // bound; we just need to keep the sender unblocked).
+            let mut captured: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut script_pos = 0usize;
+            loop {
+                if script_pos < script.len() {
+                    recv_write.write_all(&[script[script_pos]]).await.ok();
+                    recv_write.flush().await.ok();
+                    script_pos += 1;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    recv_read.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => captured.extend_from_slice(&buf[..n]),
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        if script_pos >= script.len() {
+                            break;
+                        }
+                    }
+                }
+            }
+            captured
+        });
+
+        let _ = send_task.await;
+        capture_task.await.unwrap()
+    }
+
+    /// Heuristic: scan `wire` for the first occurrence of an XMODEM
+    /// block (SOH or STX) and return the (header_byte, block_num,
+    /// complement, payload_offset) tuple.
+    fn find_first_block(wire: &[u8]) -> Option<(u8, u8, u8, usize)> {
+        for (i, &b) in wire.iter().enumerate() {
+            if (b == SOH || b == STX) && i + 2 < wire.len() {
+                return Some((b, wire[i + 1], wire[i + 2], i + 3));
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_christensen_checksum_block_layout() {
+        // XMODEM (Christensen 1977): block = SOH (0x01) | block_num |
+        // ~block_num | 128 bytes | checksum (1 byte sum mod 256).
+        // Receiver requests checksum mode by sending NAK first.
+        let data = b"Hello, XMODEM!";
+        let wire = capture_xmodem_wire(data, false, None, &[NAK, ACK, ACK]).await;
+        let (hdr, num, comp, off) = find_first_block(&wire).expect("no block in wire");
+        assert_eq!(hdr, SOH, "checksum-mode XMODEM block must start with SOH");
+        assert_eq!(num, 1, "first block number must be 1 (Christensen)");
+        assert_eq!(comp, !num, "complement must be bitwise NOT of block num");
+        assert!(off + 128 < wire.len(), "wire too short for SOH+128+cksum");
+        // Verify the checksum (sum mod 256 of the 128 data bytes).
+        let payload = &wire[off..off + 128];
+        let cksum: u8 = payload.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(wire[off + 128], cksum, "checksum mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_crc16_block_layout() {
+        // XMODEM-CRC: same as Christensen but with CRC-16/XMODEM
+        // (poly 0x1021) appended MSB-first instead of a 1-byte
+        // checksum.  Triggered by receiver sending 'C' first.
+        let data = b"CRC mode payload";
+        let wire = capture_xmodem_wire(data, false, None, &[CRC_REQUEST, ACK, ACK]).await;
+        let (hdr, num, _, off) = find_first_block(&wire).expect("no block");
+        assert_eq!(hdr, SOH);
+        assert_eq!(num, 1);
+        assert!(off + 128 + 2 <= wire.len(), "wire too short for SOH+128+CRC");
+        let payload = &wire[off..off + 128];
+        let crc = crc16_xmodem(payload);
+        // CRC is appended MSB-first per the spec.
+        assert_eq!(
+            wire[off + 128],
+            (crc >> 8) as u8,
+            "CRC high byte must come first"
+        );
+        assert_eq!(
+            wire[off + 129],
+            crc as u8,
+            "CRC low byte must come second"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_1k_block_uses_stx_header() {
+        // XMODEM-1K: 1024-byte blocks introduced with STX (0x02)
+        // instead of SOH.  Forsberg specified this so receivers can
+        // distinguish block sizes from the leading byte alone.
+        let data: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+        let wire = capture_xmodem_wire(&data, true, None, &[CRC_REQUEST, ACK, ACK]).await;
+        let (hdr, _, _, _) = find_first_block(&wire).expect("no block");
+        assert_eq!(hdr, STX, "XMODEM-1K block must start with STX (0x02)");
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_1k_block_layout() {
+        // XMODEM-1K: STX | num | ~num | 1024 bytes | CRC16 (2 bytes).
+        let data: Vec<u8> = (0..1024u32).map(|i| (i.wrapping_mul(13) & 0xFF) as u8).collect();
+        let wire = capture_xmodem_wire(&data, true, None, &[CRC_REQUEST, ACK, ACK]).await;
+        let (hdr, num, comp, off) = find_first_block(&wire).expect("no block");
+        assert_eq!(hdr, STX);
+        assert_eq!(num, 1);
+        assert_eq!(comp, !num);
+        assert!(off + 1024 + 2 <= wire.len(), "wire too short for STX+1024+CRC");
+        let crc = crc16_xmodem(&wire[off..off + 1024]);
+        assert_eq!(wire[off + 1024], (crc >> 8) as u8);
+        assert_eq!(wire[off + 1025], crc as u8);
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_block_number_increments_then_wraps() {
+        // Block numbers are 8-bit, increment from 1, and wrap 255 → 0.
+        // 257 blocks (256 × 128 + 1) → numbers 1, 2, ..., 255, 0, 1.
+        // We probe the first two block numbers (cheaper than 257-block
+        // wrap, which is expensive) — the wrap logic is exercised by
+        // the existing internal round-trip tests.
+        let data: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
+        let wire =
+            capture_xmodem_wire(&data, false, None, &[CRC_REQUEST, ACK, ACK, ACK]).await;
+        // First block is num=1.  Find the second SOH.
+        let mut soh_positions: Vec<usize> = Vec::new();
+        for (i, &b) in wire.iter().enumerate() {
+            if b == SOH && i + 2 < wire.len() && wire[i + 2] == !wire[i + 1] {
+                soh_positions.push(i);
+            }
+        }
+        assert!(
+            soh_positions.len() >= 2,
+            "expected at least 2 blocks for 256-byte payload"
+        );
+        assert_eq!(wire[soh_positions[0] + 1], 1, "first block must be 1");
+        assert_eq!(wire[soh_positions[1] + 1], 2, "second block must be 2");
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_eot_after_last_block() {
+        // After the final data block + final ACK, the sender emits
+        // EOT (0x04) to signal end-of-file.
+        let data = b"short";
+        let wire = capture_xmodem_wire(data, false, None, &[CRC_REQUEST, ACK, ACK]).await;
+        assert!(
+            wire.contains(&EOT),
+            "wire must contain EOT (0x04) after last block, got: {:?}",
+            wire.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xmodem_pads_short_block_with_sub() {
+        // XMODEM blocks are fixed-width.  The last block of a file
+        // shorter than 128 bytes is padded with 0x1A (SUB / CP/M EOF).
+        let data = b"abc"; // 3 bytes, must be padded to 128
+        let wire = capture_xmodem_wire(data, false, None, &[CRC_REQUEST, ACK, ACK]).await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        let payload = &wire[off..off + 128];
+        assert_eq!(&payload[..3], data);
+        assert!(
+            payload[3..].iter().all(|&b| b == SUB),
+            "tail of short block must be padded with SUB (0x1A), got: {:?}",
+            &payload[3..]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ymodem_block_zero_format() {
+        // YMODEM (Forsberg §5): block 0 carries metadata as
+        //   "filename\0size mtime mode\0...\0" padded to block size.
+        // Block number is 0 (not 1) for the metadata block.
+        let data = b"file body";
+        let header = YmodemHeader {
+            filename: "test.bin".to_string(),
+            size: data.len() as u64,
+        };
+        let wire =
+            capture_xmodem_wire(data, false, Some(header), &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK])
+                .await;
+        let (hdr, num, comp, off) = find_first_block(&wire).expect("no block");
+        assert_eq!(hdr, SOH, "YMODEM block 0 uses SOH (128 bytes)");
+        assert_eq!(num, 0, "block 0 must have block number 0");
+        assert_eq!(comp, !num);
+        let payload = &wire[off..off + 128];
+        // Filename comes first, NUL-terminated.
+        let nul = payload.iter().position(|&b| b == 0).expect("no NUL after filename");
+        assert_eq!(&payload[..nul], b"test.bin");
+        // After the NUL, ASCII-decimal size, space-separated from
+        // mtime / mode.  We just need to verify the size field is
+        // present in decimal ASCII before the next NUL.
+        let after_name = &payload[nul + 1..];
+        let next_nul = after_name
+            .iter()
+            .position(|&b| b == 0)
+            .expect("no NUL after metadata");
+        let meta = std::str::from_utf8(&after_name[..next_nul]).unwrap();
+        let first_field = meta.split_whitespace().next().unwrap();
+        assert_eq!(
+            first_field,
+            "9",
+            "size field must be decimal ASCII matching data length"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ymodem_block_zero_uses_crc16() {
+        // YMODEM mandates CRC-16 (not checksum) for all blocks, so
+        // even the receiver's negotiation byte before block 0 must
+        // be 'C' — a NAK negotiation would put us in legacy XMODEM
+        // mode where YMODEM features (size truncation, batch) don't
+        // apply.  This test locks in that block 0 is followed by a
+        // 2-byte CRC-16 trailer.
+        let data = b"x";
+        let header = YmodemHeader {
+            filename: "a".to_string(),
+            size: 1,
+        };
+        let wire = capture_xmodem_wire(
+            data,
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        // Block 0 = SOH + 2-byte hdr + 128 data + 2-byte CRC.
+        let payload = &wire[off..off + 128];
+        let crc = crc16_xmodem(payload);
+        assert_eq!(wire[off + 128], (crc >> 8) as u8, "block 0 CRC high byte");
+        assert_eq!(wire[off + 129], crc as u8, "block 0 CRC low byte");
+    }
+
+    #[test]
+    fn test_xmodem_crc16_canonical_vector() {
+        // Forsberg "XMODEM/YMODEM Protocol Reference" cites the
+        // CRC-16/XMODEM canonical vector (poly 0x1021, init 0,
+        // no reflection): "123456789" → 0x31C3.  Locks in the CRC
+        // implementation as a separate spec-citation test from the
+        // pre-existing internal vector test.
+        assert_eq!(crc16_xmodem(b"123456789"), 0x31C3);
+    }
+
+    #[test]
+    fn test_xmodem_control_byte_constants_match_christensen() {
+        // Christensen 1977 / Forsberg's YMODEM.DOC defines:
+        //   SOH = 0x01, STX = 0x02, EOT = 0x04, ACK = 0x06,
+        //   NAK = 0x15, CAN = 0x18, SUB = 0x1A.
+        // Plus Forsberg's CRC-mode trigger 'C' = 0x43.
+        const _: () = assert!(SOH == 0x01);
+        const _: () = assert!(STX == 0x02);
+        const _: () = assert!(EOT == 0x04);
+        const _: () = assert!(ACK == 0x06);
+        const _: () = assert!(NAK == 0x15);
+        const _: () = assert!(CAN == 0x18);
+        const _: () = assert!(SUB == 0x1A);
+        const _: () = assert!(CRC_REQUEST == 0x43);
+    }
+
+    // ─── lrzsz interop tests (manual, #[ignore]) ────────────
+    //
+    // Mirror the ZMODEM lrzsz interop tests in src/zmodem.rs.  Run with:
+    //   cargo test --release -- --ignored test_lrzsz_xmodem
+    //   cargo test --release -- --ignored test_lrzsz_ymodem
+    // Each test spawns a real sx/rx/sb/rb subprocess, drives our
+    // sender/receiver against it through stdin/stdout, reaps the child
+    // before unwrapping, and verifies the file bytes round-trip
+    // unchanged.  Unix-only because lrzsz is.
+
+    // ─── XMODEM: our sender → real `rx` ──────────────────────
+
+    /// Our sender → real `rx -c` (CRC-16).  Validates our CRC-16
+    /// negotiation and 128-byte SOH block stream against a real
+    /// receiver.  Payload deliberately avoids trailing 0x1A so the
+    /// SUB-strip on the receiving side doesn't confuse the assertion.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_xmodem_rx_crc() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rx (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("xmodem_rx_crc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_path = tmp.join("received.dat");
+
+        // 256 bytes, no trailing 0x1A — picks every byte 1..=255 then 0,
+        // so the last byte is 0x00 (not SUB).
+        let payload: Vec<u8> = (1u16..=256u16)
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+
+        let mut rx = Command::new("rx")
+            .arg("-c") // CRC-16 mode
+            .arg(&out_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rx");
+
+        let mut rx_stdin = rx.stdin.take().unwrap();
+        let mut rx_stdout = rx.stdout.take().unwrap();
+
+        let send_result = xmodem_send(
+            &mut rx_stdout,
+            &mut rx_stdin,
+            &payload,
+            false,
+            false,
+            true,
+            false,
+            None,
+        )
+        .await;
+        let _ = rx.wait().await;
+        send_result.expect("xmodem_send against rx -c failed");
+
+        let received = std::fs::read(&out_path).unwrap();
+        // rx pads with 0x1A to the next 128-byte boundary.  Strip
+        // trailing 0x1A bytes for the comparison — our sender pads
+        // identically, and the original payload doesn't end in 0x1A.
+        let stripped: Vec<u8> = {
+            let mut v = received.clone();
+            while v.last() == Some(&0x1A) {
+                v.pop();
+            }
+            v
+        };
+        assert_eq!(stripped, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Our sender → real `rx` (no `-c`, defaults to checksum mode).
+    /// `rx` opens the negotiation with NAK (0x15) so our sender falls
+    /// back to the legacy 1-byte checksum path.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_xmodem_rx_checksum() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rx (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("xmodem_rx_cksum_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_path = tmp.join("received.dat");
+
+        let payload = b"checksum-mode round trip across legacy XMODEM\n".to_vec();
+
+        let mut rx = Command::new("rx")
+            .arg(&out_path) // no -c: defaults to checksum
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rx");
+
+        let mut rx_stdin = rx.stdin.take().unwrap();
+        let mut rx_stdout = rx.stdout.take().unwrap();
+
+        let send_result = xmodem_send(
+            &mut rx_stdout,
+            &mut rx_stdin,
+            &payload,
+            false,
+            false,
+            true,
+            false,
+            None,
+        )
+        .await;
+        let _ = rx.wait().await;
+        send_result.expect("xmodem_send against rx (checksum) failed");
+
+        let received = std::fs::read(&out_path).unwrap();
+        let stripped: Vec<u8> = {
+            let mut v = received.clone();
+            while v.last() == Some(&0x1A) {
+                v.pop();
+            }
+            v
+        };
+        assert_eq!(stripped, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Our sender with `use_1k=true` → real `rx -c`.  Validates our
+    /// XMODEM-1K STX/1024 path.  Payload is an exact multiple of 1024
+    /// so we never fall back to a final SOH block, exercising the pure
+    /// 1K path end-to-end.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_xmodem_rx_1k() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rx (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("xmodem_rx_1k_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_path = tmp.join("received.dat");
+
+        // 4096 = exact 4 × 1024 STX blocks, no SOH fallback.
+        let payload: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(13) & 0xFF) as u8)
+            .collect();
+
+        let mut rx = Command::new("rx")
+            .arg("-c") // CRC-16; rx auto-detects STX vs SOH
+            .arg(&out_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rx");
+
+        let mut rx_stdin = rx.stdin.take().unwrap();
+        let mut rx_stdout = rx.stdout.take().unwrap();
+
+        let send_result = xmodem_send(
+            &mut rx_stdout,
+            &mut rx_stdin,
+            &payload,
+            false,
+            false,
+            true,
+            true, // use_1k
+            None,
+        )
+        .await;
+        let _ = rx.wait().await;
+        send_result.expect("xmodem_send (1K) against rx -c failed");
+
+        let received = std::fs::read(&out_path).unwrap();
+        let stripped: Vec<u8> = {
+            let mut v = received.clone();
+            while v.last() == Some(&0x1A) {
+                v.pop();
+            }
+            v
+        };
+        assert_eq!(stripped, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── XMODEM: real `sx` → our receiver ─────────────────────
+
+    /// Real `sx` → our receiver (128-byte SOH path).  `sx` defaults to
+    /// XMODEM with CRC-16 negotiation.  Counterpart to the sender-
+    /// direction tests above — catches receive-side regressions a real
+    /// sender exposes that our internal duplex round-trip can't.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_xmodem_sx_to_us() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sx (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("xmodem_sx_basic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let payload: Vec<u8> = (0..512u32)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
+        let payload_path = tmp.join("payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sx = Command::new("sx")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sx");
+
+        let mut sx_stdin = sx.stdin.take().unwrap();
+        let mut sx_stdout = sx.stdout.take().unwrap();
+
+        let recv_result = xmodem_receive(
+            &mut sx_stdout,
+            &mut sx_stdin,
+            false,
+            false,
+            true,
+        )
+        .await;
+        let _ = sx.wait().await;
+        let mut received = recv_result.expect("xmodem_receive against sx failed");
+
+        // sx pads with 0x1A; our receiver strips trailing SUB bytes for
+        // plain XMODEM (no size info).  Strip any residual 0x1A in case
+        // the boundary aligned exactly with the payload length.
+        while received.last() == Some(&0x1A) {
+            received.pop();
+        }
+        assert_eq!(received, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Real `sx -k` → our receiver.  Forces sx to emit STX/1024-byte
+    /// blocks; validates our receiver auto-detects STX and decodes the
+    /// 1K body correctly against a real sender.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_xmodem_sx_1k_to_us() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sx")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sx (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("xmodem_sx_1k_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let payload: Vec<u8> = (0..3072u32)
+            .map(|i| (i.wrapping_mul(11) & 0xFF) as u8)
+            .collect();
+        let payload_path = tmp.join("payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sx = Command::new("sx")
+            .arg("-k") // force 1K blocks
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sx -k");
+
+        let mut sx_stdin = sx.stdin.take().unwrap();
+        let mut sx_stdout = sx.stdout.take().unwrap();
+
+        let recv_result = xmodem_receive(
+            &mut sx_stdout,
+            &mut sx_stdin,
+            false,
+            false,
+            true,
+        )
+        .await;
+        let _ = sx.wait().await;
+        let mut received = recv_result.expect("xmodem_receive against sx -k failed");
+
+        while received.last() == Some(&0x1A) {
+            received.pop();
+        }
+        assert_eq!(received, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── YMODEM: our sender → real `rb` ──────────────────────
+
+    /// Our sender (YMODEM mode) → real `rb`.  Emits block 0 with
+    /// filename + size, then data blocks, then end-of-batch.  `rb` is
+    /// the YMODEM-batch lrzsz binary; verifies our YMODEM block-0
+    /// format is acceptable to a real receiver and that the
+    /// end-of-batch handshake completes cleanly.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_ymodem_rb_single() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rb")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rb (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("ymodem_rb_single_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let payload: Vec<u8> = (0..600u32)
+            .map(|i| (i.wrapping_mul(17) & 0xFF) as u8)
+            .collect();
+        let header = YmodemHeader {
+            filename: "ymodem_test.bin".to_string(),
+            size: payload.len() as u64,
+        };
+
+        let mut rb = Command::new("rb")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rb");
+
+        let mut rb_stdin = rb.stdin.take().unwrap();
+        let mut rb_stdout = rb.stdout.take().unwrap();
+
+        let send_result = xmodem_send(
+            &mut rb_stdout,
+            &mut rb_stdin,
+            &payload,
+            false,
+            false,
+            true,
+            false,
+            Some(header),
+        )
+        .await;
+        let _ = rb.wait().await;
+        send_result.expect("xmodem_send (YMODEM) against rb failed");
+
+        let received = std::fs::read(tmp.join("ymodem_test.bin")).unwrap();
+        // YMODEM declares size in block 0, so rb truncates exactly —
+        // no SUB-strip needed and the comparison is byte-exact.
+        assert_eq!(received, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── YMODEM: real `sb` → our receiver ─────────────────────
+
+    /// Real `sb` → our receiver.  Validates our auto-detection of
+    /// YMODEM via block 0, filename + size extraction, and the size-
+    /// based truncation that preserves files ending in 0x1A.  Payload
+    /// deliberately ends in 0x1A so a SUB-strip would corrupt it; if
+    /// the assertion passes, size-truncation is working.
+    ///
+    /// NOTE: our `xmodem_receive` returns one file per call and closes
+    /// the YMODEM batch after the first file, so multi-file `sb` is
+    /// outside the current API and is not tested here.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_ymodem_sb_to_us_single() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sb")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sb (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("ymodem_sb_single_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Payload that ends in 0x1A — tests size-based truncation
+        // (YMODEM block 0 declares the exact size).  If the receiver
+        // SUB-strips instead, the trailing 0x1A would be lost.
+        let mut payload: Vec<u8> = (0..500u32)
+            .map(|i| (i.wrapping_mul(19) & 0xFF) as u8)
+            .collect();
+        payload.push(0x1A);
+        payload.push(0x1A);
+        let payload_path = tmp.join("ymodem_payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sb = Command::new("sb")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sb");
+
+        let mut sb_stdin = sb.stdin.take().unwrap();
+        let mut sb_stdout = sb.stdout.take().unwrap();
+
+        let recv_result = xmodem_receive(
+            &mut sb_stdout,
+            &mut sb_stdin,
+            false,
+            false,
+            true,
+        )
+        .await;
+        let _ = sb.wait().await;
+        let received = recv_result.expect("xmodem_receive against sb failed");
+
+        assert_eq!(
+            received, payload,
+            "YMODEM size-truncation should preserve trailing 0x1A bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

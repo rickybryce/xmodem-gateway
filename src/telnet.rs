@@ -14148,4 +14148,195 @@ mod tests {
         peer.read_to_end(&mut out).await.unwrap();
         assert!(out.is_empty(), "NOP should produce no reply, got {:?}", out);
     }
+
+    // ─── Telnet RFC conformance tests ────────────────────────
+    //
+    // These tests cite specific RFC sections and lock in byte-exact
+    // protocol behavior.  They complement the broader behavioral
+    // tests above by giving a future reader an explicit checkpoint
+    // against the standards.
+
+    #[test]
+    fn test_rfc854_command_byte_values() {
+        // RFC 854 §"COMMAND NAME" table: every IAC command is a
+        // specific byte value.  Lock these in as constants so a
+        // refactor that accidentally renames a constant can't
+        // silently change the wire format.
+        const _: () = assert!(IAC == 0xFF);
+        const _: () = assert!(SE == 0xF0);
+        const _: () = assert!(SB == 0xFA);
+        const _: () = assert!(WILL == 0xFB);
+        const _: () = assert!(WONT == 0xFC);
+        const _: () = assert!(DO == 0xFD);
+        const _: () = assert!(DONT == 0xFE);
+    }
+
+    #[test]
+    fn test_rfc857_858_859_1073_1091_option_byte_values() {
+        // Option byte assignments per IANA Telnet Option registry,
+        // codified in the originating RFCs:
+        //   RFC 857 — Echo (option 1)
+        //   RFC 858 — Suppress Go Ahead (option 3)
+        //   RFC 859 — Status (option 5)
+        //   RFC 860 — Timing Mark (option 6)
+        //   RFC 1091 — Terminal Type (option 24 = 0x18)
+        //   RFC 1073 — Window Size / NAWS (option 31 = 0x1F)
+        const _: () = assert!(OPT_ECHO == 0x01);
+        const _: () = assert!(OPT_SGA == 0x03);
+        const _: () = assert!(OPT_STATUS == 0x05);
+        const _: () = assert!(OPT_TIMING_MARK == 0x06);
+        const _: () = assert!(OPT_TTYPE == 0x18);
+        const _: () = assert!(OPT_NAWS == 0x1F);
+    }
+
+    #[test]
+    fn test_rfc1091_ttype_subnegotiation_command_bytes() {
+        // RFC 1091: TTYPE subnegotiation uses two command bytes:
+        //   IS   = 0x00 (sender follows with the terminal name)
+        //   SEND = 0x01 (request the peer's terminal name)
+        const _: () = assert!(TTYPE_IS == 0x00);
+        const _: () = assert!(TTYPE_SEND == 0x01);
+    }
+
+    #[tokio::test]
+    async fn test_rfc854_iac_iac_decodes_to_literal_ff() {
+        // RFC 854: "If [the data stream] is desired to send the data
+        // byte 255, two 255s must be sent."  i.e., IAC IAC in the
+        // data stream decodes to a single literal 0xFF byte.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, IAC, b'X']).await.unwrap();
+        assert_eq!(
+            session.session_read_byte().await.unwrap(),
+            Some(0xFF),
+            "IAC IAC must decode to literal 0xFF"
+        );
+        assert_eq!(
+            session.session_read_byte().await.unwrap(),
+            Some(b'X'),
+            "byte after IAC IAC must read normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rfc1073_naws_subneg_byte_layout() {
+        // RFC 1073: NAWS subnegotiation is exactly:
+        //   IAC SB NAWS WIDTH_HI WIDTH_LO HEIGHT_HI HEIGHT_LO IAC SE
+        // This test feeds a well-formed NAWS payload and verifies
+        // both width and height are decoded as 16-bit big-endian.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        session.neg_sent_do[OPT_NAWS as usize] = true;
+        use tokio::io::AsyncWriteExt;
+        // 132 cols × 43 rows = 0x0084 × 0x002B.
+        peer.write_all(&[
+            IAC, SB, OPT_NAWS,
+            0x00, 0x84, // width hi, lo
+            0x00, 0x2B, // height hi, lo
+            IAC, SE,
+            b'!', // sentinel data byte
+        ])
+        .await
+        .unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'!'));
+        assert_eq!(session.window_width, Some(132));
+        assert_eq!(session.window_height, Some(43));
+    }
+
+    #[tokio::test]
+    async fn test_rfc1091_ttype_is_subneg_byte_layout() {
+        // RFC 1091: TTYPE IS subnegotiation is:
+        //   IAC SB TTYPE IS <terminal-name> IAC SE
+        // The terminal name is bytes following IS (0x00) up to the
+        // closing IAC SE.  Test feeds "ANSI" and verifies it ends up
+        // recognized as TerminalType::Ansi.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ascii);
+        session.neg_sent_do[OPT_TTYPE as usize] = true;
+        use tokio::io::AsyncWriteExt;
+        peer.write_all(&[IAC, SB, OPT_TTYPE, TTYPE_IS])
+            .await
+            .unwrap();
+        peer.write_all(b"ANSI").await.unwrap();
+        peer.write_all(&[IAC, SE, b'!']).await.unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'!'));
+        assert_eq!(
+            session.terminal_type,
+            TerminalType::Ansi,
+            "TTYPE IS 'ANSI' must set terminal type to Ansi"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rfc859_status_send_triggers_status_is_response() {
+        // RFC 859: when peer sends IAC SB STATUS SEND IAC SE, we
+        // must respond with IAC SB STATUS IS <state> IAC SE.  The
+        // state body lists every option we've negotiated.  This
+        // test verifies the response begins with the expected
+        // wrapper.
+        const STATUS_SEND: u8 = 0x01;
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        // Per the handler, we only respond if we've already WILL'd
+        // STATUS — otherwise we don't claim to support it.
+        session.neg_sent_will[OPT_STATUS as usize] = true;
+        // Pretend we WILL'd ECHO so STATUS IS has something to report.
+        session.neg_sent_will[OPT_ECHO as usize] = true;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, SB, OPT_STATUS, STATUS_SEND, IAC, SE, b'.'])
+            .await
+            .unwrap();
+        // Drain the data byte so the subneg gets fully processed.
+        let _ = session.session_read_byte().await;
+        // Drop session so peer can read whatever the server emitted.
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        // Find the STATUS IS reply.  Format: IAC SB STATUS IS ...
+        // IAC SE.  We just verify the prefix and the trailer are
+        // present, and that ECHO appears as a WILL in the body.
+        let prefix = [IAC, SB, OPT_STATUS, 0x00 /* IS */];
+        let pos = out
+            .windows(prefix.len())
+            .position(|w| w == prefix)
+            .expect("expected IAC SB STATUS IS in reply");
+        // Body must contain WILL OPT_ECHO somewhere before the
+        // closing IAC SE.
+        let after_prefix = &out[pos + prefix.len()..];
+        let se_idx = after_prefix
+            .windows(2)
+            .position(|w| w == [IAC, SE])
+            .expect("expected closing IAC SE");
+        let body = &after_prefix[..se_idx];
+        let will_echo = [WILL, OPT_ECHO];
+        assert!(
+            body.windows(2).any(|w| w == will_echo),
+            "STATUS IS body must contain WILL OPT_ECHO, got: {:?}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rfc855_q_method_dont_loop_on_already_disabled_option() {
+        // RFC 855 Q-method §"DON'T to a disabled option": if a peer
+        // sends IAC DONT for an option that's already disabled on
+        // our side, we must NOT respond with another IAC WONT —
+        // doing so would create an infinite negotiation loop.
+        // We never advertised WILL ECHO, so OPT_ECHO is in the
+        // disabled state; sending DONT ECHO must produce no reply.
+        let (mut session, mut peer) = make_test_session_with_peer(TerminalType::Ansi);
+        // Make sure OPT_ECHO has not been WILL'd.
+        session.neg_sent_will[OPT_ECHO as usize] = false;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        peer.write_all(&[IAC, DONT, OPT_ECHO, b'.']).await.unwrap();
+        assert_eq!(session.session_read_byte().await.unwrap(), Some(b'.'));
+        drop(session);
+        let mut out = Vec::new();
+        peer.read_to_end(&mut out).await.unwrap();
+        // The reply must not contain another WONT ECHO (which would
+        // bounce back to the peer and risk a loop).
+        let wont_echo = [IAC, WONT, OPT_ECHO];
+        assert!(
+            !out.windows(3).any(|w| w == wont_echo),
+            "received unexpected WONT ECHO reply (Q-method violation), out={:?}",
+            out
+        );
+    }
 }
