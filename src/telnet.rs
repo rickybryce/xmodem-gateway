@@ -3322,6 +3322,33 @@ impl TelnetSession {
         tokio::fs::create_dir_all(self.transfer_path()).await
     }
 
+    /// Apply YMODEM block-0 metadata to a freshly saved file.  Both
+    /// modtime and mode are best-effort — failures are ignored because
+    /// they don't affect data integrity.  Mode is masked to `0o777` so
+    /// a misbehaving sender can't set setuid/setgid/sticky bits on our
+    /// saved files; mode application is a no-op on non-Unix platforms.
+    /// Sync std::fs calls are deliberate — these are microsecond-level
+    /// operations that run once per saved file, so the cost of routing
+    /// through `spawn_blocking` would exceed the operations themselves.
+    fn apply_ymodem_meta(
+        path: &std::path::Path,
+        meta: Option<&crate::xmodem::YmodemReceiveMeta>,
+    ) {
+        let Some(m) = meta else { return };
+        if let Some(secs) = m.modtime
+            && let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+        {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            let _ = file.set_modified(when);
+        }
+        #[cfg(unix)]
+        if let Some(mode) = m.mode {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode & 0o777);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+
     fn validate_filename(name: &str) -> Result<(), &'static str> {
         if name.is_empty() {
             return Err("Filename cannot be empty");
@@ -3678,7 +3705,11 @@ impl TelnetSession {
         // the protocol, so we mark it as None and the user-entered
         // name wins.  ZMODEM carries a filename per file; we keep it
         // so batches can save files 2..N under their sender names.
-        type Received = Vec<(Option<String>, Vec<u8>)>;
+        // The third tuple slot carries optional YMODEM metadata
+        // (modtime/mode/sno) parsed from block 0; ZMODEM doesn't surface
+        // file attributes through this path so its entries are always
+        // `None`.  The save-side applies modtime + mode after writing.
+        type Received = Vec<(Option<String>, Vec<u8>, Option<crate::xmodem::YmodemReceiveMeta>)>;
         // Decide callback for the ZMODEM receiver.  The first file
         // (idx 0) is always accepted — the user typed a destination
         // filename in the upload prompt, so they want this one saved
@@ -3712,7 +3743,7 @@ impl TelnetSession {
             .await
             .map(|rxs| {
                 rxs.into_iter()
-                    .map(|rx| (Some(rx.filename), rx.data))
+                    .map(|rx| (Some(rx.filename), rx.data, None))
                     .collect()
             }),
             UploadProtocol::XmodemYmodem => crate::xmodem::xmodem_receive(
@@ -3723,7 +3754,7 @@ impl TelnetSession {
                 verbose,
             )
             .await
-            .map(|data| vec![(None, data)]),
+            .map(|(data, meta)| vec![(None, data, meta)]),
         };
         drop(writer_guard);
         let elapsed = start.elapsed();
@@ -3749,7 +3780,7 @@ impl TelnetSession {
         let mut saved: Vec<(String, usize)> = Vec::new();
         let mut skipped: Vec<(String, &'static str)> = Vec::new();
 
-        for (idx, (sender_name, data)) in uploads.iter().enumerate() {
+        for (idx, (sender_name, data, ymeta)) in uploads.iter().enumerate() {
             if idx == 0 {
                 // First file: user-entered filename, honor overwrite.
                 let mut opts = tokio::fs::OpenOptions::new();
@@ -3768,6 +3799,8 @@ impl TelnetSession {
                             return Ok(());
                         }
                         let _ = file.flush().await;
+                        drop(file);
+                        Self::apply_ymodem_meta(&filepath, ymeta.as_ref());
                         saved.push((filename.clone(), data.len()));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -3804,6 +3837,8 @@ impl TelnetSession {
                             continue;
                         }
                         let _ = file.flush().await;
+                        drop(file);
+                        Self::apply_ymodem_meta(&batch_path, ymeta.as_ref());
                         saved.push((name, data.len()));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -4119,6 +4154,28 @@ impl TelnetSession {
                 return Ok(());
             }
         };
+        // Best-effort fs metadata for the YMODEM block-0 modtime/mode
+        // fields (Forsberg §6.1).  Both are informational — if metadata
+        // lookup fails or the platform doesn't expose UNIX mode bits we
+        // pass `None` and the sender emits octal `0` in that slot.
+        let (file_modtime, file_mode) = match tokio::fs::metadata(&filepath).await {
+            Ok(m) => {
+                let modtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::MetadataExt;
+                    Some(m.mode())
+                };
+                #[cfg(not(unix))]
+                let mode: Option<u32> = None;
+                (modtime, mode)
+            }
+            Err(_) => (None, None),
+        };
 
         // Prompt the user to pick the transfer protocol for this download.
         // ESC at the prompt cancels the transfer.
@@ -4183,6 +4240,8 @@ impl TelnetSession {
                 Some(crate::xmodem::YmodemHeader {
                     filename: filename.to_string(),
                     size: file_size,
+                    modtime: file_modtime,
+                    mode: file_mode,
                 })
             } else {
                 None
@@ -14338,5 +14397,84 @@ mod tests {
             "received unexpected WONT ECHO reply (Q-method violation), out={:?}",
             out
         );
+    }
+
+    // ─── YMODEM block-0 metadata application ─────────────────
+
+    /// `apply_ymodem_meta` with `meta = None` must be a no-op — covers
+    /// the common XMODEM (no block 0) and ZMODEM paths so we don't
+    /// accidentally rewrite mtime/mode on every saved file.
+    #[test]
+    fn test_apply_ymodem_meta_none_is_noop() {
+        let tmp = std::env::temp_dir()
+            .join(format!("ymeta_none_{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"x").unwrap();
+        let before = std::fs::metadata(&tmp).unwrap();
+        // Brief sleep so any spurious modtime change is detectable.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        TelnetSession::apply_ymodem_meta(&tmp, None);
+        let after = std::fs::metadata(&tmp).unwrap();
+        assert_eq!(
+            before.modified().unwrap(),
+            after.modified().unwrap(),
+            "modtime must be unchanged when meta is None",
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Modtime application: when block-0 carried a timestamp, the
+    /// saved file's mtime should match (within whole-second resolution
+    /// — POSIX `utimes` is second-granular on most filesystems).
+    #[test]
+    fn test_apply_ymodem_meta_modtime() {
+        let tmp = std::env::temp_dir()
+            .join(format!("ymeta_mtime_{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"x").unwrap();
+        let target_secs: u64 = 1_500_000_000; // 2017-07-14 — clearly in the past
+        let meta = crate::xmodem::YmodemReceiveMeta {
+            size: Some(1),
+            modtime: Some(target_secs),
+            mode: None,
+        };
+        TelnetSession::apply_ymodem_meta(&tmp, Some(&meta));
+        let after = std::fs::metadata(&tmp).unwrap();
+        let actual = after
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(actual, target_secs, "modtime must match block-0 value");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Mode application is Unix-only; on Unix, the block-0 `mode`
+    /// field (already masked to 0o7777 by the parser) is masked
+    /// further to 0o777 by the apply path before reaching `chmod`.
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_ymodem_meta_mode_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir()
+            .join(format!("ymeta_mode_{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"x").unwrap();
+        // Start with mode 0o600.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let meta = crate::xmodem::YmodemReceiveMeta {
+            size: Some(1),
+            modtime: None,
+            // Pass setuid + 0o755; the apply mask (0o777) must drop
+            // setuid, giving us plain 0o755 on disk.  This guards
+            // against a malicious sender setting setuid bits on our
+            // saved files.
+            mode: Some(0o4755),
+        };
+        TelnetSession::apply_ymodem_meta(&tmp, Some(&meta));
+        let actual = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(actual, 0o755, "setuid bit must be stripped, perms preserved");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
