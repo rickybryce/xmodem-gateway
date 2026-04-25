@@ -863,6 +863,29 @@ where
             ZABORT => {
                 return Err("ZMODEM: sender aborted".into());
             }
+            ZSINIT => {
+                // Per Forsberg §11.3: sender announces its escape
+                // requirements (TESCCTL bit in ZF0) and its Attn
+                // sequence in a small ZDLE-escaped subpacket.  We
+                // must drain the subpacket and respond with ZACK,
+                // otherwise the sender stalls waiting for our reply.
+                // We don't act on the Attn sequence — it's only used
+                // by senders that want the receiver to interrupt them
+                // mid-stream, which isn't part of our use case.
+                let _ = read_subpacket(
+                    reader,
+                    is_tcp,
+                    &mut state,
+                    hdr.crc_kind,
+                    32, // ZATTNLEN cap per spec
+                )
+                .await;
+                send_zack(writer, is_tcp, 1, verbose).await?;
+                if verbose {
+                    glog!("ZMODEM recv: ACKed ZSINIT (escape-mode negotiation)");
+                }
+                continue;
+            }
             other => {
                 if verbose {
                     glog!("ZMODEM recv: ignoring header type 0x{:02X}", other);
@@ -1249,7 +1272,7 @@ pub(crate) async fn zmodem_send(
         let mut zfile_attempts: u32 = 0;
         let start_pos: u32;
         let mut skipped = false;
-        loop {
+        'zfile: loop {
             if zfile_attempts >= max_retries {
                 send_cancel(writer, is_tcp).await.ok();
                 return Err("ZMODEM: no ZRPOS from receiver".into());
@@ -1263,46 +1286,56 @@ pub(crate) async fn zmodem_send(
                 glog!("ZMODEM send: sent ZFILE + subpacket for '{}'", filename);
             }
 
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(frame_timeout),
-                read_header(reader, is_tcp, &mut state, verbose),
-            )
-            .await
-            {
-                Ok(Ok(h)) if h.frame == ZRPOS => {
-                    start_pos = h.position();
-                    break;
-                }
-                Ok(Ok(h)) if h.frame == ZSKIP => {
-                    // Receiver rejects this file (Forsberg §7) — skip
-                    // to the next one without sending ZDATA/ZEOF.
-                    if verbose {
-                        glog!(
-                            "ZMODEM send: receiver sent ZSKIP for '{}', skipping",
-                            filename
-                        );
+            // Drain stale ZRINITs queued by the receiver (lrzsz emits
+            // multiple at startup before processing our first ZFILE)
+            // without retransmitting — every ZFILE we send produces a
+            // matching ZRPOS/ZSKIP, and a duplicate would leak into the
+            // next file's exchange.  On a true timeout we fall through
+            // to the outer loop, which retransmits ZFILE.
+            loop {
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(frame_timeout),
+                    read_header(reader, is_tcp, &mut state, verbose),
+                )
+                .await
+                {
+                    Ok(Ok(h)) if h.frame == ZRPOS => {
+                        start_pos = h.position();
+                        break 'zfile;
                     }
-                    skipped = true;
-                    start_pos = 0;
-                    break;
-                }
-                Ok(Ok(h)) if h.frame == ZRINIT => {
-                    // Receiver wants us to re-send ZFILE.
-                    continue;
-                }
-                Ok(Ok(h)) if h.frame == ZABORT => {
-                    return Err("ZMODEM: receiver aborted".into());
-                }
-                Ok(Ok(h)) => {
-                    if verbose {
-                        glog!(
-                            "ZMODEM send: unexpected frame 0x{:02X} while awaiting ZRPOS",
-                            h.frame
-                        );
+                    Ok(Ok(h)) if h.frame == ZSKIP => {
+                        // Receiver rejects this file (Forsberg §7) —
+                        // skip to the next without sending ZDATA/ZEOF.
+                        if verbose {
+                            glog!(
+                                "ZMODEM send: receiver sent ZSKIP for '{}', skipping",
+                                filename
+                            );
+                        }
+                        skipped = true;
+                        start_pos = 0;
+                        break 'zfile;
                     }
-                    continue;
+                    Ok(Ok(h)) if h.frame == ZRINIT => {
+                        if verbose {
+                            glog!("ZMODEM send: draining stale ZRINIT after ZFILE");
+                        }
+                        continue;
+                    }
+                    Ok(Ok(h)) if h.frame == ZABORT => {
+                        return Err("ZMODEM: receiver aborted".into());
+                    }
+                    Ok(Ok(h)) => {
+                        if verbose {
+                            glog!(
+                                "ZMODEM send: unexpected frame 0x{:02X} while awaiting ZRPOS",
+                                h.frame
+                            );
+                        }
+                        continue 'zfile;
+                    }
+                    _ => continue 'zfile,
                 }
-                _ => continue,
             }
         }
 
@@ -2806,6 +2839,357 @@ mod tests {
 
         let new_after = std::fs::read(tmp.join("new_file.dat")).unwrap();
         assert_eq!(new_after, new_content);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: our sender → real `rz`, batch happy path ─
+    //
+    // Three files with shapes that hit different sender code paths:
+    // a sub-subpacket payload (single ZCRCE end-frame), an exact-1024
+    // payload (single ZCRCE at the boundary), and a multi-subpacket
+    // payload (ZCRCQ mid-frame ACK loop + final ZCRCE).  Validates
+    // that real lrzsz `rz` accepts our sender's frames in the most
+    // common production path — no `-p`, no `-y`, just batch receive.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_rz_basic_batch() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_basic_batch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let small = b"short text payload\n".to_vec();
+        let exact_1k: Vec<u8> =
+            (0..SUBPACKET_DATA_SIZE).map(|i| (i & 0xFF) as u8).collect();
+        let multi_1k: Vec<u8> = (0..SUBPACKET_DATA_SIZE * 3 + 17)
+            .map(|i| ((i.wrapping_mul(31)) & 0xFF) as u8)
+            .collect();
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let batch: [(&str, &[u8]); 3] = [
+            ("small.dat", &small),
+            ("exact_1k.dat", &exact_1k),
+            ("multi_1k.dat", &multi_1k),
+        ];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, true).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed");
+
+        assert_eq!(std::fs::read(tmp.join("small.dat")).unwrap(), small);
+        assert_eq!(std::fs::read(tmp.join("exact_1k.dat")).unwrap(), exact_1k);
+        assert_eq!(std::fs::read(tmp.join("multi_1k.dat")).unwrap(), multi_1k);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: live `sz` → our receiver ─────────────
+    //
+    // Counterpart to the static `test_lrzsz_replay_*` tests: those
+    // replay captured `sz` bytes through our receiver, which can't
+    // catch regressions where our receiver's response timing is now
+    // wrong (because the captured bytes don't depend on our replies).
+    // This drives a live `sz` subprocess, so any change to our
+    // ZRPOS/ZACK timing or ZRINIT scheduling shows up immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_sz_to_us_live() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_sz_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 16 KB so we cross multiple subpackets and exercise the
+        // mid-frame ZCRCQ ACK path on sz's side.
+        let payload: Vec<u8> = (0..16384u32)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
+        let payload_path = tmp.join("payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sz = Command::new("sz")
+            .arg("-b")
+            .arg("-q")
+            .arg("--disable-timeouts")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sz");
+
+        let mut sz_stdin = sz.stdin.take().unwrap();
+        let mut sz_stdout = sz.stdout.take().unwrap();
+
+        let recv_result = zmodem_receive(
+            &mut sz_stdout,
+            &mut sz_stdin,
+            false,
+            true,
+            |_, _, _| true,
+        )
+        .await;
+        let _ = sz.wait().await;
+        let received = recv_result.expect("zmodem_receive against sz failed");
+
+        assert_eq!(
+            received.len(),
+            1,
+            "sz with one file should produce a 1-entry batch"
+        );
+        assert_eq!(received[0].data, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: `rz -y` (force overwrite) ────────────
+    //
+    // Complements the `-p` (skip) test: `-y` is the opposite policy —
+    // accept and clobber.  Validates the sender's normal ZRPOS path
+    // when the receiver explicitly chooses to overwrite an existing
+    // file.  Different code path inside lrzsz from `-p`; would catch
+    // a regression that only shows up when rz reopens an existing
+    // file for write rather than declining via ZSKIP.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_rz_overwrite() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_overwrite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let old_content = b"OLD content -- this MUST be replaced";
+        std::fs::write(tmp.join("target.dat"), old_content).unwrap();
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-y") // yes: clobber any existing files with the same name
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let new_content = b"NEW content -- overwrite must succeed";
+        let batch: [(&str, &[u8]); 1] = [("target.dat", new_content)];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, true).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed");
+
+        let after = std::fs::read(tmp.join("target.dat")).unwrap();
+        assert_eq!(
+            after, new_content,
+            "rz -y should have overwritten target.dat with new content"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: `sz -e` (force-escape) → our receiver ─
+    //
+    // `sz -e` forces sz to ZDLE-escape control characters that aren't
+    // normally escaped (the `Zctlesc` toggle in lrzsz).  This stresses
+    // our receiver's `read_escaped_byte` path against the maximum-
+    // escaping version of a real sender, which the recorded-replay
+    // fixtures don't cover (they use sz's default escape set).  A
+    // payload of every byte 0..=255 forces every escapable byte to
+    // appear at least once.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_sz_force_escape() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("sz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("sz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_sz_force_escape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Every byte value, repeated enough times to span multiple
+        // subpackets — forces every escapable byte through the wire
+        // many times each.
+        let payload: Vec<u8> = (0..=255u8).cycle().take(8192).collect();
+        let payload_path = tmp.join("all_bytes.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let mut sz = Command::new("sz")
+            .arg("-b")
+            .arg("-e") // force-escape all control chars
+            .arg("-q")
+            .arg("--disable-timeouts")
+            .arg(&payload_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn sz -e");
+
+        let mut sz_stdin = sz.stdin.take().unwrap();
+        let mut sz_stdout = sz.stdout.take().unwrap();
+
+        let recv_result = zmodem_receive(
+            &mut sz_stdout,
+            &mut sz_stdin,
+            false,
+            true,
+            |_, _, _| true,
+        )
+        .await;
+        let _ = sz.wait().await;
+        let received = recv_result.expect("zmodem_receive against sz -e failed");
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── lrzsz interop: 1 MB payload through real `rz` ───────
+    //
+    // Our internal large-file round-trip uses 64 KB.  This drives a
+    // 1 MB pseudorandom payload through a real `rz` subprocess so we
+    // exercise lrzsz's actual buffering, ACK pacing (32 KB default
+    // bufsize), and disk I/O.  Multi-thread runtime so the OS-pipe
+    // I/O on rz's side doesn't starve our send loop.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn test_lrzsz_rz_large_file() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rz")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rz (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("zmodem_rz_large_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Deterministic 1 MB pseudorandom payload — using a tiny LCG
+        // so the test is reproducible without pulling in `rand`.
+        let size = 1 << 20;
+        let mut payload: Vec<u8> = Vec::with_capacity(size);
+        let mut rng: u32 = 0xDEAD_BEEF;
+        for _ in 0..size {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            payload.push((rng >> 16) as u8);
+        }
+
+        let mut rz = Command::new("rz")
+            .arg("-b")
+            .arg("-q")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rz");
+
+        let mut rz_stdin = rz.stdin.take().unwrap();
+        let mut rz_stdout = rz.stdout.take().unwrap();
+
+        let batch: [(&str, &[u8]); 1] = [("large.bin", &payload)];
+
+        let send_result =
+            zmodem_send(&mut rz_stdout, &mut rz_stdin, &batch, false, false).await;
+        let _ = rz.wait().await;
+        send_result.expect("zmodem_send against rz failed for 1 MB file");
+
+        let received = std::fs::read(tmp.join("large.bin")).unwrap();
+        assert_eq!(received.len(), payload.len(), "size mismatch");
+        assert_eq!(received, payload, "content mismatch");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
