@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>XMODEM Gateway — User Manual</title>
+<title>Vintage Gateway — User Manual</title>
 <style>
 @page {
     size: letter;
@@ -14,7 +14,7 @@
         color: #555;
     }
     @bottom-left {
-        content: "XMODEM Gateway — User Manual";
+        content: "Vintage Gateway — User Manual";
         font-family: Georgia, "DejaVu Serif", serif;
         font-size: 9pt;
         color: #555;
@@ -224,14 +224,15 @@ hr { border: 0; border-top: 1px solid #bbb; margin: 1em 0; }
 
 <!-- ═══════════════════ Cover ═══════════════════ -->
 <div class="cover">
-    <div class="title">XMODEM Gateway</div>
+    <div class="title">Vintage Gateway</div>
     <div class="subtitle">User Manual</div>
-    <div class="version">Version 0.3.3</div>
+    <div class="version">Version 0.4.0</div>
     <div class="author">Ricky Bryce</div>
     <div class="tag">
-        A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible
-        modem emulator, text-mode web browser, and AI chat client for retro
-        hardware — PETSCII, ANSI, and ASCII terminals.
+        A telnet/SSH file-transfer gateway, SSH proxy, Hayes-compatible
+        modem emulator, text-mode web browser, AI chat client, and weather
+        service for retro hardware — XMODEM, XMODEM-1K, YMODEM, and ZMODEM
+        over PETSCII, ANSI, and ASCII terminals.
     </div>
 </div>
 
@@ -294,7 +295,7 @@ hr { border: 0; border-top: 1px solid #bbb; margin: 1em 0; }
 <h1 id="ch1" class="no-break">1. Introduction</h1>
 
 <p>
-<strong>XMODEM Gateway</strong> is a standalone server written in Rust that bridges
+<strong>Vintage Gateway</strong> is a standalone server written in Rust that bridges
 retro hardware and modern networks. It accepts telnet and SSH connections, speaks
 the XMODEM / XMODEM-1K / YMODEM file-transfer protocols, emulates a Hayes AT
 modem on a physical serial port, proxies outbound connections to remote telnet
@@ -360,7 +361,7 @@ Commodore, ANSI escape sequences on modern terminals, and plain text on ASCII.
 <span class="label">Security notice</span>
 Telnet transmits all data, including passwords, in cleartext. The telnet
 interface is intended for <em>local or private network use only</em>. Use the
-SSH interface for anything leaving your LAN, and keep <code>xmodem.conf</code>
+SSH interface for anything leaving your LAN, and keep <code>vgateway.conf</code>
 at mode <code>0600</code> because it contains plaintext credentials.
 </aside>
 
@@ -374,13 +375,13 @@ The simplest installation on a modern Linux distribution is the pre-built
 AppImage that ships with every release:
 </p>
 
-<pre><code>chmod +x XMODEM_Gateway-x86_64.AppImage
-./XMODEM_Gateway-x86_64.AppImage</code></pre>
+<pre><code>chmod +x Vintage_Gateway-x86_64.AppImage
+./Vintage_Gateway-x86_64.AppImage</code></pre>
 
 <p>
 AppImages bundle their own libraries and run on any mainstream glibc-based
 distribution without installation. On first run the AppImage creates
-<code>xmodem.conf</code> in the current working directory.
+<code>vgateway.conf</code> in the current working directory.
 </p>
 
 <aside class="note">
@@ -388,7 +389,7 @@ distribution without installation. On first run the AppImage creates
 Each release publishes a SHA-256 checksum, an optional GPG signature, and a
 Sigstore keyless signature bound to the publisher's GitHub identity. Verify
 at least the SHA-256 before running any binary from the internet:
-<code>sha256sum -c xmodem-gateway-v0.3.3-…tar.gz.sha256</code>.
+<code>sha256sum -c vintage-gateway-v0.4.0-…tar.gz.sha256</code>.
 </aside>
 
 <h2 id="ch2-source">2.2 Building from Source</h2>
@@ -437,7 +438,7 @@ cmake --version</code></pre>
 <pre><code>cargo build --release</code></pre>
 
 <p>
-The resulting binary is at <code>target/release/xmodem-gateway</code>. The
+The resulting binary is at <code>target/release/vintage-gateway</code>. The
 first full build pulls a couple of hundred crates and may take 3–8 minutes
 depending on your machine; subsequent incremental builds are quick.
 </p>
@@ -458,26 +459,26 @@ plain-text rendering), <code>eframe</code> / <code>egui_extras</code>
 
 <p>
 A hardened unit file is bundled at
-<code>contrib/systemd/xmodem-gateway.service</code>. To install:
+<code>contrib/systemd/vintage-gateway.service</code>. To install:
 </p>
 
 <pre><code># Create a dedicated unprivileged service user
-sudo useradd --system --home-dir /var/lib/xmodem-gateway \
-             --shell /usr/sbin/nologin xmodem-gateway
-sudo install -d -m 0750 -o xmodem-gateway -g xmodem-gateway \
-             /var/lib/xmodem-gateway
+sudo useradd --system --home-dir /var/lib/vintage-gateway \
+             --shell /usr/sbin/nologin vintage-gateway
+sudo install -d -m 0750 -o vintage-gateway -g vintage-gateway \
+             /var/lib/vintage-gateway
 
 # Install the binary
-sudo install -m 0755 target/release/xmodem-gateway /usr/local/bin/
+sudo install -m 0755 target/release/vintage-gateway /usr/local/bin/
 
 # Install and enable the unit
-sudo install -m 0644 contrib/systemd/xmodem-gateway.service \
+sudo install -m 0644 contrib/systemd/vintage-gateway.service \
              /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now xmodem-gateway.service
+sudo systemctl enable --now vintage-gateway.service
 
 # Watch the log
-journalctl -u xmodem-gateway -f</code></pre>
+journalctl -u vintage-gateway -f</code></pre>
 
 <p>
 The unit ships with defensive hardening: <code>NoNewPrivileges</code>,
@@ -486,7 +487,7 @@ The unit ships with defensive hardening: <code>NoNewPrivileges</code>,
 <code>SystemCallFilter=@system-service</code>, an empty capability bounding
 set, a 512 MiB memory cap, and <code>TasksMax=256</code>. The service user
 has no shell, no home directory, and write access only to
-<code>/var/lib/xmodem-gateway</code>.
+<code>/var/lib/vintage-gateway</code>.
 </p>
 
 <p>
@@ -496,7 +497,7 @@ the <code>CapabilityBoundingSet=CAP_NET_BIND_SERVICE</code> and matching
 </p>
 
 <p>
-<code>systemctl reload xmodem-gateway</code> sends SIGHUP, which the binary
+<code>systemctl reload vintage-gateway</code> sends SIGHUP, which the binary
 handles as a graceful stop. Restart the service to pick up config changes.
 </p>
 
@@ -504,7 +505,7 @@ handles as a graceful stop. Restart the service to pick up config changes.
 <h1 id="ch3">3. First Run &amp; Configuration File</h1>
 
 <p>
-On the very first launch the gateway looks for <code>xmodem.conf</code> in the
+On the very first launch the gateway looks for <code>vgateway.conf</code> in the
 current working directory. If the file does not exist it is created with
 sensible defaults and a short log message is printed. On subsequent launches
 the file is read, every missing key is filled in with its default, and the file
@@ -513,11 +514,11 @@ is rewritten so that future editors see the full set of keys and comments.
 
 <aside class="note">
 <span class="label">Unix permissions</span>
-<code>xmodem.conf</code> holds plaintext credentials (telnet password, SSH
+<code>vgateway.conf</code> holds plaintext credentials (telnet password, SSH
 password, Groq API key). On Unix the file is set to mode <code>0600</code>
 (owner-only read/write) on every write. The same applies to
 <code>dialup.conf</code>, <code>gateway_hosts</code>,
-<code>xmodem_ssh_host_key</code>, and <code>xmodem_gateway_ssh_key</code>.
+<code>vintage_ssh_host_key</code>, and <code>vintage_gateway_ssh_key</code>.
 </aside>
 
 <h2>3.1 File Format</h2>
@@ -530,7 +531,7 @@ can annotate your own notes as needed. Boolean values accept
 <code>true</code> / <code>false</code> in any case.
 </p>
 
-<pre><code># XMODEM Gateway Configuration
+<pre><code># Vintage Gateway Configuration
 telnet_enabled = true
 telnet_port = 2323
 ssh_enabled  = false
@@ -661,7 +662,7 @@ used to be asked interactively at dial time:
 </p>
 
 <ul>
-    <li><strong>Telnet Gateway → Mode</strong> — dropdown with <em>Telnet</em> or <em>Raw TCP</em>. Telnet is the default and parses IAC in both directions; Raw TCP disables the entire IAC layer for destinations that don't speak telnet at all. Sets <code>telnet_gateway_raw</code> in <code>xmodem.conf</code>.</li>
+    <li><strong>Telnet Gateway → Mode</strong> — dropdown with <em>Telnet</em> or <em>Raw TCP</em>. Telnet is the default and parses IAC in both directions; Raw TCP disables the entire IAC layer for destinations that don't speak telnet at all. Sets <code>telnet_gateway_raw</code> in <code>vgateway.conf</code>.</li>
     <li><strong>Negotiate TTYPE / NAWS with remote</strong> — checkbox, enabled only when Mode is <em>Telnet</em>. Turn on when you dial real telnet servers that want cooperative option negotiation. Sets <code>telnet_gateway_negotiate</code>.</li>
     <li><strong>SSH Gateway → Auth</strong> — dropdown with <em>Key</em> or <em>Password</em>. Password is the default because it works out of the box with most remote accounts. When Key is selected the popup also displays the gateway's public key in a read-only text box below, ready to paste into the remote's <code>~/.ssh/authorized_keys</code>. Sets <code>ssh_gateway_auth</code>.</li>
 </ul>
@@ -720,7 +721,7 @@ required. The corresponding telnet-side pages live under
 
 <p>
 Each popup has its own <strong>Save</strong> button, which writes the current
-configuration to <code>xmodem.conf</code> <em>without restarting the server</em>.
+configuration to <code>vgateway.conf</code> <em>without restarting the server</em>.
 This is useful for changes that take effect on the next session — updating
 stored phone numbers, toggling verbose logging, or adjusting XMODEM timeouts —
 because no listener needs to be re-bound.
@@ -759,7 +760,7 @@ at 2000 lines.
 <p>
 The telnet server is on by default and listens on TCP port <strong>2323</strong>.
 Change the port via the GUI, the in-session <em>Configuration</em> menu, or by
-editing <code>telnet_port</code> in <code>xmodem.conf</code> and restarting.
+editing <code>telnet_port</code> in <code>vgateway.conf</code> and restarting.
 </p>
 
 <h2>5.1 Connecting</h2>
@@ -852,7 +853,7 @@ the telnet credentials, and exposes the same menu system as telnet.
 
 <p>
 Toggle the <em>SSH</em> checkbox in the GUI Server frame, or edit
-<code>xmodem.conf</code>:
+<code>vgateway.conf</code>:
 </p>
 
 <pre><code>ssh_enabled  = true
@@ -863,7 +864,7 @@ ssh_password = <em>pick-something-strong</em></code></pre>
 <p>
 Then click <em>Save and Restart Server</em>, or restart manually. On first
 start with SSH enabled, the gateway generates an Ed25519 host key and persists
-it to <code>xmodem_ssh_host_key</code> next to the binary (mode
+it to <code>vintage_ssh_host_key</code> next to the binary (mode
 <code>0600</code> on Unix). Subsequent starts reuse the same key so clients
 can verify the server's identity.
 </p>
@@ -879,7 +880,7 @@ your client's <code>~/.ssh/known_hosts</code> as usual.
 </p>
 
 <p>
-After authentication you land on the same XMODEM Gateway menu as a telnet
+After authentication you land on the same Vintage Gateway menu as a telnet
 user, rendered in ANSI terminal mode. All features — file transfer, SSH
 gateway, telnet gateway, browser, AI chat, modem emulator, weather — are
 available.
@@ -895,7 +896,7 @@ remote hosts — a separate concept.
 
 <aside class="warn">
 <span class="label">Plaintext credentials</span>
-SSH credentials in <code>xmodem.conf</code> are stored in plaintext. The SSH
+SSH credentials in <code>vgateway.conf</code> are stored in plaintext. The SSH
 connection itself is encrypted, but the file is not. Protect it with the
 <code>0600</code> permissions the gateway sets automatically, and do not
 reuse passwords from other services.
@@ -961,11 +962,11 @@ On Unix, every file the gateway writes that may contain secrets is set to mode
 </p>
 
 <ul>
-    <li><code>xmodem.conf</code> — telnet password, SSH password, Groq API key.</li>
+    <li><code>vgateway.conf</code> — telnet password, SSH password, Groq API key.</li>
     <li><code>dialup.conf</code> — no secrets, but dial-up mappings.</li>
     <li><code>gateway_hosts</code> — known host fingerprints for outbound SSH dials.</li>
-    <li><code>xmodem_ssh_host_key</code> — the SSH server's private host key.</li>
-    <li><code>xmodem_gateway_ssh_key</code> — the gateway's outbound SSH client key.</li>
+    <li><code>vintage_ssh_host_key</code> — the SSH server's private host key.</li>
+    <li><code>vintage_gateway_ssh_key</code> — the gateway's outbound SSH client key.</li>
 </ul>
 
 <p>
@@ -1171,7 +1172,7 @@ in-band command byte, and serial streams aren't subject to NVT rules.
 If the auto default is wrong for your client — the most visible symptom is
 consistent block-CRC failures in one direction — press <span class="kbd">I</span>
 on the File Transfer menu to flip both transforms and retry. The choice is
-session-local; it isn't persisted to <code>xmodem.conf</code>, so the next
+session-local; it isn't persisted to <code>vgateway.conf</code>, so the next
 connection from the same terminal type gets the same auto default again.
 </p>
 
@@ -1199,7 +1200,7 @@ its frame-based protocol has different cadence requirements.
 Each key can be changed from the telnet <em>Configuration &rarr; F
 File Transfer &rarr; X / Y / Z</em> menus, from the GUI <em>File
 Transfer &rarr; More&#8230;</em> popup, or by editing
-<code>xmodem.conf</code> directly. Changes take effect on the next
+<code>vgateway.conf</code> directly. Changes take effect on the next
 file transfer — no restart required.
 </p>
 
@@ -1308,7 +1309,7 @@ The emulator routes dial strings over TCP. There is no real phone line — the
     <thead><tr><th>Command</th><th>Action</th></tr></thead>
     <tbody>
         <tr><td><code>ATDT host:port</code></td><td>Connect to a remote telnet server. <code>ATDT</code> and <code>ATDP</code> are equivalent (there is no audible difference over TCP).</td></tr>
-        <tr><td><code>ATDT xmodem-gateway</code></td><td>Built-in shortcut — dials this gateway's own main menu, so the serial device can use all gateway features (file transfer, browser, AI chat, etc.) without a network detour.</td></tr>
+        <tr><td><code>ATDT vintage-gateway</code></td><td>Built-in shortcut — dials this gateway's own main menu, so the serial device can use all gateway features (file transfer, browser, AI chat, etc.) without a network detour.</td></tr>
         <tr><td><code>ATDP host:port</code></td><td>Same as <code>ATDT</code> — pulse selector, ignored.</td></tr>
         <tr><td><code>ATDSn</code> (n = 0–3)</td><td>Dial stored number in slot <em>n</em>. Bare <code>ATDS</code> dials slot 0.</td></tr>
         <tr><td><code>ATDL</code></td><td>Redial the last number.</td></tr>
@@ -1341,7 +1342,7 @@ skips modifier processing for everything except the trailing <code>;</code>.
 
 <h3>9.2.1 Examples</h3>
 
-<pre><code>ATDT xmodem-gateway
+<pre><code>ATDT vintage-gateway
 CONNECT 9600
 <em>(local gateway main menu appears)</em>
 
@@ -1370,7 +1371,7 @@ ATDT 5551234
 The gateway also maintains <code>dialup.conf</code>, which maps phone numbers
 to <code>host:port</code> targets. Edit it through the Modem Emulator menu's
 <em>D</em> submenu. A built-in entry, <code>1001000</code>, always maps to
-the local gateway menu (equivalent to <code>ATDT xmodem-gateway</code>) and
+the local gateway menu (equivalent to <code>ATDT vintage-gateway</code>) and
 cannot be deleted. Numbers are matched by digits only — dashes, spaces,
 and parentheses are ignored — so <code>555-1234</code> and <code>5551234</code>
 hit the same entry.
@@ -1381,14 +1382,14 @@ hit the same entry.
 <table>
     <thead><tr><th>Command</th><th>Response</th></tr></thead>
     <tbody>
-        <tr><td><code>ATI</code> / <code>ATI0</code></td><td>Product ID and version: <code>XMODEM Gateway Modem Emulator v0.3.3</code></td></tr>
+        <tr><td><code>ATI</code> / <code>ATI0</code></td><td>Product ID and version: <code>Vintage Gateway Modem Emulator v0.4.0</code></td></tr>
         <tr><td><code>ATI1</code></td><td>ROM checksum: <code>000</code> (virtual)</td></tr>
         <tr><td><code>ATI2</code></td><td>ROM self-test: <code>OK</code></td></tr>
-        <tr><td><code>ATI3</code></td><td>Firmware identifier: <code>XMODEM Gateway 0.3.3</code></td></tr>
+        <tr><td><code>ATI3</code></td><td>Firmware identifier: <code>Vintage Gateway 0.3.3</code></td></tr>
         <tr><td><code>ATI4</code></td><td>Product description: <code>Hayes-compatible virtual modem over TCP</code></td></tr>
         <tr><td><code>ATI5</code></td><td>OEM / country code: <code>B00</code></td></tr>
         <tr><td><code>ATI6</code></td><td>Link diagnostics: <code>No link diagnostics available</code></td></tr>
-        <tr><td><code>ATI7</code></td><td>Product info: <code>Product: xmodem-gateway (software emulator)</code></td></tr>
+        <tr><td><code>ATI7</code></td><td>Product info: <code>Product: vintage-gateway (software emulator)</code></td></tr>
     </tbody>
 </table>
 
@@ -1397,9 +1398,9 @@ hit the same entry.
 <table>
     <thead><tr><th>Command</th><th>Action</th></tr></thead>
     <tbody>
-        <tr><td><code>ATZ</code></td><td>Reset to the stored profile (read from <code>xmodem.conf</code>). Drops any active connection.</td></tr>
+        <tr><td><code>ATZ</code></td><td>Reset to the stored profile (read from <code>vgateway.conf</code>). Drops any active connection.</td></tr>
         <tr><td><code>AT&amp;F</code></td><td>Factory reset to gateway-friendly defaults. Does <em>not</em> overwrite the stored profile.</td></tr>
-        <tr><td><code>AT&amp;W</code></td><td>Save current settings to <code>xmodem.conf</code>. Persists echo, verbose, quiet, all 27 S-registers, <code>X</code>, <code>&amp;C</code>, <code>&amp;D</code>, <code>&amp;K</code>, and the four stored-number slots.</td></tr>
+        <tr><td><code>AT&amp;W</code></td><td>Save current settings to <code>vgateway.conf</code>. Persists echo, verbose, quiet, all 27 S-registers, <code>X</code>, <code>&amp;C</code>, <code>&amp;D</code>, <code>&amp;K</code>, and the four stored-number slots.</td></tr>
         <tr><td><code>AT&amp;V</code></td><td>Display current configuration — one line of mode flags, a second line listing every S-register, and a third line listing stored numbers.</td></tr>
     </tbody>
 </table>
@@ -1488,7 +1489,7 @@ carrier" option.
 <p>
 Query with <code>ATSn?</code>, set with <code>ATSn=v</code>. Values are 0–255.
 <code>ATS?</code> prints a help table. <code>AT&amp;W</code> saves all 27
-values to <code>xmodem.conf</code>; <code>ATZ</code> restores them from the
+values to <code>vgateway.conf</code>; <code>ATZ</code> restores them from the
 stored profile; <code>AT&amp;F</code> resets to factory defaults.
 </p>
 
@@ -1560,8 +1561,8 @@ Telnet and SSH users can simulate an incoming phone call to the serial device
 from the Modem Emulator menu (<span class="kbd">I</span> — Ring emulator).
 The modem sends <code>RING</code> to the serial port at standard US cadence
 (every 6 seconds). After <code>S0</code> rings (default 5) the modem
-auto-answers and the serial device receives the XMODEM Gateway main menu,
-just as if it had dialled in with <code>ATDT xmodem-gateway</code>. The
+auto-answers and the serial device receives the Vintage Gateway main menu,
+just as if it had dialled in with <code>ATDT vintage-gateway</code>. The
 serial device can also answer manually with <code>ATA</code> during ringing.
 </p>
 
@@ -1610,7 +1611,7 @@ other, so auth failures are unambiguous:
 
 <ul>
     <li><strong>Password</strong> — the gateway asks for the remote account's password after the username prompt. Works with any SSH server that allows password auth.</li>
-    <li><strong>Key</strong> — the gateway offers its own Ed25519 keypair (<code>xmodem_gateway_ssh_key</code>, generated on first use and persisted at mode <code>0600</code>). The remote must have the matching public half in <code>~/.ssh/authorized_keys</code> first. The public key is shown in the GUI's Server &rarr; More popup when Auth is set to Key; you can also extract it on the command line with <code>ssh-keygen -y -f xmodem_gateway_ssh_key</code>.</li>
+    <li><strong>Key</strong> — the gateway offers its own Ed25519 keypair (<code>vintage_gateway_ssh_key</code>, generated on first use and persisted at mode <code>0600</code>). The remote must have the matching public half in <code>~/.ssh/authorized_keys</code> first. The public key is shown in the GUI's Server &rarr; More popup when Auth is set to Key; you can also extract it on the command line with <code>ssh-keygen -y -f vintage_gateway_ssh_key</code>.</li>
 </ul>
 
 <p>
@@ -1652,8 +1653,8 @@ for PETSCII and 80&times;24 for ANSI/ASCII.
     <thead><tr><th>File</th><th>Role</th><th>Analogous to</th></tr></thead>
     <tbody>
         <tr><td><code>gateway_hosts</code></td><td>Remote host fingerprints accepted by the SSH Gateway.</td><td><code>~/.ssh/known_hosts</code></td></tr>
-        <tr><td><code>xmodem_ssh_host_key</code></td><td>Host key the SSH <em>server</em> presents to incoming clients.</td><td><code>/etc/ssh/ssh_host_ed25519_key</code></td></tr>
-        <tr><td><code>xmodem_gateway_ssh_key</code></td><td>Outbound SSH client keypair used for pubkey auth to remote hosts.</td><td><code>~/.ssh/id_ed25519</code></td></tr>
+        <tr><td><code>vintage_ssh_host_key</code></td><td>Host key the SSH <em>server</em> presents to incoming clients.</td><td><code>/etc/ssh/ssh_host_ed25519_key</code></td></tr>
+        <tr><td><code>vintage_gateway_ssh_key</code></td><td>Outbound SSH client keypair used for pubkey auth to remote hosts.</td><td><code>~/.ssh/id_ed25519</code></td></tr>
     </tbody>
 </table>
 
@@ -1768,7 +1769,7 @@ in the terminal. It is free to use — you need a Groq account and an API key
 <ol>
     <li>Go to <code>https://console.groq.com/keys</code> and create a free account.</li>
     <li>Generate an API key. It starts with <code>gsk_</code>.</li>
-    <li>In the GUI, paste the key into the <em>API Key</em> field (it displays as dots), or edit <code>xmodem.conf</code> and set <code>groq_api_key = gsk_your_key_here</code>.</li>
+    <li>In the GUI, paste the key into the <em>API Key</em> field (it displays as dots), or edit <code>vgateway.conf</code> and set <code>groq_api_key = gsk_your_key_here</code>.</li>
     <li>Save. No restart needed.</li>
 </ol>
 
@@ -1886,7 +1887,7 @@ any US ZIP code. Data is pulled from Open-Meteo
 
 <p>
 The last-used ZIP is persisted to <code>weather_zip</code> in
-<code>xmodem.conf</code> so subsequent calls default to the same location.
+<code>vgateway.conf</code> so subsequent calls default to the same location.
 </p>
 
 <!-- ═══════════════════ 15. Signals ═══════════════════ -->
@@ -1926,11 +1927,11 @@ When a signal arrives:
 
 <h2>15.2 Under systemd</h2>
 
-<pre><code>sudo systemctl status xmodem-gateway   # current status
-journalctl -u xmodem-gateway -f        # live log
-sudo systemctl reload xmodem-gateway   # graceful stop (SIGHUP)
-sudo systemctl restart xmodem-gateway  # restart
-sudo systemctl stop xmodem-gateway     # stop (SIGTERM)</code></pre>
+<pre><code>sudo systemctl status vintage-gateway   # current status
+journalctl -u vintage-gateway -f        # live log
+sudo systemctl reload vintage-gateway   # graceful stop (SIGHUP)
+sudo systemctl restart vintage-gateway  # restart
+sudo systemctl stop vintage-gateway     # stop (SIGTERM)</code></pre>
 
 <p>
 The unit's <code>Restart=on-failure</code> policy respawns the process if it
@@ -1970,7 +1971,7 @@ telnet and SSH — retrying on the other protocol will not reset the counter.
 <h2>16.4 File Transfer Times Out</h2>
 
 <p>
-Turn on verbose mode (<code>verbose = true</code> in <code>xmodem.conf</code>,
+Turn on verbose mode (<code>verbose = true</code> in <code>vgateway.conf</code>,
 or the <em>Verbose Transfer Logging</em> checkbox in the GUI General frame)
 and retry. The log will show every header byte, every CRC result, every
 timeout, tagged with the protocol (<code>XMODEM recv:</code>,
@@ -1991,7 +1992,7 @@ timeout, tagged with the protocol (<code>XMODEM recv:</code>,
     <li>Check <code>ssh_enabled = true</code> and that the server has been restarted since the change.</li>
     <li>Confirm the port with <code>ss -tlnp | grep 2222</code> on Linux.</li>
     <li>On first connect, accept the gateway's host-key fingerprint. Your client records it in <code>~/.ssh/known_hosts</code>.</li>
-    <li>If your client complains about host-key mismatch, you have probably regenerated <code>xmodem_ssh_host_key</code>. Delete the old entry from <code>known_hosts</code> or compare fingerprints carefully.</li>
+    <li>If your client complains about host-key mismatch, you have probably regenerated <code>vintage_ssh_host_key</code>. Delete the old entry from <code>known_hosts</code> or compare fingerprints carefully.</li>
     <li>Public-key auth against the <em>server</em> is not supported — only password auth. Public-key auth is only available on the <em>outbound</em> SSH Gateway.</li>
 </ul>
 
@@ -2025,7 +2026,7 @@ automatically on timeout. Within 60 seconds your old settings come back.
 <h1 id="appA">Appendix A — Configuration Key Reference</h1>
 
 <p>
-Every key recognised by <code>xmodem.conf</code>, sorted alphabetically. The
+Every key recognised by <code>vgateway.conf</code>, sorted alphabetically. The
 parser is case-sensitive on keys but booleans (<code>true</code>/<code>false</code>)
 are compared case-insensitively. Unknown keys are silently ignored. Out-of-range
 numeric values fall back to the default.
@@ -2102,7 +2103,7 @@ commands may be combined on a single <code>AT</code> line (e.g.
         <tr><td><code>AT?</code></td><td>Display AT command help.</td></tr>
         <tr><td><code>ATZ</code></td><td>Reset to stored profile (saved by <code>AT&amp;W</code>).</td></tr>
         <tr><td><code>AT&amp;F</code></td><td>Factory reset to gateway-friendly defaults.</td></tr>
-        <tr><td><code>AT&amp;W</code> / <code>AT&amp;W0</code></td><td>Save current settings to <code>xmodem.conf</code>.</td></tr>
+        <tr><td><code>AT&amp;W</code> / <code>AT&amp;W0</code></td><td>Save current settings to <code>vgateway.conf</code>.</td></tr>
         <tr><td><code>AT&amp;V</code></td><td>Display current configuration.</td></tr>
         <tr><td><code>ATH</code> / <code>ATH0</code></td><td>Hang up any active connection.</td></tr>
         <tr><td><code>ATA</code></td><td>Answer incoming ring.</td></tr>
@@ -2172,7 +2173,7 @@ commands may be combined on a single <code>AT</code> line (e.g.
         <tr><td><code>ATD <em>target</em></code></td><td>Dial <em>target</em>. Bare <code>D</code> (no T/P).</td></tr>
         <tr><td><code>ATDT <em>host:port</em></code></td><td>Tone-dial. Default for all TCP dials.</td></tr>
         <tr><td><code>ATDP <em>host:port</em></code></td><td>Pulse-dial (identical to <code>ATDT</code> over TCP).</td></tr>
-        <tr><td><code>ATDT xmodem-gateway</code></td><td>Built-in shortcut: connect to this gateway's main menu.</td></tr>
+        <tr><td><code>ATDT vintage-gateway</code></td><td>Built-in shortcut: connect to this gateway's main menu.</td></tr>
         <tr><td><code>ATDL</code></td><td>Redial last number.</td></tr>
         <tr><td><code>ATDS</code> / <code>ATDS0</code></td><td>Dial stored number in slot 0.</td></tr>
         <tr><td><code>ATDS1</code> … <code>ATDS3</code></td><td>Dial stored number in slots 1–3.</td></tr>
@@ -2221,7 +2222,7 @@ run to completion rather than halt mid-setup with <code>ERROR</code>.
 <hr>
 
 <p class="small" style="margin-top: 1.5em; text-align: center;">
-XMODEM Gateway v0.3.3 &mdash; Copyright &copy; 2026 Ricky Bryce &mdash;
+Vintage Gateway v0.4.0 &mdash; Copyright &copy; 2026 Ricky Bryce &mdash;
 Licensed under GPL-3.0-or-later.
 </p>
 

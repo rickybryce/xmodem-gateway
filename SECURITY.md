@@ -3,7 +3,7 @@
 ## Supported Versions
 
 Security fixes are applied to the latest released version of
-**xmodem-gateway**.  Older versions do not receive patches; please
+**vintage-gateway**.  Older versions do not receive patches; please
 upgrade before reporting.
 
 | Version | Supported |
@@ -19,10 +19,10 @@ Instead, choose one of:
 
 1. **GitHub Security Advisories (preferred).**  Open a private report
    at
-   [github.com/rbryce/xmodem-gateway/security/advisories/new](https://github.com/rbryce/xmodem-gateway/security/advisories/new).
+   [github.com/rickybryce/vintage-gateway/security/advisories/new](https://github.com/rickybryce/vintage-gateway/security/advisories/new).
    This keeps the details confidential until a fix is ready.
 2. **Email.**  Send a description to `rbryce@nevco.com` with the subject
-   line `xmodem-gateway security`.  If the issue is sensitive, you may
+   line `vintage-gateway security`.  If the issue is sensitive, you may
    encrypt the body with my public GPG key — the fingerprint is
    published in the signed release artifacts (see
    [README → Verifying Releases](README.md#verifying-releases)).
@@ -51,7 +51,7 @@ Please include:
 
 In scope:
 
-- The xmodem-gateway binary itself.
+- The vintage-gateway binary itself.
 - Protocol handling (telnet, SSH, XMODEM, Hayes AT emulator).
 - Configuration parsing and on-disk credential storage.
 - Build scripts and release artifacts.
@@ -60,7 +60,7 @@ Out of scope:
 
 - Vulnerabilities in upstream dependencies — please report those to the
   upstream project.  If the dependency's advisory warrants a patched
-  version of xmodem-gateway, file it here as "upgrade X to Y" and I'll
+  version of vintage-gateway, file it here as "upgrade X to Y" and I'll
   ship a release.
 - Attacks that require physical access to the server machine.
 - Social-engineering the operator into accepting a bad host key (the
@@ -69,8 +69,8 @@ Out of scope:
 
 ## Security Model Snapshot
 
-- **Sensitive files** (`xmodem.conf`, `dialup.conf`, `gateway_hosts`,
-  `xmodem_ssh_host_key`, `xmodem_gateway_ssh_key`) are written with
+- **Sensitive files** (`vgateway.conf`, `dialup.conf`, `gateway_hosts`,
+  `vintage_ssh_host_key`, `vintage_gateway_ssh_key`) are written with
   mode `0o600` on Unix.  Windows users should place the binary in a
   per-user folder for equivalent NTFS ACL protection.
 - **Credential comparison** is constant-time on both telnet and SSH.

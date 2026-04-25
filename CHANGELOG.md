@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **xmodem-gateway** are documented in this file.
+All notable changes to **vintage-gateway** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -8,6 +8,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 _No unreleased changes._
+
+## [0.4.0] - 2026-04-25
+
+### Changed
+
+#### Project rename: XMODEM Gateway → Vintage Gateway
+- The product is now **Vintage Gateway**. The original name no longer
+  reflected the scope (SSH, web browser, AI chat, weather, modem
+  emulator, gateway proxies — only one of which is XMODEM).
+  Functionality is unchanged; this is purely a naming refresh.
+- Cargo package renamed `xmodem-gateway` → `vintage-gateway`.
+- GitHub repository moved to
+  [`rickybryce/vintage-gateway`](https://github.com/rickybryce/vintage-gateway).
+- Configuration file renamed `xmodem.conf` → `vgateway.conf`.
+- SSH host key file renamed `xmodem_ssh_host_key` → `vintage_ssh_host_key`.
+- Outbound SSH gateway client key renamed `xmodem_gateway_ssh_key` →
+  `vintage_gateway_ssh_key`.
+- AppImage renamed `XMODEM_Gateway-x86_64.AppImage` →
+  `Vintage_Gateway-x86_64.AppImage`.
+- systemd unit renamed `xmodem-gateway.service` → `vintage-gateway.service`.
+- Telnet menu prompt path renamed `xmodem> ` → `vintage> ` (and all
+  sub-paths: `vintage/xfer`, `vintage/web`, `vintage/config/...`).
+- Hayes dial shortcut: `ATDT xmodem-gateway` → `ATDT vintage-gateway`
+  (the `1001000` shortcut number is unchanged).
+- HTTP browser User-Agent: `XmodemGateway/1.0` → `VintageGateway/1.0`.
+
+**Migration**: existing deployments that want to preserve identity should
+rename `xmodem.conf` → `vgateway.conf` and `xmodem_ssh_host_key` →
+`vintage_ssh_host_key` (and the gateway client key) before first start.
+Otherwise the gateway will create fresh files and SSH clients will see a
+"host key changed" warning.
+
+#### GUI refresh
+- New logo (`vintagelogo.png`, 1774×887, 2:1 aspect ratio) displayed at
+  366×183 with trilinear (mipmap) texture filtering for clean
+  downscaling.
+- Window/panel background darkened from `#050E1A` to `#000510` to match
+  the new logo's deep-navy backdrop.
+
+### Added
+
+#### ZMODEM polish (continuation of 0.3.5 work)
+- **`ZRINIT` drain**: receiver now consumes the trailing ZRINIT/handshake
+  bytes some senders (notably lrzsz `sz`) emit before they go quiet.
+  Eliminates a 5-second stall at the end of a successful ZMODEM receive.
+- **`ZSINIT` handler** on receive — sender-supplied attention/escape
+  configuration is parsed and ack'd per Forsberg §11.5, so senders that
+  block waiting for the ACK now proceed.
+- **lrzsz interop suite**: 13 captured-wire replay fixtures (tiny / exact-
+  1 KB / all-bytes / 2-file batch / ZSKIP / aborted-mid-batch) plus two
+  `#[ignore]` subprocess tests that drive real `sz` / `rz` end-to-end.
+
+#### XMODEM/YMODEM/ZMODEM compliance pass
+- **CAN×2 abort handling** per Forsberg's recommendation: a single CAN is
+  no longer treated as an abort; two consecutive CANs (with no
+  intervening data) are required. Routes through a shared
+  `is_can_abort` helper so all three protocols agree.
+- **Spec-citation tests** (63 new tests across the four files) that
+  reference exact section numbers in the Forsberg specs and validate
+  edge-case behavior (block-zero NAK retry, zero-length payloads,
+  trailing-`SUB` preservation, etc.).
+- **YMODEM maximal compliance** — full Forsberg §6.1 block-0 metadata
+  (filename, size, mtime, mode, serial number) is parsed on receive and
+  applied (mtime + mode) on save. Send path emits the same set.
+
+#### End-to-end test infrastructure
+- **Binary-level e2e test** (`tests/binary_e2e.rs`): launches the actual
+  release binary as a subprocess, drives the telnet UI through the web
+  browser flow against a hermetic localhost HTTP server, and asserts on
+  the rendered output. Catches integration regressions that unit tests
+  alone miss.
+- **Hermetic e2e tests** for the HTTP and Gopher browsers: spin up
+  loopback servers, run the parser/renderer end-to-end, assert on
+  PETSCII/ANSI/ASCII rendering invariants.
+
+### Fixed
+
+- Logo rendering aspect ratio is now correct after the asset swap.
+  Previously the new 2:1 logo was being squashed into a 1.6:1 box.
+
+### Tests
+
+- Total: **719** unit + proptest tests (718 lib + 1 binary e2e), 0
+  failed, 15 ignored. All green on Linux / macOS / Windows.
 
 ## [0.3.5] - 2026-04-23
 
@@ -84,7 +168,7 @@ _No unreleased changes._
 - **Gateway Configuration menu** at `Configuration → G` in the telnet
   session: toggles the outbound Telnet mode (Telnet / Raw TCP) and the
   outbound SSH auth mode (Key / Password) at runtime, persists to
-  `xmodem.conf`, and takes effect on the next gateway connection with no
+  `vgateway.conf`, and takes effect on the next gateway connection with no
   server restart. Replaces the per-connection interactive prompts that
   used to live inside the Telnet Gateway and SSH Gateway flows.
 - **Config key `ssh_gateway_auth`** (`"key"` or `"password"`, default
@@ -180,7 +264,7 @@ _No unreleased changes._
 - **Raw-TCP escape hatch** (`telnet_gateway_raw = true`): bypasses the
   telnet IAC layer entirely for destinations that aren't really telnet.
   Toggleable live from the Telnet Gateway menu with the **T** key; choice
-  persists to `xmodem.conf`.
+  persists to `vgateway.conf`.
 - **8 KiB subnegotiation body cap**: malicious remotes cannot exhaust
   memory by sending huge `SB` bodies without a terminating `IAC SE`.
 - **Property-based fuzz test** (`qmethod_proptest`) covers the full Q-method
@@ -189,7 +273,7 @@ _No unreleased changes._
 
 #### Outgoing SSH Gateway
 - **Public-key authentication** with auto-generated Ed25519 client keypair
-  (`xmodem_gateway_ssh_key`, 0o600 on Unix). Tried before password; on
+  (`vintage_gateway_ssh_key`, 0o600 on Unix). Tried before password; on
   acceptance, the password prompt is skipped entirely.
 - **"Show gateway public key" menu**: press **K** at the SSH Gateway
   menu to display the one-line OpenSSH-format public key for pasting
@@ -227,8 +311,8 @@ _No unreleased changes._
   blocked for 5 minutes across both protocols — an attacker can't bounce
   between them to reset the counter.
 - **0o600 file permissions on Unix** for all sensitive files:
-  `xmodem.conf`, `dialup.conf`, `gateway_hosts`, `xmodem_ssh_host_key`,
-  `xmodem_gateway_ssh_key`.
+  `vgateway.conf`, `dialup.conf`, `gateway_hosts`, `vintage_ssh_host_key`,
+  `vintage_gateway_ssh_key`.
 - **Per-PID temporary filenames** for atomic config writes; closes a
   TOCTOU window on shared working directories.
 - **`save_config` now acquires the `CONFIG` mutex before disk write**,
@@ -278,8 +362,11 @@ _No unreleased changes._
 - Windows build fix for `GetDiskFreeSpaceExW`.
 - S-register persistence via `AT&W`.
 
-[Unreleased]: https://github.com/rbryce/xmodem-gateway/compare/v0.3.3...HEAD
-[0.3.3]: https://github.com/rbryce/xmodem-gateway/releases/tag/v0.3.3
-[0.3.2]: https://github.com/rbryce/xmodem-gateway/releases/tag/v0.3.2
-[0.3.1]: https://github.com/rbryce/xmodem-gateway/releases/tag/v0.3.1
-[0.3.0]: https://github.com/rbryce/xmodem-gateway/releases/tag/v0.3.0
+[Unreleased]: https://github.com/rickybryce/vintage-gateway/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.4.0
+[0.3.5]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.5
+[0.3.4]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.4
+[0.3.3]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.3
+[0.3.2]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.2
+[0.3.1]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.1
+[0.3.0]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.0

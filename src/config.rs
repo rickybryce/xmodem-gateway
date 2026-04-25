@@ -1,6 +1,6 @@
 //! Configuration file management.
 //!
-//! Reads/writes a simple key=value config file (`xmodem.conf`). If the file
+//! Reads/writes a simple key=value config file (`vgateway.conf`). If the file
 //! does not exist at startup it is created with sensible defaults. Unknown
 //! keys are silently ignored; missing keys are filled with defaults and the
 //! file is rewritten.
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::logger::glog;
 
 /// Name of the configuration file (lives next to the binary).
-pub const CONFIG_FILE: &str = "xmodem.conf";
+pub const CONFIG_FILE: &str = "vgateway.conf";
 
 // ─── Defaults ──────────────────────────────────────────────
 const DEFAULT_TELNET_ENABLED: bool = true;
@@ -105,7 +105,7 @@ const DEFAULT_SSH_PASSWORD: &str = "changeme";
 /// public key on the remote's `~/.ssh/authorized_keys`.
 const DEFAULT_SSH_GATEWAY_AUTH: &str = "password";
 
-/// Runtime configuration loaded from `xmodem.conf`.
+/// Runtime configuration loaded from `vgateway.conf`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Enable the telnet server. Set to false for SSH-only access.
@@ -546,7 +546,7 @@ pub fn save_config(cfg: &Config) {
 fn write_config_file(path: &str, cfg: &Config) {
     let content = format!(
         "\
-# XMODEM Gateway Configuration
+# Vintage Gateway Configuration
 #
 # This file is auto-generated if it does not exist.
 # Edit values below to customise the server.
@@ -685,7 +685,7 @@ ssh_password = {}
 # proxies to a remote SSH server).  Values:
 #   key      — use the gateway's built-in Ed25519 client key.  Copy the
 #              public half (shown in the GUI Server > More popup, or
-#              extract with `ssh-keygen -y -f xmodem_gateway_ssh_key`)
+#              extract with `ssh-keygen -y -f vintage_gateway_ssh_key`)
 #              into the remote's ~/.ssh/authorized_keys first.
 #   password — prompt the operator for the remote account's password on
 #              each connect.  No key is offered.
@@ -1614,7 +1614,7 @@ mod tests {
     }
 
     /// When zmodem keys are absent from the file, defaults kick in.
-    /// Covers the rollout case where an existing xmodem.conf predates
+    /// Covers the rollout case where an existing vgateway.conf predates
     /// the zmodem_* additions.
     #[test]
     fn test_read_config_missing_zmodem_keys_fall_back_to_defaults() {

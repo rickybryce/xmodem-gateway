@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>XMODEM Gateway v0.3.5 &mdash; User Manual</title>
-    <meta name="description" content="Complete user manual for XMODEM Gateway — a telnet/SSH gateway server with XMODEM file transfer, AI chat, web browser, weather, and serial modem emulation.">
+    <title>Vintage Gateway v0.4.0 &mdash; User Manual</title>
+    <meta name="description" content="Complete user manual for Vintage Gateway — a telnet/SSH gateway server with XMODEM file transfer, AI chat, web browser, weather, and serial modem emulation.">
     <style>
         :root {
             --green: #33ff33;
@@ -515,11 +515,11 @@
         <header class="site-header">
             <div class="header-photos">
                 <img src="ricky.png" alt="Author: Ricky Bryce" class="sysop-photo">
-                <img src="xmodemlogo.png" alt="XMODEM Gateway" class="logo-photo">
+                <img src="vintagelogo.png" alt="Vintage Gateway" class="logo-photo">
             </div>
-            <h1>XMODEM Gateway</h1>
+            <h1>Vintage Gateway</h1>
             <p class="hdr-tagline">User Manual</p>
-            <div class="hdr-version">v0.3.5</div>
+            <div class="hdr-version">v0.4.0</div>
             <div class="hdr-badges">
                 <span class="hdr-badge">Telnet</span>
                 <span class="hdr-badge">SSH</span>
@@ -557,7 +557,7 @@
             <div class="section" id="overview">
                 <div class="section-title">Overview</div>
                 <p>
-                    XMODEM Gateway is a standalone, retro-themed server written in Rust
+                    Vintage Gateway is a standalone, retro-themed server written in Rust
                     that bridges vintage and modern computing. It provides telnet and
                     SSH access to a full-featured gateway with XMODEM file transfer,
                     SSH and telnet proxying, an AI chat client, a text-mode web browser,
@@ -566,13 +566,13 @@
                 <p class="dim-text">
                     Designed to work with hardware as old as the Commodore 64 and CP/M
                     machines while remaining fully functional on modern ANSI terminals,
-                    XMODEM Gateway adapts its display automatically to the capabilities
+                    Vintage Gateway adapts its display automatically to the capabilities
                     of each connected client.
                 </p>
                 <p>
                     <strong style="color: var(--amber);">Download:</strong>
                     Pre-built binaries are available on the
-                    <a href="https://github.com/rickybryce/xmodem-gateway/releases/">GitHub Releases</a> page.
+                    <a href="https://github.com/rickybryce/vintage-gateway/releases/">GitHub Releases</a> page.
                 </p>
 
                 <div class="cat">Features</div>
@@ -642,22 +642,22 @@
                         <li>Install Rust: <a href="https://rustup.rs">rustup.rs</a></li>
                         <li>Clone the repository</li>
                         <li>Build a release binary: <code>cargo build --release</code></li>
-                        <li>The binary is at <code>target/release/xmodem-gateway</code></li>
+                        <li>The binary is at <code>target/release/vintage-gateway</code></li>
                     </ol>
                     <p style="margin-top: 8px;">An AppImage is also available for x86_64 Linux systems.</p>
                 </div>
 
                 <div class="cat">First Run</div>
                 <p class="dim-text">
-                    When launched for the first time, XMODEM Gateway creates a configuration
-                    file (<code>xmodem.conf</code>) and the <code>transfer/</code> directory
+                    When launched for the first time, Vintage Gateway creates a configuration
+                    file (<code>vgateway.conf</code>) and the <code>transfer/</code> directory
                     automatically.
                 </p>
-                <pre><code><span class="prompt-char">$</span> ./xmodem-gateway
-<span class="output-text">XMODEM Gateway v0.3.5
+                <pre><code><span class="prompt-char">$</span> ./vintage-gateway
+<span class="output-text">Vintage Gateway v0.4.0
 Author: Ricky Bryce
 
-Created default configuration: xmodem.conf
+Created default configuration: vgateway.conf
 Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></code></pre>
 
                 <div class="callout callout-tip">
@@ -729,7 +729,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
 
                 <div class="menu-block">
                     <div class="sep">========================================</div>
-                    <div>&nbsp;&nbsp;<span class="title">XMODEM GATEWAY</span></div>
+                    <div>&nbsp;&nbsp;<span class="title">VINTAGE GATEWAY</span></div>
                     <div class="sep">========================================</div>
                     <br>
                     <div>&nbsp;&nbsp;<span class="key">A</span>&nbsp;&nbsp;<span class="label">AI Chat</span></div>
@@ -876,7 +876,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
 
                 <div class="cat">SSH Gateway</div>
                 <p class="dim-text">
-                    Connect to remote SSH servers through XMODEM Gateway. Press
+                    Connect to remote SSH servers through Vintage Gateway. Press
                     <strong>S</strong> from the main menu.
                 </p>
                 <div class="instructions">
@@ -937,7 +937,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
 
                 <div class="cat">Telnet Gateway</div>
                 <p class="dim-text">
-                    Connect to remote telnet servers through XMODEM Gateway. Press
+                    Connect to remote telnet servers through Vintage Gateway. Press
                     <strong>T</strong> from the main menu.
                 </p>
                 <div class="instructions">
@@ -955,7 +955,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <ul>
                         <li><strong>Telnet protocol (default)</strong> &mdash; the gateway parses IAC framing, unescapes <code>IAC IAC</code> to literal 0xFF data, accepts peer-initiated <code>WILL ECHO</code> cooperatively, and refuses other options with <code>DONT</code>/<code>WONT</code>. Works with any RFC-compliant telnet server.</li>
                         <li><strong>Cooperative</strong> (<code>telnet_gateway_negotiate = true</code>) &mdash; adds proactive offers of <code>WILL TTYPE</code>, <code>WILL NAWS</code>, and <code>DO ECHO</code> at connect, plus mid-session NAWS forwarding when you resize. Makes modern BBSes (Synchronet, Mystic) render at your actual window size.</li>
-                        <li><strong>Raw TCP</strong> (toggled with <strong>T</strong>, persisted to <code>xmodem.conf</code>) &mdash; disables the telnet IAC layer entirely. Use this when dialing destinations that aren't really telnet: some MUDs, hand-rolled BBS software, or custom services on port 23. Bytes to your local client are still IAC-escaped so a stray 0xFF doesn't confuse your telnet client.</li>
+                        <li><strong>Raw TCP</strong> (toggled with <strong>T</strong>, persisted to <code>vgateway.conf</code>) &mdash; disables the telnet IAC layer entirely. Use this when dialing destinations that aren't really telnet: some MUDs, hand-rolled BBS software, or custom services on port 23. Bytes to your local client are still IAC-escaped so a stray 0xFF doesn't confuse your telnet client.</li>
                     </ul>
                 </div>
 
@@ -983,7 +983,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <ol>
                         <li>Visit <a href="https://console.groq.com">console.groq.com</a> and create a free account</li>
                         <li>Generate an API key from the Groq dashboard</li>
-                        <li>In XMODEM Gateway, go to <strong>Configuration &gt; Other Settings</strong></li>
+                        <li>In Vintage Gateway, go to <strong>Configuration &gt; Other Settings</strong></li>
                         <li>Enter your API key when prompted</li>
                     </ol>
                 </div>
@@ -1113,7 +1113,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
             <!-- ══════════════════════════════════════════════ -->
             <div class="section" id="configuration">
                 <div class="section-title">Configuration</div>
-                <p class="intro">Press C from the main menu. Changes are saved to xmodem.conf immediately.</p>
+                <p class="intro">Press C from the main menu. Changes are saved to vgateway.conf immediately.</p>
 
                 <div class="cat">Security Settings</div>
                 <p class="dim-text">
@@ -1179,7 +1179,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                 <div class="cat" style="margin-top:12px;">ZMODEM</div>
                 <p class="dim-text">
                     Independent tunables. These values used to be hardcoded constants in
-                    the ZMODEM implementation; they now live in <code>xmodem.conf</code>
+                    the ZMODEM implementation; they now live in <code>vgateway.conf</code>
                     so operators can tune them per environment.
                 </p>
                 <table class="data-table">
@@ -1213,11 +1213,11 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
 
                 <div class="cat">Configuration File</div>
                 <p class="dim-text">
-                    The file <code>xmodem.conf</code> uses a simple <code>key = value</code>
+                    The file <code>vgateway.conf</code> uses a simple <code>key = value</code>
                     format. Lines beginning with <code>#</code> are comments. The file is
                     auto-created if missing and rewritten to ensure all keys are present.
                 </p>
-                <pre><code><span class="output-text"># XMODEM Gateway Configuration
+                <pre><code><span class="output-text"># Vintage Gateway Configuration
 telnet_enabled = true
 telnet_port = 2323
 security_enabled = false
@@ -1289,7 +1289,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                 <p class="intro">Hayes AT-compatible modem emulation on a physical serial port.</p>
 
                 <p class="dim-text">
-                    Connect vintage computers with serial interfaces to XMODEM Gateway.
+                    Connect vintage computers with serial interfaces to Vintage Gateway.
                     The emulator accepts standard AT commands and "dials" TCP connections
                     to remote hosts. Enable it in <strong>Configuration &gt; Modem
                     Emulator Settings</strong>.
@@ -1387,7 +1387,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                 <table class="feature-table">
                     <tr>
                         <td class="name-col">Configuration Editor</td>
-                        <td class="desc-col">Modify all server settings in real time with immediate save to xmodem.conf.</td>
+                        <td class="desc-col">Modify all server settings in real time with immediate save to vgateway.conf.</td>
                     </tr>
                     <tr>
                         <td class="name-col">Console Output</td>
@@ -1424,7 +1424,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
 
                 <div class="cat">IP Restrictions (Security Disabled)</div>
                 <p class="dim-text">
-                    When security is disabled (the default), XMODEM Gateway restricts
+                    When security is disabled (the default), Vintage Gateway restricts
                     access to private and loopback IP ranges only:
                 </p>
                 <div class="instructions">
@@ -1463,7 +1463,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                 </p>
                 <div class="instructions">
                     <ul>
-                        <li><code>xmodem.conf</code> &mdash; contains telnet/SSH passwords and the Groq API key</li>
+                        <li><code>vgateway.conf</code> &mdash; contains telnet/SSH passwords and the Groq API key</li>
                         <li><code>xmodem_ssh_host_key</code> &mdash; the gateway's SSH server private host key</li>
                         <li><code>xmodem_gateway_ssh_key</code> &mdash; the gateway's outgoing SSH client key</li>
                         <li><code>gateway_hosts</code> &mdash; remote-server host keys (privacy: reveals dial history)</li>
@@ -1518,7 +1518,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                     <tr><th>Symptom</th><th>Solution</th></tr>
                     <tr>
                         <td>Transfer times out before starting</td>
-                        <td>Pick the same protocol on both sides: the gateway's upload menu expects either XMODEM/YMODEM or ZMODEM, and the download menu lets you select XMODEM, XMODEM-1K, YMODEM, or ZMODEM explicitly. If your terminal takes a while to open its Send/Receive dialog, increase <code>xmodem_negotiation_timeout</code> (XMODEM / XMODEM-1K / YMODEM, default 45 s) or <code>zmodem_negotiation_timeout</code> (ZMODEM, default 45 s) in <code>xmodem.conf</code>.</td>
+                        <td>Pick the same protocol on both sides: the gateway's upload menu expects either XMODEM/YMODEM or ZMODEM, and the download menu lets you select XMODEM, XMODEM-1K, YMODEM, or ZMODEM explicitly. If your terminal takes a while to open its Send/Receive dialog, increase <code>xmodem_negotiation_timeout</code> (XMODEM / XMODEM-1K / YMODEM, default 45 s) or <code>zmodem_negotiation_timeout</code> (ZMODEM, default 45 s) in <code>vgateway.conf</code>.</td>
                     </tr>
                     <tr>
                         <td>Transfer fails partway through</td>
@@ -1576,13 +1576,13 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
                     <div class="author-info">
                         <h3>Ricky Bryce</h3>
                         <p>
-                            Creator and sole developer of XMODEM Gateway. A lifelong
+                            Creator and sole developer of Vintage Gateway. A lifelong
                             enthusiast of retrocomputing and telecommunications, Ricky
                             built this project to bridge the gap between vintage hardware
                             and modern network services.
                         </p>
                         <p>
-                            XMODEM Gateway is released under the
+                            Vintage Gateway is released under the
                             <strong style="color: var(--green);">GNU General Public License v3.0</strong>
                             (or later).
                         </p>
@@ -1597,9 +1597,9 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
             <!-- ══════════════════════════════════════════════ -->
             <div class="section" id="screenshot">
                 <div class="section-title">Screenshot</div>
-                <p class="intro">The XMODEM Gateway GUI console in action.</p>
+                <p class="intro">The Vintage Gateway GUI console in action.</p>
                 <div style="text-align: center; margin-top: 16px;">
-                    <img src="screenshot.png" alt="XMODEM Gateway GUI Console" style="max-width: 100%; height: auto; border: 1px solid var(--cyan); box-shadow: 0 0 12px rgba(0, 255, 255, 0.3);">
+                    <img src="screenshot.png" alt="Vintage Gateway GUI Console" style="max-width: 100%; height: auto; border: 1px solid var(--cyan); box-shadow: 0 0 12px rgba(0, 255, 255, 0.3);">
                 </div>
             </div>
 
@@ -1609,7 +1609,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
         <!-- FOOTER                                            -->
         <!-- ══════════════════════════════════════════════════ -->
         <footer class="site-footer">
-            XMODEM Gateway v0.3.5 &mdash; &copy; 2025 Ricky Bryce &mdash;
+            Vintage Gateway v0.4.0 &mdash; &copy; 2025 Ricky Bryce &mdash;
             Licensed under GPL-3.0-or-later
         </footer>
 

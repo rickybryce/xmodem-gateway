@@ -47,15 +47,34 @@ enum TransferMode {
     Crc16,
 }
 
-/// Optional YMODEM header metadata supplied by the caller when sending
-/// in YMODEM (batch) mode.  The filename appears in block 0; size is
-/// used by receivers to truncate trailing SUB-padding exactly.  When
-/// `None`, the sender uses plain XMODEM semantics and never emits a
-/// block 0.
+/// YMODEM header metadata supplied by the caller when sending in
+/// YMODEM (batch) mode.  Filename and size are mandatory; receivers
+/// use the size for exact end-of-file truncation (Forsberg §5).
+/// `modtime` (UNIX seconds) and `mode` (UNIX permission bits) are
+/// optional informational fields per Forsberg §6.1 — when supplied
+/// they're emitted in their respective slots, when `None` they're
+/// emitted as octal `0` (the spec-defined "unknown" sentinel).
+/// Passing `None` for the whole `Option<YmodemHeader>` parameter to
+/// `xmodem_send` selects plain XMODEM mode (no block 0 at all).
 #[derive(Clone)]
 pub(crate) struct YmodemHeader {
     pub filename: String,
     pub size: u64,
+    pub modtime: Option<u64>,
+    pub mode: Option<u32>,
+}
+
+/// Metadata parsed out of a YMODEM block 0 by the receiver.  All fields
+/// are `Option` because the spec allows minimal senders that emit only
+/// the filename, or filename + size.  When present, `mode` is masked to
+/// `0o7777` by the parser to keep setuid/setgid/sticky bits visible to
+/// callers that want them, but the upload-save path masks further to
+/// `0o777` before applying.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct YmodemReceiveMeta {
+    pub size: Option<u64>,
+    pub modtime: Option<u64>,
+    pub mode: Option<u32>,
 }
 
 // =============================================================================
@@ -68,7 +87,7 @@ pub(crate) async fn xmodem_receive(
     is_tcp: bool,
     is_petscii: bool,
     verbose: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<YmodemReceiveMeta>), String> {
     let cfg = config::get_config();
     let negotiation_timeout = cfg.xmodem_negotiation_timeout;
     let block_timeout = cfg.xmodem_block_timeout;
@@ -82,11 +101,12 @@ pub(crate) async fn xmodem_receive(
     // Set when we successfully handle a YMODEM filename-header block so
     // the EOT handler knows to run the end-of-batch handshake.
     let mut ymodem_mode = false;
-    // Reported file length from a YMODEM block 0.  When `Some`, we
-    // truncate `file_data` to exactly this length at end of transfer
-    // (YMODEM spec §5) instead of stripping trailing SUB padding —
-    // critical for files that legitimately end in 0x1A bytes.
-    let mut ymodem_size: Option<u64> = None;
+    // Parsed metadata from a YMODEM block 0.  Reported file length, when
+    // present, drives end-of-transfer truncation (Forsberg §5) instead of
+    // SUB-stripping — critical for files that legitimately end in 0x1A
+    // bytes.  Modtime and mode are returned to the caller for fs-attribute
+    // application after save; we don't apply them ourselves.
+    let mut ymodem_meta: Option<YmodemReceiveMeta> = None;
     let negotiation_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(negotiation_timeout);
 
@@ -129,6 +149,13 @@ pub(crate) async fn xmodem_receive(
                 if is_esc_key(byte, is_petscii) {
                     return Err("Transfer cancelled".into());
                 }
+                if is_can_abort(byte, state) {
+                    return Err("Transfer cancelled by sender".into());
+                }
+                if byte == CAN {
+                    if verbose { glog!("XMODEM recv: single CAN treated as line noise (waiting for second)"); }
+                    continue;
+                }
                 if byte == SOH || byte == STX {
                     let block_size = if byte == STX {
                         XMODEM_1K_BLOCK_SIZE
@@ -167,12 +194,12 @@ pub(crate) async fn xmodem_receive(
                         )
                         .await
                         {
-                            Ok(Ok((true, size))) => {
+                            Ok(Ok((true, meta))) => {
                                 raw_write_byte(writer, ACK, is_tcp).await?;
                                 // Second 'C' starts the data phase.
                                 raw_write_byte(writer, CRC_REQUEST, is_tcp).await?;
                                 ymodem_mode = true;
-                                ymodem_size = size;
+                                ymodem_meta = meta;
                                 break;
                             }
                             Ok(Ok((false, _))) => {
@@ -229,11 +256,9 @@ pub(crate) async fn xmodem_receive(
                 }
                 if byte == EOT {
                     raw_write_byte(writer, ACK, is_tcp).await?;
-                    return Ok(file_data);
+                    return Ok((file_data, ymodem_meta));
                 }
-                if byte == CAN {
-                    return Err("Transfer cancelled by sender".into());
-                }
+                // CAN handled above by is_can_abort + single-CAN continue.
                 if verbose { glog!("XMODEM recv: ignoring unexpected byte 0x{:02X}", byte); }
             }
             Ok(Err(e)) => return Err(e),
@@ -263,6 +288,10 @@ pub(crate) async fn xmodem_receive(
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err("Transfer timeout".into()),
         };
+
+        if is_can_abort(byte, state) {
+            return Err("Transfer cancelled by sender".into());
+        }
 
         match byte {
             SOH | STX => {
@@ -352,7 +381,11 @@ pub(crate) async fn xmodem_receive(
                 break;
             }
             CAN => {
-                return Err("Transfer cancelled by sender".into());
+                // Single CAN — Forsberg's CAN×2 rule says ignore as
+                // possible line noise.  Don't NAK; just keep reading.
+                // `is_can_abort` already set `pending_can`; if the
+                // very next byte is also CAN we'll abort there.
+                if verbose { glog!("XMODEM recv: single CAN treated as line noise"); }
             }
             _ => {
                 raw_write_byte(writer, NAK, is_tcp).await?;
@@ -365,7 +398,8 @@ pub(crate) async fn xmodem_receive(
     // which SUB-stripping would corrupt.  Fall back to SUB-stripping
     // when the sender didn't report a size, or when we're in plain
     // XMODEM / XMODEM-1K mode (no block 0 at all).
-    let truncated_by_size = if let Some(size) = ymodem_size {
+    let reported_size = ymodem_meta.as_ref().and_then(|m| m.size);
+    let truncated_by_size = if let Some(size) = reported_size {
         let target = size as usize;
         if target <= file_data.len() {
             file_data.truncate(target);
@@ -389,7 +423,7 @@ pub(crate) async fn xmodem_receive(
         }
     }
 
-    Ok(file_data)
+    Ok((file_data, ymodem_meta))
 }
 
 /// Receive and validate a single XMODEM block (after SOH or STX was
@@ -424,20 +458,25 @@ async fn receive_block(
 
 /// Read and validate the 128-byte payload + CRC/checksum trailer of a
 /// YMODEM block 0, given that `SOH 0x00 0xFF` has already been read.
-/// Returns `Ok(true)` if the checksum/CRC is valid, `Ok(false)` if it
-/// is not.  Called under a `tokio::time::timeout` so a stalled sender
-/// can't hold the session indefinitely.
-/// Outcome of parsing a YMODEM block 0 payload.  `None` means CRC /
-/// checksum mismatch; `Some(size)` carries the reported file length if
-/// it was present and well-formed (some minimal senders omit it), or
-/// `Some(None)` if the block is valid but the length field is absent.
+/// Returns `(valid, meta)` — `valid=false` means CRC/checksum mismatch
+/// and `meta` is meaningless; on `valid=true` `meta` carries whatever
+/// metadata fields were parsed.  Called under a `tokio::time::timeout`
+/// so a stalled sender can't hold the session indefinitely.
+///
+/// Per Forsberg YMODEM §6.1 the block-0 payload is:
+///
+///     filename\0length<SP>modtime<SP>mode<SP>sno<SP>...\0<NUL fill>
+///
+/// where `length` is decimal and `modtime`/`mode`/`sno` are octal.
+/// All metadata fields are optional from the receiver's standpoint —
+/// minimal senders omit the trailing fields, and we tolerate that.
 async fn read_ymodem_block_zero_body(
     reader: &mut (impl AsyncRead + Unpin),
     mode: TransferMode,
     is_tcp: bool,
     verbose: bool,
     state: &mut ReadState,
-) -> Result<(bool, Option<u64>), String> {
+) -> Result<(bool, Option<YmodemReceiveMeta>), String> {
     let mut payload = [0u8; XMODEM_BLOCK_SIZE];
     for b in payload.iter_mut() {
         *b = nvt_read_byte(reader, is_tcp, state).await?;
@@ -455,39 +494,85 @@ async fn read_ymodem_block_zero_body(
             recv == calc
         }
     };
-    let mut size: Option<u64> = None;
-    if valid {
-        // Forsberg YMODEM block 0 layout:
-        //   filename\0size mtime mode serial\0 <NUL padding>
-        // All fields after the filename-terminating NUL are space
-        // separated, and the whole block of fields is NUL-terminated.
-        // We parse just the size (the only field that matters for
-        // exact truncation); mtime/mode are informational.  Minimal
-        // senders may omit everything after the filename NUL — in that
-        // case we leave size as None and fall back to SUB-stripping.
-        if let Some(name_end) = payload.iter().position(|&b| b == 0) {
-            let after = &payload[name_end + 1..];
-            if let Some(fields_end) = after.iter().position(|&b| b == 0) {
-                let fields = &after[..fields_end];
-                let text = std::str::from_utf8(fields).unwrap_or("");
-                if let Some(first) = text.split_ascii_whitespace().next()
-                    && let Ok(n) = first.parse::<u64>()
-                {
-                    size = Some(n);
-                }
-            }
-            if verbose {
-                let name = std::str::from_utf8(&payload[..name_end])
-                    .unwrap_or("<invalid>");
-                glog!(
-                    "XMODEM recv: YMODEM filename='{}' size={}",
-                    name,
-                    size.map(|n| n.to_string()).unwrap_or_else(|| "<unknown>".into()),
-                );
-            }
-        }
+    if !valid {
+        return Ok((false, None));
     }
-    Ok((valid, size))
+    let parsed = parse_ymodem_block_zero_payload(&payload);
+    if verbose {
+        let name = payload
+            .iter()
+            .position(|&b| b == 0)
+            .and_then(|n| std::str::from_utf8(&payload[..n]).ok())
+            .unwrap_or("<invalid>");
+        glog!(
+            "XMODEM recv: YMODEM filename='{}' size={} modtime={} mode={}",
+            name,
+            parsed
+                .as_ref()
+                .and_then(|m| m.size)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unknown>".into()),
+            parsed
+                .as_ref()
+                .and_then(|m| m.modtime)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unknown>".into()),
+            parsed
+                .as_ref()
+                .and_then(|m| m.mode)
+                .map(|n| format!("{:o}", n))
+                .unwrap_or_else(|| "<unknown>".into()),
+        );
+    }
+    Ok((true, parsed))
+}
+
+/// Parse the 128-byte block-0 payload into a `YmodemReceiveMeta`.  Returns
+/// `None` if the payload is empty (filename starts with NUL — the
+/// end-of-batch terminator block).  Otherwise returns `Some(meta)` with
+/// whatever fields were present and well-formed.
+///
+/// Field encoding per Forsberg YMODEM §6.1: `length` is decimal,
+/// `modtime`/`mode`/`sno` are octal.  Anything that fails to parse
+/// stays `None` rather than poisoning the rest — minimal senders that
+/// omit fields, and broken senders that emit junk, are both tolerated
+/// the same way.
+fn parse_ymodem_block_zero_payload(payload: &[u8]) -> Option<YmodemReceiveMeta> {
+    let name_end = payload.iter().position(|&b| b == 0)?;
+    if name_end == 0 {
+        // End-of-batch null block 0 — no metadata to extract.
+        return None;
+    }
+    let mut meta = YmodemReceiveMeta::default();
+    let after = &payload[name_end + 1..];
+    let Some(fields_end) = after.iter().position(|&b| b == 0) else {
+        return Some(meta);
+    };
+    let text = match std::str::from_utf8(&after[..fields_end]) {
+        Ok(s) => s,
+        Err(_) => return Some(meta),
+    };
+    let mut fields = text.split_ascii_whitespace();
+    if let Some(first) = fields.next()
+        && let Ok(n) = first.parse::<u64>()
+    {
+        meta.size = Some(n);
+    }
+    if let Some(second) = fields.next()
+        && let Ok(n) = u64::from_str_radix(second, 8)
+        && n != 0
+    {
+        meta.modtime = Some(n);
+    }
+    if let Some(third) = fields.next()
+        && let Ok(n) = u32::from_str_radix(third, 8)
+        && n != 0
+    {
+        // Mask to permission + setuid/setgid/sticky bits.  The upload
+        // path further restricts to `0o777` before applying.
+        meta.mode = Some(n & 0o7777);
+    }
+    Some(meta)
 }
 
 /// Same as `receive_block` but the block-number + complement bytes have
@@ -593,6 +678,9 @@ pub(crate) async fn xmodem_send(
                 if is_esc_key(byte, is_petscii) {
                     return Err("Transfer cancelled".into());
                 }
+                if is_can_abort(byte, state) {
+                    return Err("Transfer cancelled by receiver".into());
+                }
                 match byte {
                     CRC_REQUEST => {
                         if verbose { glog!("XMODEM send: receiver requests CRC mode"); }
@@ -603,7 +691,12 @@ pub(crate) async fn xmodem_send(
                         break TransferMode::Checksum;
                     }
                     CAN => {
-                        return Err("Transfer cancelled by receiver".into());
+                        // Single CAN — Forsberg's CAN×2 rule treats it
+                        // as possible line noise.  Keep waiting for the
+                        // next byte; `is_can_abort` already armed
+                        // `pending_can` so a second CAN aborts.
+                        if verbose { glog!("XMODEM send: single CAN treated as line noise during negotiation"); }
+                        continue;
                     }
                     _ => {
                         if verbose { glog!("XMODEM send: ignoring byte 0x{:02X} during negotiation", byte); }
@@ -735,25 +828,47 @@ pub(crate) async fn xmodem_send(
 
             raw_write_bytes(writer, &packet, is_tcp).await?;
 
-            // Wait for ACK/NAK
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(block_timeout),
-                nvt_read_byte(reader, is_tcp, state),
-            )
-            .await
-            {
-                Ok(Ok(ACK)) => {
+            // Wait for ACK/NAK, draining single-CAN line noise per
+            // Forsberg's CAN×2 abort rule.  The inner loop returns the
+            // first non-CAN byte; CAN×2 returns Err immediately via
+            // `is_can_abort`.  Read errors and timeouts surface to the
+            // outer match for retry handling.
+            enum Resp {
+                Byte(u8),
+                ReadErr(String),
+                Timeout,
+            }
+            let response = loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(block_timeout),
+                    nvt_read_byte(reader, is_tcp, state),
+                )
+                .await
+                {
+                    Ok(Ok(byte)) => {
+                        if is_can_abort(byte, state) {
+                            if verbose { glog!("XMODEM send: CAN×2 abort at block #{}", block_idx + 1); }
+                            return Err("Transfer cancelled by receiver".into());
+                        }
+                        if byte == CAN {
+                            if verbose { glog!("XMODEM send: single CAN at block #{} treated as line noise", block_idx + 1); }
+                            continue;
+                        }
+                        break Resp::Byte(byte);
+                    }
+                    Ok(Err(e)) => break Resp::ReadErr(e),
+                    Err(_) => break Resp::Timeout,
+                }
+            };
+            match response {
+                Resp::Byte(ACK) => {
                     if verbose && (block_idx < 3 || retries > 0) {
                         glog!("XMODEM send: block #{} ACK (retries={}, size={})",
                             block_idx + 1, retries, block_size);
                     }
                     break;
                 }
-                Ok(Ok(CAN)) => {
-                    if verbose { glog!("XMODEM send: CAN received at block #{}", block_idx + 1); }
-                    return Err("Transfer cancelled by receiver".into());
-                }
-                Ok(Ok(NAK)) => {
+                Resp::Byte(NAK) => {
                     if verbose { glog!("XMODEM send: block #{} NAK (retry {})", block_idx + 1, retries + 1); }
                     // Opportunistic fallback: if the very first block
                     // we sent used STX and the receiver rejected it,
@@ -771,14 +886,14 @@ pub(crate) async fn xmodem_send(
                     retries += 1;
                     continue;
                 }
-                Ok(Ok(byte)) => {
+                Resp::Byte(byte) => {
                     if verbose { glog!("XMODEM send: block #{} unexpected response 0x{:02X} (retry {})",
                         block_idx + 1, byte, retries + 1); }
                     retries += 1;
                     continue;
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
+                Resp::ReadErr(e) => return Err(e),
+                Resp::Timeout => {
                     if verbose { glog!("XMODEM send: block #{} timeout (retry {})", block_idx + 1, retries + 1); }
                     retries += 1;
                     continue;
@@ -856,6 +971,16 @@ pub(crate) async fn xmodem_send(
 /// Build and transmit YMODEM block 0 (filename + size header).
 /// Uses a 128-byte SOH block regardless of the sender's 1K preference
 /// because the YMODEM spec fixes block 0 at 128 bytes.
+///
+/// Per Forsberg YMODEM §6.1 the metadata field after the filename NUL
+/// is `length<SP>modtime<SP>mode<SP>sno\0` where `length` is decimal
+/// and `modtime`/`mode`/`sno` are octal.  We always emit the full
+/// quartet — when the caller didn't supply `modtime` or `mode` we
+/// substitute octal `0`, the spec-defined "unknown" value, so
+/// receivers doing positional parsing always see four fields.  Serial
+/// number (`sno`) is always `0` — we don't track per-sender serials.
+/// (lrzsz `sb` emits two extra positional fields, `nfiles_left` and
+/// `bytes_left`, which the spec lists as optional; we omit them.)
 #[allow(clippy::too_many_arguments)]
 async fn send_ymodem_block_zero(
     reader: &mut (impl AsyncRead + Unpin),
@@ -867,21 +992,28 @@ async fn send_ymodem_block_zero(
     verbose: bool,
     state: &mut ReadState,
 ) -> Result<(), String> {
-    // Build the 128-byte payload: "filename\0size_decimal\0" then NUL
-    // padding.  Filenames are limited to what fits; anything longer is
-    // truncated at 100 bytes so the size field still fits in 128.
+    // Build the 128-byte payload: "filename\0length modtime mode 0\0"
+    // then NUL padding.  Filenames are limited to what fits; anything
+    // longer is truncated at 100 bytes so the metadata still fits in
+    // 128 alongside the trailing NUL terminator.
     let mut payload = [0u8; XMODEM_BLOCK_SIZE];
     let fn_bytes = hdr.filename.as_bytes();
     let fn_cap = fn_bytes.len().min(100);
     payload[..fn_cap].copy_from_slice(&fn_bytes[..fn_cap]);
     // payload[fn_cap] is already 0 (null-terminator for filename).
-    let meta = format!("{} ", hdr.size);
+    let modtime_oct = hdr.modtime.unwrap_or(0);
+    // Mask mode to permission + setuid/setgid/sticky bits before
+    // emission — never send anything outside the file-type-independent
+    // mode word, regardless of what the caller passed in.
+    let mode_oct = hdr.mode.unwrap_or(0) & 0o7777;
+    let meta = format!("{} {:o} {:o} 0", hdr.size, modtime_oct, mode_oct);
     let meta_start = fn_cap + 1;
-    let meta_end = (meta_start + meta.len()).min(XMODEM_BLOCK_SIZE);
+    let meta_end = (meta_start + meta.len()).min(XMODEM_BLOCK_SIZE - 1);
     let meta_len = meta_end - meta_start;
     payload[meta_start..meta_end]
         .copy_from_slice(&meta.as_bytes()[..meta_len]);
-    // Remaining bytes stay 0 as padding/NUL-terminator.
+    // payload[meta_end] stays 0 as the metadata-block terminator;
+    // remaining bytes are NUL padding.
 
     let mut packet = Vec::with_capacity(3 + XMODEM_BLOCK_SIZE + 2);
     packet.push(SOH);
@@ -893,8 +1025,8 @@ async fn send_ymodem_block_zero(
     packet.push((crc & 0xFF) as u8);
 
     if verbose { glog!(
-        "XMODEM send: YMODEM block 0 filename='{}' size={}",
-        hdr.filename, hdr.size,
+        "XMODEM send: YMODEM block 0 filename='{}' size={} modtime={:o} mode={:o}",
+        hdr.filename, hdr.size, modtime_oct, mode_oct,
     ); }
 
     let mut retries = 0;
@@ -903,19 +1035,32 @@ async fn send_ymodem_block_zero(
             return Err("YMODEM block 0: too many retries".into());
         }
         raw_write_bytes(writer, &packet, is_tcp).await?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(block_timeout),
-            nvt_read_byte(reader, is_tcp, state),
-        )
-        .await
-        {
-            Ok(Ok(ACK)) => return Ok(()),
-            Ok(Ok(NAK)) => {
-                retries += 1;
-                continue;
+        // Drain single-CAN line noise per Forsberg's CAN×2 abort
+        // rule: only two consecutive CANs trigger an abort, all other
+        // outcomes (timeout, read error, unexpected byte) feed the
+        // retry counter.
+        let response = loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(block_timeout),
+                nvt_read_byte(reader, is_tcp, state),
+            )
+            .await
+            {
+                Ok(Ok(byte)) => {
+                    if is_can_abort(byte, state) {
+                        return Err("Transfer cancelled by receiver".into());
+                    }
+                    if byte == CAN {
+                        continue;
+                    }
+                    break Some(byte);
+                }
+                Ok(Err(_)) | Err(_) => break None,
             }
-            Ok(Ok(CAN)) => return Err("Transfer cancelled by receiver".into()),
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+        };
+        match response {
+            Some(ACK) => return Ok(()),
+            _ => {
                 retries += 1;
                 continue;
             }
@@ -1079,9 +1224,44 @@ async fn raw_write_bytes(
 /// collapse the NUL so XMODEM byte counts stay aligned.  The pushback
 /// slot holds a byte we looked ahead for CR-NUL detection that turned
 /// out not to be a NUL; the next call returns it before reading more.
+///
+/// `pending_can` tracks whether the most recently read byte at the
+/// protocol level was CAN.  Forsberg's protocol notes recommend that
+/// abort-on-CAN require **two consecutive** CAN bytes so a single
+/// stray 0x18 from line noise doesn't false-abort an in-flight
+/// transfer.  Each CAN-handling site sets the flag on a first CAN,
+/// checks it on a second CAN to abort, and clears it on any non-CAN
+/// byte.  See `is_can_abort` for the canonical state transition.
 #[derive(Default)]
 struct ReadState {
     pushback: Option<u8>,
+    pending_can: bool,
+}
+
+/// Forsberg's CAN×2 abort rule, factored out so every read site
+/// applies the same state transitions:
+///
+/// - On CAN: if a previous CAN was already pending, return `true`
+///   (caller aborts).  Otherwise set `pending_can` and return `false`
+///   so the caller treats the byte as "ignore for now, keep reading."
+/// - On any other byte: clear `pending_can` and return `false`.  The
+///   caller proceeds with normal handling for that byte.
+///
+/// Crucially, `pending_can` persists across read calls: a CAN seen
+/// during one block, followed by ACK from the receiver, then another
+/// CAN, must NOT abort — only **consecutive** CANs do.
+fn is_can_abort(byte: u8, state: &mut ReadState) -> bool {
+    if byte == CAN {
+        if state.pending_can {
+            state.pending_can = false;
+            return true;
+        }
+        state.pending_can = true;
+        false
+    } else {
+        state.pending_can = false;
+        false
+    }
 }
 
 /// NVT-aware byte reader: wraps [`raw_read_byte`] with CR-NUL stripping
@@ -1236,7 +1416,7 @@ mod tests {
         });
 
         send_task.await.unwrap();
-        recv_task.await.unwrap()
+        recv_task.await.unwrap().0
     }
 
     #[tokio::test]
@@ -1444,6 +1624,8 @@ mod tests {
         let hdr = YmodemHeader {
             filename: filename.to_string(),
             size: data.len() as u64,
+            modtime: None,
+            mode: None,
         };
 
         let send_task = tokio::spawn(async move {
@@ -1467,7 +1649,7 @@ mod tests {
         });
 
         send_task.await.unwrap();
-        recv_task.await.unwrap()
+        recv_task.await.unwrap().0
     }
 
     #[tokio::test]
@@ -1669,7 +1851,7 @@ mod tests {
                 .unwrap()
         });
         send_task.await.unwrap();
-        recv_task.await.unwrap()
+        recv_task.await.unwrap().0
     }
 
     async fn ymodem_round_trip_iac(filename: &str, original: &[u8]) -> Vec<u8> {
@@ -1681,6 +1863,8 @@ mod tests {
         let hdr = YmodemHeader {
             filename: filename.to_string(),
             size: data.len() as u64,
+            modtime: None,
+            mode: None,
         };
         let send_task = tokio::spawn(async move {
             xmodem_send(
@@ -1702,7 +1886,7 @@ mod tests {
                 .unwrap()
         });
         send_task.await.unwrap();
-        recv_task.await.unwrap()
+        recv_task.await.unwrap().0
     }
 
     /// 0xFF bytes in the data payload must survive telnet IAC escaping:
@@ -1861,7 +2045,7 @@ mod tests {
         });
 
         send_task.await.unwrap();
-        let received = recv_task.await.unwrap();
+        let (received, _) = recv_task.await.unwrap();
         let _ = s_to_r.await;
         let _ = r_to_s.await;
         assert_eq!(received, original, "receiver must recover correct data after NAK+retry");
@@ -1917,7 +2101,7 @@ mod tests {
             assert_eq!(a_eot, ACK);
         });
 
-        let received = xmodem_receive(
+        let (received, _) = xmodem_receive(
             &mut recv_read, &mut recv_write, false, false, false,
         ).await.unwrap();
 
@@ -1927,7 +2111,9 @@ mod tests {
     }
 
     /// Test 4a: receiver returns "cancelled by sender" when the sender
-    /// emits CAN mid-transfer.
+    /// emits CAN×2 (consecutive) mid-transfer.  Forsberg's protocol
+    /// notes recommend two consecutive CANs for abort so a stray 0x18
+    /// from line noise doesn't false-abort a transfer.
     #[tokio::test]
     async fn test_xmodem_receive_aborts_on_sender_can() {
         let (sender_half, receiver_half) = tokio::io::duplex(16384);
@@ -1937,15 +2123,28 @@ mod tests {
         let send_task = tokio::spawn(async move {
             // Wait for 'C'.
             let _ = raw_read_byte(&mut send_read, false).await.unwrap();
-            // Send CAN instead of any block.
+            // Send CAN×2 (consecutive) — the spec-conformant abort.
             raw_write_byte(&mut send_write, CAN, false).await.unwrap();
+            raw_write_byte(&mut send_write, CAN, false).await.unwrap();
+            // Drain whatever the receiver writes after the first CAN
+            // (e.g. another 'C' from the negotiation loop) until the
+            // task is aborted by the test driver.
+            loop {
+                let _ = raw_read_byte(&mut send_read, false).await;
+            }
         });
 
         let result = xmodem_receive(
             &mut recv_read, &mut recv_write, false, false, false,
         ).await;
 
-        send_task.await.unwrap();
+        // Receiver returned — abort the drain loop.  Splitting a
+        // DuplexStream into Read/Write halves means dropping just
+        // `recv_write` doesn't close the stream (recv_read still
+        // holds it), so the cleanest way to terminate the spawn is
+        // an explicit abort.
+        send_task.abort();
+        let _ = send_task.await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1955,7 +2154,7 @@ mod tests {
     }
 
     /// Test 4b: sender returns "cancelled by receiver" when the
-    /// receiver sends CAN in response to a data block.
+    /// receiver sends CAN×2 in response to a data block.
     #[tokio::test]
     async fn test_xmodem_send_aborts_on_receiver_can_mid_transfer() {
         let (sender_half, receiver_half) = tokio::io::duplex(16384);
@@ -1972,8 +2171,9 @@ mod tests {
 
         let recv_task = tokio::spawn(async move {
             raw_write_byte(&mut recv_write, CRC_REQUEST, false).await.unwrap();
-            // Read block 1 and respond with CAN.
+            // Read block 1 and respond with CAN×2.
             let _ = read_soh_crc_block(&mut recv_read).await;
+            raw_write_byte(&mut recv_write, CAN, false).await.unwrap();
             raw_write_byte(&mut recv_write, CAN, false).await.unwrap();
         });
 
@@ -1987,7 +2187,7 @@ mod tests {
     }
 
     /// Test 4c: sender returns cancel error when the receiver sends
-    /// CAN during negotiation (before any block has been transmitted).
+    /// CAN×2 during negotiation (before any block has been transmitted).
     #[tokio::test]
     async fn test_xmodem_send_aborts_on_receiver_can_during_negotiation() {
         let (sender_half, receiver_half) = tokio::io::duplex(16384);
@@ -2002,7 +2202,8 @@ mod tests {
             ).await
         });
 
-        // Send CAN immediately in place of 'C' or NAK.
+        // Send CAN×2 in place of 'C' or NAK.
+        raw_write_byte(&mut recv_write, CAN, false).await.unwrap();
         raw_write_byte(&mut recv_write, CAN, false).await.unwrap();
 
         let result = send_task.await.unwrap();
@@ -2107,6 +2308,8 @@ mod tests {
         let hdr = YmodemHeader {
             filename: "retry.bin".to_string(),
             size: original.len() as u64,
+            modtime: None,
+            mode: None,
         };
 
         let send_task = tokio::spawn(async move {
@@ -2610,6 +2813,8 @@ mod tests {
         let header = YmodemHeader {
             filename: "test.bin".to_string(),
             size: data.len() as u64,
+            modtime: None,
+            mode: None,
         };
         let wire =
             capture_xmodem_wire(data, false, Some(header), &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK])
@@ -2651,6 +2856,8 @@ mod tests {
         let header = YmodemHeader {
             filename: "a".to_string(),
             size: 1,
+            modtime: None,
+            mode: None,
         };
         let wire = capture_xmodem_wire(
             data,
@@ -2667,6 +2874,323 @@ mod tests {
         assert_eq!(wire[off + 129], crc as u8, "block 0 CRC low byte");
     }
 
+    /// Forsberg YMODEM §6.1: the metadata field after the filename
+    /// NUL is `length<SP>modtime<SP>mode<SP>sno\0` where `length` is
+    /// decimal and `modtime`/`mode`/`sno` are octal.  When the sender
+    /// is given full metadata, it must emit all four fields.
+    #[tokio::test]
+    async fn test_ymodem_block_zero_emits_full_metadata() {
+        let data = b"abc";
+        let header = YmodemHeader {
+            filename: "doc.txt".to_string(),
+            size: 3,
+            modtime: Some(0o12345670),
+            mode: Some(0o100644),
+        };
+        let wire = capture_xmodem_wire(
+            data,
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (hdr, num, _, off) = find_first_block(&wire).expect("no block");
+        assert_eq!(hdr, SOH, "block 0 must use SOH");
+        assert_eq!(num, 0, "block 0 number must be 0");
+        let payload = &wire[off..off + 128];
+        let nul = payload.iter().position(|&b| b == 0).expect("filename NUL");
+        assert_eq!(&payload[..nul], b"doc.txt");
+        let after_name = &payload[nul + 1..];
+        let next_nul = after_name
+            .iter()
+            .position(|&b| b == 0)
+            .expect("metadata-block NUL terminator");
+        let meta = std::str::from_utf8(&after_name[..next_nul]).unwrap();
+        let fields: Vec<&str> = meta.split_ascii_whitespace().collect();
+        assert!(
+            fields.len() >= 4,
+            "must emit at least length/modtime/mode/sno, got {:?}",
+            fields,
+        );
+        assert_eq!(fields[0], "3", "length must be decimal");
+        assert_eq!(
+            u64::from_str_radix(fields[1], 8).expect("modtime must be octal"),
+            0o12345670,
+        );
+        assert_eq!(
+            u32::from_str_radix(fields[2], 8).expect("mode must be octal") & 0o7777,
+            0o100644 & 0o7777,
+        );
+        assert_eq!(fields[3], "0", "sno must be octal 0");
+    }
+
+    /// Length is decimal, modtime/mode are octal — emitting modtime
+    /// in decimal would silently misrepresent the timestamp on parsers
+    /// that follow the spec.  This test pins the radix on each field
+    /// independently of the matching round-trip test.
+    #[tokio::test]
+    async fn test_ymodem_block_zero_octal_radix() {
+        let data = b"y";
+        let header = YmodemHeader {
+            filename: "f".to_string(),
+            size: 1,
+            // 0o20 = 16 — distinguishable from its decimal form (20)
+            // and its hex form (0x14) so a wrong radix would fail.
+            modtime: Some(0o20),
+            mode: Some(0o20),
+        };
+        let wire = capture_xmodem_wire(
+            data,
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        let payload = &wire[off..off + 128];
+        let nul = payload.iter().position(|&b| b == 0).unwrap();
+        let after = &payload[nul + 1..];
+        let end = after.iter().position(|&b| b == 0).unwrap();
+        let meta = std::str::from_utf8(&after[..end]).unwrap();
+        let fields: Vec<&str> = meta.split_ascii_whitespace().collect();
+        assert_eq!(fields[1], "20", "modtime 0o20 must serialize as octal '20'");
+        assert_eq!(fields[2], "20", "mode 0o20 must serialize as octal '20'");
+    }
+
+    /// End-to-end round-trip with full metadata — sender encodes,
+    /// receiver decodes, both halves agree on the values.
+    #[tokio::test]
+    async fn test_ymodem_round_trip_modtime_mode_metadata() {
+        let original = b"round trip body";
+        let (sender_half, receiver_half) = tokio::io::duplex(16384);
+        let (mut send_read, mut send_write) = tokio::io::split(sender_half);
+        let (mut recv_read, mut recv_write) = tokio::io::split(receiver_half);
+
+        let data = original.to_vec();
+        let hdr = YmodemHeader {
+            filename: "rt.bin".to_string(),
+            size: data.len() as u64,
+            modtime: Some(1_700_000_000),
+            mode: Some(0o100755),
+        };
+
+        let send_task = tokio::spawn(async move {
+            xmodem_send(
+                &mut send_read,
+                &mut send_write,
+                &data,
+                false,
+                false,
+                false,
+                true,
+                Some(hdr),
+            )
+            .await
+            .unwrap();
+        });
+        let recv_task = tokio::spawn(async move {
+            xmodem_receive(&mut recv_read, &mut recv_write, false, false, false)
+                .await
+                .unwrap()
+        });
+        send_task.await.unwrap();
+        let (received, meta) = recv_task.await.unwrap();
+        assert_eq!(received, original, "data must round-trip exactly");
+        let meta = meta.expect("YMODEM block 0 must surface meta");
+        assert_eq!(meta.size, Some(original.len() as u64));
+        assert_eq!(meta.modtime, Some(1_700_000_000));
+        // Mode is parser-masked to 0o7777 (perms + setuid/setgid/sticky).
+        assert_eq!(meta.mode, Some(0o100755 & 0o7777));
+    }
+
+    /// Minimal-sender compatibility: a block 0 with `filename\0length\0`
+    /// (no modtime/mode/sno) must still parse — Forsberg explicitly
+    /// permits trailing fields to be omitted.
+    #[test]
+    fn test_parse_block_zero_minimal_size_only() {
+        let mut payload = [0u8; XMODEM_BLOCK_SIZE];
+        // Layout: "f.bin\0123\0..."  — filename, NUL, decimal length,
+        // NUL terminator for the metadata block.
+        let bytes: &[u8] = b"f.bin\x00123";
+        payload[..bytes.len()].copy_from_slice(bytes);
+        // payload[bytes.len()] stays 0 — terminates metadata.
+        let meta = parse_ymodem_block_zero_payload(&payload).expect("must parse");
+        assert_eq!(meta.size, Some(123));
+        assert_eq!(meta.modtime, None);
+        assert_eq!(meta.mode, None);
+    }
+
+    /// Even more minimal: filename only, no metadata block at all.
+    /// Some pre-Forsberg-1988 senders did this; we should tolerate it
+    /// by returning a meta with all `None` fields.
+    #[test]
+    fn test_parse_block_zero_filename_only() {
+        let mut payload = [0u8; XMODEM_BLOCK_SIZE];
+        payload[..4].copy_from_slice(b"name");
+        // payload[4] is the filename NUL; everything after is NUL fill.
+        let meta = parse_ymodem_block_zero_payload(&payload).expect("must parse");
+        assert_eq!(meta.size, None);
+        assert_eq!(meta.modtime, None);
+        assert_eq!(meta.mode, None);
+    }
+
+    /// End-of-batch null block 0 (filename starts with NUL) must not
+    /// produce a meta — the parser distinguishes "no metadata" from
+    /// "end of batch terminator block."
+    #[test]
+    fn test_parse_block_zero_end_of_batch_returns_none() {
+        let payload = [0u8; XMODEM_BLOCK_SIZE];
+        assert!(parse_ymodem_block_zero_payload(&payload).is_none());
+    }
+
+    /// Modtime of 0 (octal) is the spec-defined "unknown" sentinel —
+    /// the parser must report `None` rather than `Some(0)`, so callers
+    /// don't set the file's mtime to the UNIX epoch.
+    #[test]
+    fn test_parse_block_zero_zero_modtime_means_unknown() {
+        let mut payload = [0u8; XMODEM_BLOCK_SIZE];
+        let meta_str: &[u8] = b"f\x0010 0 644 0";
+        payload[..meta_str.len()].copy_from_slice(meta_str);
+        let m = parse_ymodem_block_zero_payload(&payload).expect("must parse");
+        assert_eq!(m.size, Some(10));
+        assert_eq!(m.modtime, None, "octal 0 modtime must mean 'unknown'");
+        assert_eq!(m.mode, Some(0o644));
+    }
+
+    /// Mode parser masks to 0o7777 — anything outside the permission
+    /// and setuid/setgid/sticky bits (file-type bits such as 0o100000
+    /// for "regular file") must be stripped before reaching the caller.
+    #[test]
+    fn test_parse_block_zero_mode_masking() {
+        let mut payload = [0u8; XMODEM_BLOCK_SIZE];
+        // 0o100755 = regular file, rwxr-xr-x.  Mask should drop
+        // the 0o100000 file-type bit.
+        let meta_str: &[u8] = b"f\x001 0 100755 0";
+        payload[..meta_str.len()].copy_from_slice(meta_str);
+        let m = parse_ymodem_block_zero_payload(&payload).expect("must parse");
+        assert_eq!(m.mode, Some(0o755));
+    }
+
+    /// Junk in the metadata field must not panic; well-formed earlier
+    /// fields must still be returned.  A common failure mode for
+    /// minimally-conformant senders is putting a non-numeric token
+    /// where modtime should be.
+    #[test]
+    fn test_parse_block_zero_tolerates_junk_after_size() {
+        let mut payload = [0u8; XMODEM_BLOCK_SIZE];
+        let meta_str: &[u8] = b"f\x0042 not_a_number also_junk 0";
+        payload[..meta_str.len()].copy_from_slice(meta_str);
+        let m = parse_ymodem_block_zero_payload(&payload).expect("must parse");
+        assert_eq!(m.size, Some(42));
+        assert_eq!(m.modtime, None);
+        assert_eq!(m.mode, None);
+    }
+
+    /// The metadata block in our emitted block 0 must be NUL-terminated
+    /// (Forsberg §6.1 fixes this — the receiver looks for the NUL to
+    /// know where the field block ends).  Pin it explicitly.
+    #[tokio::test]
+    async fn test_ymodem_block_zero_metadata_nul_terminated() {
+        let header = YmodemHeader {
+            filename: "z".to_string(),
+            size: 1,
+            modtime: Some(0o12345),
+            mode: Some(0o644),
+        };
+        let wire = capture_xmodem_wire(
+            b"z",
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        let payload = &wire[off..off + 128];
+        // Filename NUL at offset 1 ("z\0..."); next NUL must terminate
+        // the metadata block, after which the rest is NUL padding.
+        assert_eq!(payload[0], b'z');
+        assert_eq!(payload[1], 0, "filename must be NUL-terminated");
+        // Find the metadata terminator.  After the filename NUL the
+        // next NUL byte ends the metadata field block.
+        let term = payload[2..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("metadata terminator NUL")
+            + 2;
+        // Everything after the terminator must be NUL padding.
+        for (i, &b) in payload[term + 1..].iter().enumerate() {
+            assert_eq!(
+                b, 0,
+                "byte {} after metadata terminator must be NUL fill, got 0x{:02X}",
+                i, b,
+            );
+        }
+    }
+
+    /// Callers who don't supply modtime/mode (e.g. pure in-memory
+    /// senders that don't have a real file) must get spec-conformant
+    /// `0` substitution rather than absence.  This keeps the
+    /// space-separated field count at exactly 4, which simpler
+    /// receivers may rely on for positional parsing.
+    #[tokio::test]
+    async fn test_ymodem_block_zero_none_metadata_emits_zeroes() {
+        let header = YmodemHeader {
+            filename: "n".to_string(),
+            size: 5,
+            modtime: None,
+            mode: None,
+        };
+        let wire = capture_xmodem_wire(
+            b"hello",
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        let payload = &wire[off..off + 128];
+        let nul = payload.iter().position(|&b| b == 0).unwrap();
+        let after = &payload[nul + 1..];
+        let end = after.iter().position(|&b| b == 0).unwrap();
+        let meta = std::str::from_utf8(&after[..end]).unwrap();
+        let fields: Vec<&str> = meta.split_ascii_whitespace().collect();
+        assert_eq!(fields, vec!["5", "0", "0", "0"]);
+    }
+
+    /// Mode is masked to 0o7777 BEFORE emission so a misbehaving caller
+    /// can't smuggle file-type bits onto the wire.  This guards against
+    /// a future caller passing the raw `st_mode` value (which includes
+    /// 0o170000 file-type bits) without masking.
+    #[tokio::test]
+    async fn test_ymodem_block_zero_mode_masked_before_emission() {
+        let header = YmodemHeader {
+            filename: "m".to_string(),
+            size: 1,
+            modtime: Some(1),
+            // 0o140755 = socket + rwxr-xr-x — caller passed the full
+            // st_mode including the 0o140000 file-type bits.  We must
+            // strip them.
+            mode: Some(0o140755),
+        };
+        let wire = capture_xmodem_wire(
+            b"m",
+            false,
+            Some(header),
+            &[CRC_REQUEST, ACK, CRC_REQUEST, ACK, ACK],
+        )
+        .await;
+        let (_, _, _, off) = find_first_block(&wire).expect("no block");
+        let payload = &wire[off..off + 128];
+        let nul = payload.iter().position(|&b| b == 0).unwrap();
+        let after = &payload[nul + 1..];
+        let end = after.iter().position(|&b| b == 0).unwrap();
+        let meta = std::str::from_utf8(&after[..end]).unwrap();
+        let fields: Vec<&str> = meta.split_ascii_whitespace().collect();
+        let emitted_mode = u32::from_str_radix(fields[2], 8).unwrap();
+        assert_eq!(emitted_mode & 0o170000, 0, "file-type bits must be stripped");
+        assert_eq!(emitted_mode, 0o0755, "permission bits must survive");
+    }
+
     #[test]
     fn test_xmodem_crc16_canonical_vector() {
         // Forsberg "XMODEM/YMODEM Protocol Reference" cites the
@@ -2675,6 +3199,186 @@ mod tests {
         // implementation as a separate spec-citation test from the
         // pre-existing internal vector test.
         assert_eq!(crc16_xmodem(b"123456789"), 0x31C3);
+    }
+
+    /// Forsberg's CAN×2 abort rule, unit-tested at the helper level.
+    /// First CAN arms `pending_can` and returns false; second
+    /// consecutive CAN returns true; any non-CAN byte clears the flag.
+    #[test]
+    fn test_is_can_abort_state_transitions() {
+        let mut state = ReadState::default();
+        // Single CAN: arms but doesn't abort.
+        assert!(!is_can_abort(CAN, &mut state));
+        assert!(state.pending_can);
+        // Second consecutive CAN: aborts.
+        assert!(is_can_abort(CAN, &mut state));
+        // After aborting, flag is cleared.
+        assert!(!state.pending_can);
+        // Single CAN, then non-CAN byte: flag cleared, no abort.
+        assert!(!is_can_abort(CAN, &mut state));
+        assert!(state.pending_can);
+        assert!(!is_can_abort(ACK, &mut state));
+        assert!(!state.pending_can);
+        // After a non-CAN byte clears the flag, a single CAN doesn't
+        // abort even though there was a CAN before.  Only **consecutive**
+        // CANs trigger abort per Forsberg's rule.
+        assert!(!is_can_abort(CAN, &mut state));
+        assert!(!is_can_abort(NAK, &mut state));
+        assert!(!is_can_abort(CAN, &mut state));
+        assert!(!is_can_abort(EOT, &mut state));
+    }
+
+    /// A single stray CAN during the receive main loop must NOT abort
+    /// the transfer.  Sender sends block 1 normally, then a stray CAN
+    /// (simulating line noise), then block 2.  Receiver should treat
+    /// the lone CAN as noise and complete the transfer with both
+    /// blocks intact.
+    #[tokio::test]
+    async fn test_xmodem_receive_single_can_is_noise() {
+        let (sender_half, receiver_half) = tokio::io::duplex(16384);
+        let (mut send_read, mut send_write) = tokio::io::split(sender_half);
+        let (mut recv_read, mut recv_write) = tokio::io::split(receiver_half);
+
+        let block1: Vec<u8> = (0..128u8).map(|i| i.wrapping_mul(7)).collect();
+        let block2: Vec<u8> = (0..128u8).map(|i| i.wrapping_mul(11)).collect();
+        let block1_clone = block1.clone();
+        let block2_clone = block2.clone();
+
+        let send_task = tokio::spawn(async move {
+            // Wait for 'C'.
+            let _ = raw_read_byte(&mut send_read, false).await.unwrap();
+            // Send block 1.
+            let mut pkt = vec![SOH, 1, !1u8];
+            pkt.extend_from_slice(&block1_clone);
+            let crc = crc16_xmodem(&block1_clone);
+            pkt.push((crc >> 8) as u8);
+            pkt.push((crc & 0xFF) as u8);
+            send_write.write_all(&pkt).await.unwrap();
+            assert_eq!(raw_read_byte(&mut send_read, false).await.unwrap(), ACK);
+            // Stray single CAN — must be ignored as noise.
+            raw_write_byte(&mut send_write, CAN, false).await.unwrap();
+            // Send block 2 immediately after.  The receiver must have
+            // cleared `pending_can` on receipt of the SOH (non-CAN byte).
+            let mut pkt = vec![SOH, 2, !2u8];
+            pkt.extend_from_slice(&block2_clone);
+            let crc = crc16_xmodem(&block2_clone);
+            pkt.push((crc >> 8) as u8);
+            pkt.push((crc & 0xFF) as u8);
+            send_write.write_all(&pkt).await.unwrap();
+            assert_eq!(raw_read_byte(&mut send_read, false).await.unwrap(), ACK);
+            // EOT to end.
+            raw_write_byte(&mut send_write, EOT, false).await.unwrap();
+            assert_eq!(raw_read_byte(&mut send_read, false).await.unwrap(), ACK);
+        });
+
+        let (received, _) = xmodem_receive(
+            &mut recv_read, &mut recv_write, false, false, false,
+        )
+        .await
+        .expect("transfer must complete despite stray CAN");
+
+        send_task.await.unwrap();
+        let mut expected = block1;
+        expected.extend_from_slice(&block2);
+        assert_eq!(received, expected, "all data must round-trip");
+    }
+
+    /// CAN, non-CAN byte, CAN must NOT abort: the non-CAN byte
+    /// breaks the "consecutive" run.  This pins the contract that
+    /// the abort rule is *strictly* consecutive — a CAN followed by
+    /// any other byte resets the state machine.
+    #[tokio::test]
+    async fn test_xmodem_receive_can_then_other_then_can_does_not_abort() {
+        let (sender_half, receiver_half) = tokio::io::duplex(16384);
+        let (mut send_read, mut send_write) = tokio::io::split(sender_half);
+        let (mut recv_read, mut recv_write) = tokio::io::split(receiver_half);
+
+        let block1: Vec<u8> = (0..128u8).map(|i| i.wrapping_mul(13)).collect();
+        let block1_clone = block1.clone();
+
+        // Drain receiver-side bytes until we see `target`, ignoring
+        // the negotiation loop's 'C' retries that arrive after the
+        // first CAN before the receiver sees the next data byte.
+        async fn read_until(
+            reader: &mut (impl AsyncRead + Unpin),
+            target: u8,
+        ) -> u8 {
+            loop {
+                let b = raw_read_byte(reader, false).await.unwrap();
+                if b == target {
+                    return b;
+                }
+            }
+        }
+
+        let send_task = tokio::spawn(async move {
+            // Wait for 'C'.
+            let _ = raw_read_byte(&mut send_read, false).await.unwrap();
+            // CAN — arms pending_can on the receiver side.
+            raw_write_byte(&mut send_write, CAN, false).await.unwrap();
+            // Block 1 (SOH+...) — non-CAN bytes clear pending_can.
+            let mut pkt = vec![SOH, 1, !1u8];
+            pkt.extend_from_slice(&block1_clone);
+            let crc = crc16_xmodem(&block1_clone);
+            pkt.push((crc >> 8) as u8);
+            pkt.push((crc & 0xFF) as u8);
+            send_write.write_all(&pkt).await.unwrap();
+            // Receiver may have sent additional 'C' requests after
+            // the first CAN before reading our SOH; drain them.
+            let _ = read_until(&mut send_read, ACK).await;
+            // Another single CAN — should NOT abort because the SOH
+            // and block body cleared the run.
+            raw_write_byte(&mut send_write, CAN, false).await.unwrap();
+            // EOT to gracefully end the transfer.
+            raw_write_byte(&mut send_write, EOT, false).await.unwrap();
+            let _ = read_until(&mut send_read, ACK).await;
+        });
+
+        let (received, _) = xmodem_receive(
+            &mut recv_read, &mut recv_write, false, false, false,
+        )
+        .await
+        .expect("two non-consecutive single CANs must not abort");
+
+        send_task.await.unwrap();
+        assert_eq!(received, block1);
+    }
+
+    /// Sender side of the same property: a single CAN from the
+    /// receiver mid-transfer (e.g. line noise) must NOT abort the
+    /// send — the sender keeps reading until either a definitive
+    /// ACK/NAK arrives or a second consecutive CAN follows.
+    #[tokio::test]
+    async fn test_xmodem_send_single_can_then_ack_continues() {
+        let (sender_half, receiver_half) = tokio::io::duplex(16384);
+        let (mut send_read, mut send_write) = tokio::io::split(sender_half);
+        let (mut recv_read, mut recv_write) = tokio::io::split(receiver_half);
+
+        let data = b"hello, single-CAN-noise!".to_vec();
+        let send_task = tokio::spawn(async move {
+            xmodem_send(
+                &mut send_read, &mut send_write, &data,
+                false, false, false, false, None,
+            ).await
+        });
+
+        let recv_task = tokio::spawn(async move {
+            // Request CRC mode.
+            raw_write_byte(&mut recv_write, CRC_REQUEST, false).await.unwrap();
+            // Read block 1.
+            let _ = read_soh_crc_block(&mut recv_read).await;
+            // Stray single CAN, then ACK.  Sender must drain the CAN
+            // and treat ACK as the definitive response.
+            raw_write_byte(&mut recv_write, CAN, false).await.unwrap();
+            raw_write_byte(&mut recv_write, ACK, false).await.unwrap();
+            // Read EOT, ACK it.
+            assert_eq!(raw_read_byte(&mut recv_read, false).await.unwrap(), EOT);
+            raw_write_byte(&mut recv_write, ACK, false).await.unwrap();
+        });
+
+        let result = send_task.await.unwrap();
+        recv_task.await.unwrap();
+        result.expect("sender must complete despite stray CAN from receiver");
     }
 
     #[test]
@@ -2979,7 +3683,7 @@ mod tests {
         )
         .await;
         let _ = sx.wait().await;
-        let mut received = recv_result.expect("xmodem_receive against sx failed");
+        let (mut received, _) = recv_result.expect("xmodem_receive against sx failed");
 
         // sx pads with 0x1A; our receiver strips trailing SUB bytes for
         // plain XMODEM (no size info).  Strip any residual 0x1A in case
@@ -3046,7 +3750,7 @@ mod tests {
         )
         .await;
         let _ = sx.wait().await;
-        let mut received = recv_result.expect("xmodem_receive against sx -k failed");
+        let (mut received, _) = recv_result.expect("xmodem_receive against sx -k failed");
 
         while received.last() == Some(&0x1A) {
             received.pop();
@@ -3093,6 +3797,8 @@ mod tests {
         let header = YmodemHeader {
             filename: "ymodem_test.bin".to_string(),
             size: payload.len() as u64,
+            modtime: None,
+            mode: None,
         };
 
         let mut rb = Command::new("rb")
@@ -3124,6 +3830,102 @@ mod tests {
         // YMODEM declares size in block 0, so rb truncates exactly —
         // no SUB-strip needed and the comparison is byte-exact.
         assert_eq!(received, payload);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Our sender (YMODEM mode, full metadata) → real `rb`.  Emits
+    /// block 0 with the maximum-conformance metadata quartet
+    /// (length/modtime/mode/sno) and validates that `rb` not only
+    /// accepts the transfer but applies the modtime to the saved
+    /// file.  This pins down end-to-end interop with the most
+    /// common real-world YMODEM receiver when full metadata is in
+    /// play, complementing the size-only path above.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_lrzsz_ymodem_rb_full_metadata() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        if Command::new("rb")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            panic!("rb (lrzsz) not found on PATH");
+        }
+
+        let tmp = std::env::temp_dir()
+            .join(format!("ymodem_rb_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let payload: Vec<u8> = (0..512u32)
+            .map(|i| (i.wrapping_mul(13) & 0xFF) as u8)
+            .collect();
+        // Use a clearly-in-the-past timestamp so we can distinguish
+        // it from rb's "use now" fallback (which it would apply if
+        // we omitted modtime).  2017-07-14 19:40:00 UTC.
+        let target_modtime: u64 = 1_500_000_000;
+        let header = YmodemHeader {
+            filename: "ymodem_meta.bin".to_string(),
+            size: payload.len() as u64,
+            modtime: Some(target_modtime),
+            mode: Some(0o100644),
+        };
+
+        let mut rb = Command::new("rb")
+            .current_dir(&tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rb");
+
+        let mut rb_stdin = rb.stdin.take().unwrap();
+        let mut rb_stdout = rb.stdout.take().unwrap();
+
+        let send_result = xmodem_send(
+            &mut rb_stdout,
+            &mut rb_stdin,
+            &payload,
+            false,
+            false,
+            true,
+            false,
+            Some(header),
+        )
+        .await;
+        let _ = rb.wait().await;
+        send_result.expect("xmodem_send (YMODEM full meta) against rb failed");
+
+        let saved_path = tmp.join("ymodem_meta.bin");
+        let received = std::fs::read(&saved_path).unwrap();
+        assert_eq!(received, payload, "data must round-trip");
+
+        // rb honors block-0 modtime by setting the saved file's
+        // mtime — verify it lands within ±1 second of what we sent
+        // (filesystem second-granularity tolerance).
+        let saved_mtime = std::fs::metadata(&saved_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let delta = (saved_mtime - target_modtime as i64).abs();
+        assert!(
+            delta <= 1,
+            "rb saved-file mtime ({}) must match block-0 modtime ({}); delta={}",
+            saved_mtime,
+            target_modtime,
+            delta,
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3194,13 +3996,84 @@ mod tests {
         )
         .await;
         let _ = sb.wait().await;
-        let received = recv_result.expect("xmodem_receive against sb failed");
+        let (received, meta) = recv_result.expect("xmodem_receive against sb failed");
 
         assert_eq!(
             received, payload,
             "YMODEM size-truncation should preserve trailing 0x1A bytes"
         );
 
+        // sb populates the full block-0 metadata quartet — surface it
+        // through our parser so this test pins the interop contract
+        // for the modtime/mode fields, not just the data round-trip.
+        let m = meta.expect("sb must emit block-0 metadata");
+        assert_eq!(
+            m.size,
+            Some(payload.len() as u64),
+            "block-0 length must match real file size",
+        );
+        // sb fills modtime from the source file's stat, which we just
+        // wrote above — must be a recent value, not 0.
+        let modtime = m.modtime.expect("sb must emit modtime");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            modtime > 0 && now.saturating_sub(modtime) < 60,
+            "sb modtime ({}) must be a recent UNIX timestamp",
+            modtime,
+        );
+        // sb emits the source file's mode; std::fs::write produces
+        // 0o644 by default on Linux, possibly modified by umask.
+        // Just check that the perm bits are non-zero and within
+        // 0o7777.
+        let mode = m.mode.expect("sb must emit mode");
+        assert!(
+            mode != 0 && mode & !0o7777 == 0,
+            "sb mode ({:o}) must be a valid permission word",
+            mode,
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── proptest fuzz: parse_ymodem_block_zero_payload ─────────
+    //
+    // The block-0 parser sees adversarial bytes from any sender that
+    // can drive an XMODEM-mode handshake.  Spec senders are
+    // well-formed; broken or malicious senders may send anything in
+    // the 128-byte payload.  Property: the parser never panics —
+    // outcomes are `Some(meta)` or `None`.  An out-of-bounds index,
+    // subtraction overflow, or UTF-8 unwrap would surface here.
+
+    mod ymodem_parser_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                ..ProptestConfig::default()
+            })]
+
+            /// 128-byte payloads sized exactly as the receiver sees
+            /// them — must never panic regardless of content.
+            #[test]
+            fn prop_parse_block_zero_full_size_no_panic(
+                bytes in prop::collection::vec(any::<u8>(), XMODEM_BLOCK_SIZE..=XMODEM_BLOCK_SIZE),
+            ) {
+                let _ = parse_ymodem_block_zero_payload(&bytes);
+            }
+
+            /// Parser is also called on shorter slices in tests; must
+            /// tolerate any length without panic.
+            #[test]
+            fn prop_parse_block_zero_arbitrary_length_no_panic(
+                bytes in prop::collection::vec(any::<u8>(), 0..256),
+            ) {
+                let _ = parse_ymodem_block_zero_payload(&bytes);
+            }
+        }
     }
 }

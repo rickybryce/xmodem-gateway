@@ -2,7 +2,7 @@
 //!
 //! Runs on a dedicated `std::thread` (not a tokio task) so it can own the
 //! synchronous `serialport::SerialPort` object.  Bridges to the async runtime
-//! via `tokio::runtime::Handle` for `ATDT xmodem-gateway` connections.
+//! via `tokio::runtime::Handle` for `ATDT vintage-gateway` connections.
 //!
 //! Supported AT commands: AT, AT?, ATZ, AT&F, AT&W, AT&V, ATE0/ATE1,
 //! ATV0/ATV1, ATQ0/ATQ1, ATI (I0-I7), ATH, ATA, ATO, ATDT, ATDP, ATD,
@@ -17,7 +17,7 @@
 //! Gateway-friendly defaults: AT&D0 (ignore DTR), AT&K0 (no modem-layer
 //! flow control), S7=15 (carrier wait).  These differ from Hayes defaults
 //! (AT&D2, AT&K3, S7=50) to avoid breaking retro clients that don't drive
-//! DTR/RTS correctly.  All settings persist via AT&W into `xmodem.conf`.
+//! DTR/RTS correctly.  All settings persist via AT&W into `vgateway.conf`.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +90,7 @@ const DEFAULT_DTR_MODE: u8 = 0;
 /// Gateway-friendly default for AT&K (modem-layer flow control).
 /// &K0 = none.  Hayes default is &K3 (RTS/CTS), which stalls clients that
 /// don't do hardware flow control.  Physical-port flow control is set by
-/// `serial_flowcontrol` in xmodem.conf.
+/// `serial_flowcontrol` in vgateway.conf.
 const DEFAULT_FLOW_MODE: u8 = 0;
 /// Gateway-friendly default for AT&C (DCD handling).
 /// &C1 = DCD tracks carrier state.  Matches Hayes default.
@@ -161,7 +161,7 @@ struct ModemState {
     dtr_mode: u8,
     /// AT&K modem-layer flow control (0-4).  Stored and persisted.  The
     /// physical serial port's flow control is controlled by
-    /// `serial_flowcontrol` in xmodem.conf, not by this value.
+    /// `serial_flowcontrol` in vgateway.conf, not by this value.
     flow_mode: u8,
     /// AT&C DCD mode (0-1).  Stored and persisted.  &C1 (default) reports
     /// carrier; &C0 forces DCD always asserted.  Physical DCD signalling
@@ -518,7 +518,7 @@ fn parse_at_command(
         }
         "I" | "I0" => vec![
             AtResult::Info(format!(
-                "XMODEM Gateway Modem Emulator v{}",
+                "Vintage Gateway Modem Emulator v{}",
                 env!("CARGO_PKG_VERSION")
             )),
             AtResult::Ok,
@@ -527,7 +527,7 @@ fn parse_at_command(
         "I2" => vec![AtResult::Ok],
         "I3" => vec![
             AtResult::Info(format!(
-                "XMODEM Gateway {}",
+                "Vintage Gateway {}",
                 env!("CARGO_PKG_VERSION")
             )),
             AtResult::Ok,
@@ -542,7 +542,7 @@ fn parse_at_command(
             AtResult::Ok,
         ],
         "I7" => vec![
-            AtResult::Info("Product: xmodem-gateway (software emulator)".into()),
+            AtResult::Info("Product: vintage-gateway (software emulator)".into()),
             AtResult::Ok,
         ],
         "?" => vec![AtResult::Help],
@@ -945,7 +945,7 @@ fn handle_return_online(state: &mut ModemState) {
 
 // ─── Dialing ───────────────────────────────────────────────
 
-/// Built-in phone number that dials the local XMODEM Gateway menu.
+/// Built-in phone number that dials the local Vintage Gateway menu.
 const GATEWAY_PHONE_NUMBER: &str = "1001000";
 
 /// Parsed representation of an ATDT/ATDP dial string with Hayes modifiers
@@ -1062,12 +1062,12 @@ fn handle_dial(state: &mut ModemState, target: &str) {
     if is_phone_number(target)
         && config::normalize_phone_number(target) == GATEWAY_PHONE_NUMBER
     {
-        dial_xmodem_gateway(state);
+        dial_vintage_gateway(state);
         return;
     }
 
-    if lower == "xmodem-gateway" || lower == "xmodem gateway" {
-        dial_xmodem_gateway(state);
+    if lower == "vintage-gateway" || lower == "vintage gateway" {
+        dial_vintage_gateway(state);
     } else {
         // If the target looks like a phone number (digits, dashes, spaces,
         // parens, etc.), look it up in the dialup mapping file.
@@ -1125,8 +1125,8 @@ fn is_phone_number(s: &str) -> bool {
     has_digit && all_phone
 }
 
-/// Dial into the local XMODEM Gateway menu via an in-memory duplex bridge.
-fn dial_xmodem_gateway(state: &mut ModemState) {
+/// Dial into the local Vintage Gateway menu via an in-memory duplex bridge.
+fn dial_vintage_gateway(state: &mut ModemState) {
     send_result(state, "CONNECT");
     state.mode = ModemMode::Online;
 
@@ -1236,7 +1236,7 @@ fn dial_tcp(state: &mut ModemState, host: &str, port: u16) {
 
 // ─── Online mode (data passthrough) ────────────────────────
 
-/// Online mode for the duplex bridge (ATDT xmodem-gateway).
+/// Online mode for the duplex bridge (ATDT vintage-gateway).
 ///
 /// Uses `Handle::block_on` to perform async reads/writes on the duplex stream.
 /// This is safe because the serial thread is a `std::thread`, not a tokio task.
@@ -1508,9 +1508,9 @@ fn process_ring(state: &mut ModemState, sender: tokio::sync::mpsc::Sender<u8>) {
         }
     }
 
-    // Answer: connect to xmodem-gateway
+    // Answer: connect to vintage-gateway
     let _ = sender.try_send(1); // notify telnet/SSH: answered
-    dial_xmodem_gateway(state);
+    dial_vintage_gateway(state);
 }
 
 // ─── Config persistence helpers ────────────────────────────
@@ -1726,7 +1726,7 @@ mod tests {
         let results = parse("ATI", &mut echo);
         assert_eq!(results.len(), 2);
         match &results[0] {
-            AtResult::Info(msg) => assert!(msg.contains("XMODEM Gateway")),
+            AtResult::Info(msg) => assert!(msg.contains("Vintage Gateway")),
             other => panic!("Expected Info, got {:?}", other),
         }
         assert_eq!(results[1], AtResult::Ok);
@@ -1735,10 +1735,10 @@ mod tests {
     #[test]
     fn test_atdt_gateway() {
         let mut echo = true;
-        let results = parse("ATDT xmodem-gateway", &mut echo);
+        let results = parse("ATDT vintage-gateway", &mut echo);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            AtResult::Dial(target) => assert_eq!(target, "xmodem-gateway"),
+            AtResult::Dial(target) => assert_eq!(target, "vintage-gateway"),
             other => panic!("Expected Dial, got {:?}", other),
         }
     }
@@ -2435,14 +2435,14 @@ mod tests {
     }
 
     #[test]
-    fn test_atdt_xmodem_gateway_case_variants() {
-        // The dial handler lowercases before comparing to "xmodem-gateway"
+    fn test_atdt_vintage_gateway_case_variants() {
+        // The dial handler lowercases before comparing to "vintage-gateway"
         let variants = [
-            "ATDT xmodem-gateway",
-            "ATDT XMODEM-GATEWAY",
-            "ATDT Xmodem-Gateway",
-            "ATDT xmodem gateway",
-            "ATDT XMODEM GATEWAY",
+            "ATDT vintage-gateway",
+            "ATDT VINTAGE-GATEWAY",
+            "ATDT Vintage-Gateway",
+            "ATDT vintage gateway",
+            "ATDT VINTAGE GATEWAY",
         ];
         for cmd in &variants {
             let mut echo = true;
@@ -2541,7 +2541,7 @@ mod tests {
     fn test_is_phone_number_not_hostname() {
         assert!(!is_phone_number("bbs.example.com"));
         assert!(!is_phone_number("bbs.example.com:23"));
-        assert!(!is_phone_number("xmodem-gateway"));
+        assert!(!is_phone_number("vintage-gateway"));
         assert!(!is_phone_number("localhost"));
     }
 
@@ -2710,8 +2710,8 @@ mod tests {
 
     #[test]
     fn test_parse_dial_plain_hostname() {
-        let p = parse_dial_string("xmodem-gateway", &S_REG_DEFAULTS);
-        assert_eq!(p.target, "xmodem-gateway");
+        let p = parse_dial_string("vintage-gateway", &S_REG_DEFAULTS);
+        assert_eq!(p.target, "vintage-gateway");
         assert_eq!(p.pre_delay, Duration::ZERO);
         assert!(!p.stay_in_command);
     }

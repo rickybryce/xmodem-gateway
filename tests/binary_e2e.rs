@@ -1,4 +1,4 @@
-//! Binary-level e2e: drives the actual `xmodem-gateway` binary as a
+//! Binary-level e2e: drives the actual `vintage-gateway` binary as a
 //! subprocess.  Writes a fresh config to a tmpdir, launches the
 //! binary, connects via TCP to the telnet port, navigates the menu
 //! to the web browser, fetches a page from a localhost HTTP server
@@ -56,7 +56,7 @@ fn test_binary_telnet_browser_e2e() {
     });
 
     // 3. Set up an isolated config in a tmpdir.  The binary auto-
-    // creates xmodem.conf in its CWD if missing; pre-writing it lets
+    // creates vgateway.conf in its CWD if missing; pre-writing it lets
     // us pin telnet_port, disable GUI/SSH/auth, and point the
     // transfer dir somewhere harmless.
     let tmp = std::env::temp_dir()
@@ -76,19 +76,19 @@ fn test_binary_telnet_browser_e2e() {
         telnet_port,
         xfer.display()
     );
-    std::fs::write(tmp.join("xmodem.conf"), &config).unwrap();
+    std::fs::write(tmp.join("vgateway.conf"), &config).unwrap();
 
     // 4. Launch the binary.  CARGO_BIN_EXE_<crate> is a compile-time
     // env var Cargo sets for integration tests; access it via env!()
     // (it isn't visible at runtime through std::env::var).
-    let binary = env!("CARGO_BIN_EXE_xmodem-gateway");
+    let binary = env!("CARGO_BIN_EXE_vintage-gateway");
 
     let mut child = Command::new(binary)
         .current_dir(&tmp)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn xmodem-gateway");
+        .expect("failed to spawn vintage-gateway");
 
     // Always reap the child even on panic.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -143,10 +143,10 @@ fn run_session(telnet_port: u16, http_port: u16) {
     conn.write_all(b"N").unwrap();
 
     // 10. Drain through the main menu prompt.  In Ascii mode the
-    // prompt is exactly "xmodem> " (no ANSI escapes).
-    let main_menu = drain_until(&mut conn, b"xmodem> ", Duration::from_secs(5));
+    // prompt is exactly "vintage> " (no ANSI escapes).
+    let main_menu = drain_until(&mut conn, b"vintage> ", Duration::from_secs(5));
     assert!(
-        contains(&main_menu, b"XMODEM GATEWAY"),
+        contains(&main_menu, b"VINTAGE GATEWAY"),
         "expected welcome banner, got: {:?}",
         printable_excerpt(&main_menu)
     );
@@ -154,7 +154,7 @@ fn run_session(telnet_port: u16, http_port: u16) {
     // 11. Enter the browser menu: send 'b' + CR.
     conn.write_all(b"b\r").unwrap();
     let browser_home =
-        drain_until(&mut conn, b"xmodem/web> ", Duration::from_secs(5));
+        drain_until(&mut conn, b"vintage/web> ", Duration::from_secs(5));
     assert!(
         !browser_home.is_empty(),
         "browser home should produce output"

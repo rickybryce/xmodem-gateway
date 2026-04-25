@@ -25,7 +25,7 @@ use logger::glog;
 fn main() {
     logger::init();
 
-    glog!("XMODEM Gateway v{}", env!("CARGO_PKG_VERSION"));
+    glog!("Vintage Gateway v{}", env!("CARGO_PKG_VERSION"));
     glog!("Author: Ricky Bryce");
     glog!();
 
