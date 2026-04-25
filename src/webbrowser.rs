@@ -1547,6 +1547,242 @@ mod tests {
         const _: () = assert!(GOPHER_MAX_BODY > 0);
     }
 
+    // ─── RFC 1436 (Gopher) conformance tests ─────────────────
+    //
+    // Each test cites the exact RFC 1436 section it locks down so a
+    // future reader can audit our behavior against the spec without
+    // chasing through render code.  Format under test (RFC 1436 §3):
+    //   <type><display>\t<selector>\t<host>\t<port>\r\n
+    // Terminator (§3.8): a line containing only "." + CRLF.
+    // URL format (RFC 4266): gopher://host[:port]/<type><selector>.
+
+    /// Build a one-line gopher menu fragment for a single item, then
+    /// wrap it in a valid menu (with terminator) and parse it through
+    /// `render_gopher_directory`.  Returns the parsed `WebPage`.
+    fn render_one_item(line: &str) -> WebPage {
+        let menu = format!("{line}\r\n.\r\n");
+        render_gopher_directory(&menu, "localhost", 70, 73, "gopher://localhost/1".into())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_0_text_creates_link() {
+        // §3.6: type '0' = "Item is a file", linkable.  Menu-line
+        // type prefix is separate from the selector field per §3.5.
+        let page = render_one_item("0README\t/readme.txt\texample.org\t70");
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0], "gopher://example.org/0/readme.txt");
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_1_directory_creates_link() {
+        // §3.6: type '1' = "Item is a directory", linkable.
+        let page = render_one_item("1Sub\t/sub\texample.org\t70");
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0], "gopher://example.org/1/sub");
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_7_search_marks_query_url() {
+        // §3.9: type '7' = "Item is an Index-Search server", the
+        // selector is the search target and the client is expected
+        // to prompt the user for a query string.  We tag the URL
+        // with `?search` so the browser layer knows to prompt.
+        let page = render_one_item("7Search\t/q\texample.org\t70");
+        assert_eq!(page.links.len(), 1);
+        assert!(
+            page.links[0].ends_with("?search"),
+            "type-7 link should be tagged with ?search marker, got {}",
+            page.links[0]
+        );
+        assert!(is_gopher_search(&page.links[0]));
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_h_html_extracts_url_prefix() {
+        // Gopher+ extension: type 'h' carries an HTTP/HTTPS URL in
+        // the selector field with a "URL:" prefix.  Our renderer
+        // strips the prefix and uses the trailing URL as the link.
+        let page = render_one_item("hExample\tURL:https://example.org/\texample.org\t70");
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0], "https://example.org/");
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_i_info_no_link() {
+        // Gopher+ extension: type 'i' is purely informational —
+        // displayed text with no associated selector/host/port.  Must
+        // NOT produce a link.
+        let page = render_one_item("iJust some text\t\t\t0");
+        assert!(
+            page.links.is_empty(),
+            "informational lines should not produce links, got {} links",
+            page.links.len()
+        );
+        assert!(page.lines.iter().any(|l| l.contains("Just some text")));
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_3_error_prefixed() {
+        // §3.6: type '3' = error.  We prefix the display text with
+        // "ERR:" so users can distinguish error rows from info rows.
+        let page = render_one_item("3Permission denied\t\t\t0");
+        assert!(
+            page.lines.iter().any(|l| l.starts_with("ERR:")),
+            "type-3 error rows should be prefixed with 'ERR:', got: {:?}",
+            page.lines
+        );
+        assert!(page.links.is_empty());
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_9_binary_label_no_link() {
+        // §3.6: type '9' = binary file.  We can't render a binary
+        // through a text terminal, so we display "[BIN]" and offer
+        // no link.
+        let page = render_one_item("9archive.zip\t/9/a.zip\texample.org\t70");
+        assert!(page.links.is_empty(), "binary items should not be linkable");
+        assert!(
+            page.lines.iter().any(|l| l.contains("[BIN]")),
+            "expected [BIN] label, got: {:?}",
+            page.lines
+        );
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_image_label_no_link() {
+        // §3.6: 'g' = GIF, 'I' = image (generic), 'p' = PNG (gopher+).
+        // All non-linkable in a text browser, all rendered as [IMG].
+        for ty in ['g', 'I', 'p'] {
+            let line = format!("{ty}pic.png\t/sel\texample.org\t70");
+            let page = render_one_item(&line);
+            assert!(
+                page.links.is_empty(),
+                "type {} should not produce a link",
+                ty
+            );
+            assert!(
+                page.lines.iter().any(|l| l.contains("[IMG]")),
+                "type {} should render with [IMG] label",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_s_sound_label_no_link() {
+        // §3.6: 's' = sound.  Same treatment as binary/image —
+        // labeled, not linked.
+        let page = render_one_item("ssong.mp3\t/s\texample.org\t70");
+        assert!(page.links.is_empty());
+        assert!(page.lines.iter().any(|l| l.contains("[SND]")));
+    }
+
+    #[test]
+    fn test_rfc1436_item_type_unknown_label_no_link() {
+        // §3.6 lists 2/4/5/6/8/T/+ as defined types we don't have
+        // first-class rendering for.  Falling back to [???] is the
+        // safe behavior: never offer a link for a type we can't
+        // safely follow, but still surface that something is there.
+        for ty in ['2', '4', '5', '6', '8', 'T', '+'] {
+            let line = format!("{ty}Mystery\t/m\texample.org\t70");
+            let page = render_one_item(&line);
+            assert!(
+                page.links.is_empty(),
+                "unknown type {} must not produce a link",
+                ty
+            );
+            assert!(
+                page.lines.iter().any(|l| l.contains("[???]")),
+                "unknown type {} should render with [???] label",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn test_rfc1436_menu_terminator_period_ends_parsing() {
+        // §3.8: a line containing only "." (followed by CRLF) marks
+        // the end of a menu.  Anything after must be ignored.
+        let menu = "0First\t/0/a\texample.org\t70\r\n\
+                    .\r\n\
+                    0AfterTerminator\t/0/b\texample.org\t70\r\n";
+        let page =
+            render_gopher_directory(menu, "localhost", 70, 73, "gopher://localhost/1".into())
+                .unwrap();
+        assert_eq!(
+            page.links.len(),
+            1,
+            "items after the '.' terminator must be ignored"
+        );
+        assert!(page.links[0].contains("/0/a"));
+    }
+
+    #[test]
+    fn test_rfc1436_blank_line_preserved() {
+        // §3.5 allows blank lines for visual spacing.  We pass them
+        // through as empty lines in the rendered output.
+        let menu = "iAbove\t\t\t0\r\n\
+                    \r\n\
+                    iBelow\t\t\t0\r\n\
+                    .\r\n";
+        let page =
+            render_gopher_directory(menu, "localhost", 70, 73, "gopher://localhost/1".into())
+                .unwrap();
+        assert!(page.lines.iter().any(|l| l.is_empty()));
+        assert!(page.lines.iter().any(|l| l.contains("Above")));
+        assert!(page.lines.iter().any(|l| l.contains("Below")));
+    }
+
+    #[test]
+    fn test_rfc4266_url_default_port_omitted() {
+        // RFC 4266 §2.1: if the gopher port is the default (70), it
+        // SHOULD be omitted from the URL.  Our build_gopher_url
+        // honors this.
+        assert_eq!(
+            build_gopher_url("example.org", 70, '1', "/sub"),
+            "gopher://example.org/1/sub"
+        );
+    }
+
+    #[test]
+    fn test_rfc4266_url_non_default_port_included() {
+        // RFC 4266 §2.1: non-default ports MUST be included.
+        assert_eq!(
+            build_gopher_url("example.org", 7070, '1', "/sub"),
+            "gopher://example.org:7070/1/sub"
+        );
+    }
+
+    #[test]
+    fn test_rfc4266_url_round_trip_preserves_components() {
+        // Parse → build → parse stability: every component (host,
+        // port, type, selector) must round-trip identically.
+        let original = "gopher://example.org:9999/0/path/to/file.txt";
+        let (host, port, ty, sel) = parse_gopher_url(original).unwrap();
+        assert_eq!(host, "example.org");
+        assert_eq!(port, 9999);
+        assert_eq!(ty, '0');
+        assert_eq!(sel, "/path/to/file.txt");
+        let rebuilt = build_gopher_url(&host, port, ty, &sel);
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn test_rfc1436_menu_line_uses_tab_separator() {
+        // §3.5: fields within a menu line are separated by a single
+        // ASCII TAB (0x09).  Lock down our renderer's tolerance: a
+        // line missing the tabs falls back to defaults rather than
+        // panicking.  Forwards-compatible for malformed peers.
+        let line = "1NoTabs"; // missing all field separators
+        let menu = format!("{line}\r\n.\r\n");
+        // Should not panic.  The renderer falls back to the current
+        // host/port and an empty selector for the missing fields.
+        let _ =
+            render_gopher_directory(&menu, "localhost", 70, 73, "gopher://localhost/1".into())
+                .unwrap();
+    }
+
     // ─── End-to-end tests against an in-process server ────────
     //
     // These tests bind a `std::net::TcpListener` to 127.0.0.1:0, get
