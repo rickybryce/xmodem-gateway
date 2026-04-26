@@ -106,6 +106,24 @@ const DEFAULT_KERMIT_8BIT_QUOTE: &str = "auto";
 /// `xmodem_iac` so an operator can run telnet ↔ raw-bytes Kermit
 /// transfers independently of the XMODEM family setting.
 const DEFAULT_KERMIT_IAC_ESCAPE: bool = false;
+/// Resume partial uploads (Frank da Cruz spec §5.1, disposition='R').
+/// When true, the receiver tells the sender to skip bytes already on
+/// disk under `transfer_dir/<filename>`.  Default false: opt-in,
+/// because a peer that ignores disposition='R' would re-send from
+/// byte 0 and produce a corrupted file once we land the receiver
+/// pre-load logic in commit 2.
+const DEFAULT_KERMIT_RESUME_PARTIAL: bool = false;
+/// Maximum age (hours) of a partial file we'll resume.  Older
+/// partials are treated as stale rot rather than legitimate
+/// resumable transfers.  168 = one week.
+const DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS: u32 = 168;
+/// Locking-shift mode (Frank da Cruz spec §3.4.5): when both peers
+/// advertise CAPAS_LOCKING_SHIFT, the encoder uses SO/SI region
+/// markers instead of QBIN's per-byte 8th-bit prefix.  Off by
+/// default — no modern Kermit peer (C-Kermit, G-Kermit, Kermit-95,
+/// E-Kermit) negotiates it; flip it on if you're talking to a
+/// strict-spec implementation that does.
+const DEFAULT_KERMIT_LOCKING_SHIFTS: bool = false;
 const DEFAULT_SERIAL_ECHO: bool = true;
 const DEFAULT_SERIAL_VERBOSE: bool = true;
 const DEFAULT_SERIAL_QUIET: bool = false;
@@ -221,6 +239,16 @@ pub struct Config {
     pub kermit_8bit_quote: String,
     /// Telnet IAC escape during Kermit transfers.
     pub kermit_iac_escape: bool,
+    /// Resume partial uploads via the spec's disposition='R' tag in the
+    /// receiver's A-packet ACK.  Off by default; flip on once both sides
+    /// are known to honor it (we ship sender support in a follow-up).
+    pub kermit_resume_partial: bool,
+    /// Max age in hours for a partial file to qualify for resume.
+    /// Older partials are ignored (treated as stale rot).
+    pub kermit_resume_max_age_hours: u32,
+    /// Advertise locking-shift (SO/SI) capability for 8-bit transit
+    /// over 7-bit-only links.  Off by default; modern peers use QBIN.
+    pub kermit_locking_shifts: bool,
     /// Enable serial modem emulation.
     pub serial_enabled: bool,
     /// Serial port device (e.g. /dev/ttyUSB0, COM3). Empty = not configured.
@@ -308,6 +336,9 @@ impl Default for Config {
             kermit_repeat_compression: DEFAULT_KERMIT_REPEAT_COMPRESSION,
             kermit_8bit_quote: DEFAULT_KERMIT_8BIT_QUOTE.into(),
             kermit_iac_escape: DEFAULT_KERMIT_IAC_ESCAPE,
+            kermit_resume_partial: DEFAULT_KERMIT_RESUME_PARTIAL,
+            kermit_resume_max_age_hours: DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS,
+            kermit_locking_shifts: DEFAULT_KERMIT_LOCKING_SHIFTS,
             serial_enabled: DEFAULT_SERIAL_ENABLED,
             serial_port: DEFAULT_SERIAL_PORT.into(),
             serial_baud: DEFAULT_SERIAL_BAUD,
@@ -553,6 +584,19 @@ fn read_config_file(path: &str) -> Config {
             .get("kermit_iac_escape")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(DEFAULT_KERMIT_IAC_ESCAPE),
+        kermit_resume_partial: map
+            .get("kermit_resume_partial")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_RESUME_PARTIAL),
+        kermit_resume_max_age_hours: map
+            .get("kermit_resume_max_age_hours")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u32| v >= 1)
+            .unwrap_or(DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS),
+        kermit_locking_shifts: map
+            .get("kermit_locking_shifts")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_LOCKING_SHIFTS),
         serial_enabled: map
             .get("serial_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -781,6 +825,19 @@ zmodem_negotiation_retry_interval = {}
 # kermit_repeat_compression:   use repeat-count compression (RLE).
 # kermit_8bit_quote:           auto (only when peer asks), on, or off.
 # kermit_iac_escape:           apply telnet IAC escaping during transfers.
+# kermit_resume_partial:       resume partial uploads (spec disposition='R').
+#                              Off by default; turn on only when the peer is
+#                              known to honor disposition='R' in the A-packet
+#                              ACK, otherwise the transfer can corrupt the
+#                              file.
+# kermit_resume_max_age_hours: ignore on-disk partials older than this when
+#                              deciding whether to resume.  168 = one week.
+# kermit_locking_shifts:       advertise SO/SI region-shift capability for
+#                              8-bit transit on 7-bit links (Frank da Cruz
+#                              §3.4.5).  Off by default — no modern Kermit
+#                              peer (C-Kermit, G-Kermit, Kermit-95, E-Kermit)
+#                              negotiates it; flip on only if you're talking
+#                              to a strict-spec implementation that does.
 kermit_negotiation_timeout = {}
 kermit_packet_timeout = {}
 kermit_max_retries = {}
@@ -794,6 +851,9 @@ kermit_attribute_packets = {}
 kermit_repeat_compression = {}
 kermit_8bit_quote = {}
 kermit_iac_escape = {}
+kermit_resume_partial = {}
+kermit_resume_max_age_hours = {}
+kermit_locking_shifts = {}
 
 # Serial modem emulation (Hayes AT commands)
 # Set serial_enabled = true and configure the port to activate.
@@ -891,6 +951,9 @@ ssh_gateway_auth = {}
         cfg.kermit_repeat_compression,
         sanitize_value(&cfg.kermit_8bit_quote),
         cfg.kermit_iac_escape,
+        cfg.kermit_resume_partial,
+        cfg.kermit_resume_max_age_hours,
+        cfg.kermit_locking_shifts,
         cfg.serial_enabled,
         sanitize_value(&cfg.serial_port),
         cfg.serial_baud,
@@ -1096,6 +1159,17 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
         }
         "kermit_iac_escape" => {
             cfg.kermit_iac_escape = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_resume_partial" => {
+            cfg.kermit_resume_partial = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_resume_max_age_hours" => {
+            if let Ok(v) = value.parse::<u32>() && v >= 1 {
+                cfg.kermit_resume_max_age_hours = v;
+            }
+        }
+        "kermit_locking_shifts" => {
+            cfg.kermit_locking_shifts = value.eq_ignore_ascii_case("true");
         }
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
         "serial_port" => cfg.serial_port = value.to_string(),
@@ -1333,6 +1407,9 @@ mod tests {
         assert!(cfg.kermit_repeat_compression);
         assert_eq!(cfg.kermit_8bit_quote, "auto");
         assert!(!cfg.kermit_iac_escape);
+        assert!(!cfg.kermit_resume_partial);
+        assert_eq!(cfg.kermit_resume_max_age_hours, 168);
+        assert!(!cfg.kermit_locking_shifts);
         assert!(!cfg.serial_enabled);
         assert_eq!(cfg.serial_port, "");
         assert_eq!(cfg.serial_baud, 9600);
@@ -1521,6 +1598,9 @@ mod tests {
             kermit_repeat_compression: false,
             kermit_8bit_quote: "on".into(),
             kermit_iac_escape: true,
+            kermit_resume_partial: true,
+            kermit_resume_max_age_hours: 72,
+            kermit_locking_shifts: true,
             serial_enabled: true,
             serial_port: "/dev/ttyUSB0".into(),
             serial_baud: 115200,
@@ -1614,6 +1694,18 @@ mod tests {
         );
         assert_eq!(loaded.kermit_8bit_quote, original.kermit_8bit_quote);
         assert_eq!(loaded.kermit_iac_escape, original.kermit_iac_escape);
+        assert_eq!(
+            loaded.kermit_resume_partial,
+            original.kermit_resume_partial
+        );
+        assert_eq!(
+            loaded.kermit_resume_max_age_hours,
+            original.kermit_resume_max_age_hours
+        );
+        assert_eq!(
+            loaded.kermit_locking_shifts,
+            original.kermit_locking_shifts
+        );
         assert_eq!(loaded.serial_enabled, original.serial_enabled);
         assert_eq!(loaded.serial_port, original.serial_port);
         assert_eq!(loaded.serial_baud, original.serial_baud);

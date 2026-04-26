@@ -3177,6 +3177,11 @@ impl TelnetSession {
             self.cyan("C")
         ))
         .await?;
+        self.send_line(&format!(
+            "  {}  Kermit server mode",
+            self.cyan("K")
+        ))
+        .await?;
         let iac_status = if self.xmodem_iac {
             self.green("ON")
         } else {
@@ -3219,6 +3224,11 @@ impl TelnetSession {
             "c" => {
                 self.file_transfer_chdir().await?;
             }
+            "k" => {
+                if let Err(e) = self.file_transfer_kermit_server().await {
+                    self.show_error(&format!("Server error: {}", e)).await?;
+                }
+            }
             "i" => {
                 self.xmodem_iac = !self.xmodem_iac;
             }
@@ -3232,6 +3242,8 @@ impl TelnetSession {
                     "  D  Download a file from server",
                     "  X  Delete a file on the server",
                     "  C  Change to a subdirectory",
+                    "  K  Kermit server mode (idle for",
+                    "     remote get/send/dir/finish)",
                     "  I  Toggle IAC escaping on/off",
                     "  R  Refresh the screen",
                     "  Q  Back to the main menu",
@@ -3278,7 +3290,7 @@ impl TelnetSession {
             }
             "r" => {} // Refresh — just re-render
             _ => {
-                self.show_error("Press U, D, X, C, I, R, Q, or H.")
+                self.show_error("Press U, D, X, C, K, I, R, Q, or H.")
                     .await?;
             }
         }
@@ -4375,6 +4387,171 @@ impl TelnetSession {
         self.send_line("").await?;
         self.send("  Press any key to continue.").await?;
         self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    // ─── KERMIT SERVER MODE ─────────────────────────────────
+
+    /// Idle as a Kermit server: peer drives the session by sending
+    /// Kermit commands (`send`, `get`, `dir`, `finish`, `bye`, etc.).
+    /// On exit, any files received during the session are written to
+    /// the current transfer subdir using the same `validate_filename`
+    /// rules as the interactive upload path.  Files whose sender-
+    /// supplied names fail validation or collide with an existing
+    /// path are skipped rather than clobbered, mirroring ZMODEM batch
+    /// behavior.
+    async fn file_transfer_kermit_server(&mut self) -> Result<(), std::io::Error> {
+        self.ensure_transfer_dir().await?;
+
+        if Self::is_disk_full() {
+            self.show_error("Disk space is low. Server mode disabled.")
+                .await?;
+            return Ok(());
+        }
+
+        self.clear_screen().await?;
+        let sep = self.separator();
+        self.send_line(&sep).await?;
+        self.send_line(&format!("  {}", self.yellow("KERMIT SERVER MODE"))).await?;
+        self.send_line(&sep).await?;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.green("Kermit server ready. Send commands or files.")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send_line("  Drive from your Kermit client, e.g. C-Kermit:").await?;
+        self.send_line(&format!(
+            "    {} — upload a file to us",
+            self.cyan("send <file>")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "    {} — download a file from us",
+            self.cyan("get <file>")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "    {} — list files in current dir",
+            self.cyan("remote dir")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "    {} — change our working subdir",
+            self.cyan("remote cwd <subdir>")
+        ))
+        .await?;
+        self.send_line(&format!(
+            "    {} — end server session",
+            self.cyan("finish | bye")
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Inactivity timeout: {} s.",
+            config::get_config().kermit_negotiation_timeout
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.flush().await?;
+
+        let verbose = config::get_config().verbose;
+        let kermit_iac = config::get_config().kermit_iac_escape;
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
+
+        let start = std::time::Instant::now();
+        let result = {
+            let mut writer_guard = self.writer.lock().await;
+            crate::kermit::kermit_server(
+                &mut self.reader,
+                &mut *writer_guard,
+                kermit_iac,
+                is_petscii,
+                verbose,
+            )
+            .await
+        };
+        let elapsed = start.elapsed();
+
+        // Save received files (from any S commands the peer sent
+        // during the session).  Mirror the existing upload save flow:
+        // validate filename, refuse to clobber existing files, apply
+        // mtime/mode if available.
+        let received = match result {
+            Ok(rxs) => rxs,
+            Err(e) => {
+                self.post_transfer_settle().await;
+                self.show_error(&format!("Server session failed: {}", e))
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let mut saved: Vec<(String, usize)> = Vec::new();
+        let mut skipped: Vec<(String, &'static str)> = Vec::new();
+        let target_dir = self.transfer_path();
+        for rx in &received {
+            if Self::validate_filename(&rx.filename).is_err() {
+                skipped.push((rx.filename.clone(), "invalid filename"));
+                continue;
+            }
+            let filepath = target_dir.join(&rx.filename);
+            if filepath.exists() {
+                skipped.push((rx.filename.clone(), "already exists"));
+                continue;
+            }
+            match std::fs::write(&filepath, &rx.data) {
+                Ok(()) => {
+                    let meta = crate::xmodem::YmodemReceiveMeta {
+                        size: rx.declared_size,
+                        modtime: rx.modtime,
+                        mode: rx.mode,
+                    };
+                    Self::apply_ymodem_meta(&filepath, Some(&meta));
+                    saved.push((rx.filename.clone(), rx.data.len()));
+                }
+                Err(_) => {
+                    skipped.push((rx.filename.clone(), "write failed"));
+                }
+            }
+        }
+
+        // Summary screen.
+        self.post_transfer_settle().await;
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  Server session ended in {:.1}s.",
+            elapsed.as_secs_f64()
+        ))
+        .await?;
+        self.send_line(&format!(
+            "  Received: {} file(s), saved: {}, skipped: {}.",
+            received.len(),
+            saved.len(),
+            skipped.len()
+        ))
+        .await?;
+        for (name, size) in &saved {
+            self.send_line(&format!(
+                "    {} {} ({} bytes)",
+                self.green("✓"),
+                self.amber(name),
+                size
+            ))
+            .await?;
+        }
+        for (name, reason) in &skipped {
+            self.send_line(&format!(
+                "    {} {} ({})",
+                self.red("✗"),
+                self.amber(name),
+                reason
+            ))
+            .await?;
+        }
+        self.send_line("").await?;
         self.wait_for_key().await?;
         Ok(())
     }

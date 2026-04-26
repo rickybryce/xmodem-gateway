@@ -43,6 +43,12 @@ use crate::tnio::{is_can_abort, nvt_read_byte, raw_write_bytes, ReadState};
 /// different MARK if peers agree, but in practice everyone uses SOH.
 pub(crate) const SOH: u8 = 0x01;
 const SP: u8 = 0x20; // space — tochar(0); marker for extended-length packets
+/// Locking-shift marker: switch decoder to "high-bit-on" mode (Frank
+/// da Cruz spec §3.4.5).  Sent ctl-quoted on the wire.
+pub(crate) const SO: u8 = 0x0E;
+/// Locking-shift marker: switch decoder back to "normal" mode.  Sent
+/// ctl-quoted on the wire.
+pub(crate) const SI: u8 = 0x0F;
 const CR: u8 = 0x0D;
 #[allow(dead_code)]
 const LF: u8 = 0x0A;
@@ -76,10 +82,14 @@ pub(crate) const TYPE_TIMEOUT: u8 = b'T';
 #[allow(dead_code)]
 pub(crate) const TYPE_RESERVED_Q: u8 = b'Q';
 pub(crate) const TYPE_GENERIC: u8 = b'G';
-#[allow(dead_code)]
 pub(crate) const TYPE_HOST: u8 = b'C';
-#[allow(dead_code)]
 pub(crate) const TYPE_TEXT: u8 = b'X';
+/// Server-mode "Receive" command — peer asks us to send the named file.
+pub(crate) const TYPE_R: u8 = b'R';
+/// Server-mode "Initialize" command — peer asks us to re-advertise our
+/// capabilities mid-session.  Honored by replying with a Y-ACK whose
+/// payload is a freshly-built Send-Init.
+pub(crate) const TYPE_INIT: u8 = b'I';
 
 // CAPAS bit positions in the first capability byte (bits are read after
 // stripping the LSB continuation flag — i.e. real bit n of capability
@@ -90,8 +100,8 @@ pub(crate) const TYPE_TEXT: u8 = b'X';
 //   bit 1: ability to do sliding-window
 //   bit 2: ability to do extended-length (long) packets
 //   bit 3: ability to handle attribute (A) packets
-//   bit 4: ability to do RESEND (resume) — we don't implement
-//   bit 5: ability to use locking shifts — we don't implement
+//   bit 4: ability to do RESEND (resume partial transfers)
+//   bit 5: ability to use locking shifts (SO/SI region markers)
 //
 // Streaming and other extended bits live in subsequent CAPAS bytes,
 // vendor-defined.  C-Kermit uses CAPAS byte 3 bit 2 for streaming.
@@ -99,9 +109,7 @@ pub(crate) const CAPAS_ATTRIBUTE: u8 = 0x08;
 pub(crate) const CAPAS_LONGPKT: u8 = 0x04;
 pub(crate) const CAPAS_SLIDING: u8 = 0x02;
 pub(crate) const CAPAS_CONTINUE: u8 = 0x01;
-#[allow(dead_code)]
 pub(crate) const CAPAS_RESEND: u8 = 0x10;
-#[allow(dead_code)]
 pub(crate) const CAPAS_LOCKING_SHIFT: u8 = 0x20;
 
 /// Streaming Kermit lives in CAPAS byte 3 bit 2 (per C-Kermit).  In our
@@ -398,11 +406,19 @@ pub(crate) struct Quoting {
     pub qctl: u8,
     /// 8th-bit prefix character.  `Some(c)` when 8th-bit quoting is
     /// active (peer asked for it or we're on a 7-bit link); `None` when
-    /// 8-bit-clean transparent transmission is in use.
+    /// 8-bit-clean transparent transmission is in use.  Mutually
+    /// exclusive with `locking_shifts`: when locking shifts are
+    /// negotiated, QBIN goes off (locking-shift > QBIN per spec §3.4).
     pub qbin: Option<u8>,
     /// Repeat prefix character, when REPT compression is active.  `None`
     /// disables compression entirely.
     pub rept: Option<u8>,
+    /// Locking-shift mode (Frank da Cruz spec §3.4.5): instead of
+    /// per-byte 8th-bit prefixing, the encoder emits SO/SI markers to
+    /// switch into a "high-bit-on" region for runs of high-bit bytes.
+    /// Used on strict 7-bit links; `qbin` should be `None` when this
+    /// is true.
+    pub locking_shifts: bool,
 }
 
 impl Default for Quoting {
@@ -411,14 +427,67 @@ impl Default for Quoting {
             qctl: DEFAULT_QCTL,
             qbin: None,
             rept: Some(DEFAULT_REPT),
+            locking_shifts: false,
         }
     }
+}
+
+/// Encoder/decoder state for the locking-shift layer.  Tracks which
+/// "set" we're currently writing — Normal = bytes pass through with
+/// their high bit clear, Shifted = bytes had their high bit set on
+/// the encoder side and the decoder OR's it back.  Reset to Normal at
+/// the start of every packet (encoder emits a closing SI to guarantee
+/// this; decoder re-initialises in `decode_data`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShiftMode {
+    Normal,
+    Shifted,
 }
 
 /// Encode a single byte through the quoting layers into the output
 /// buffer.  Inner per-byte step; the public encoder walks the input
 /// slice and applies repeat compression when active.
-fn encode_one_byte(out: &mut Vec<u8>, b: u8, q: Quoting) {
+///
+/// `mode` is only consulted when `q.locking_shifts` is true; in that
+/// case the function may emit a leading `qctl ctl(SO|SI)` to flip
+/// the wire-side mode before the body byte.
+fn encode_one_byte(out: &mut Vec<u8>, b: u8, q: Quoting, mode: &mut ShiftMode) {
+    if q.locking_shifts {
+        // Locking-shift path: high bit becomes a mode rather than a
+        // per-byte prefix.  QBIN is unused when this branch is taken.
+        let target = if b & 0x80 != 0 {
+            ShiftMode::Shifted
+        } else {
+            ShiftMode::Normal
+        };
+        if target != *mode {
+            out.push(q.qctl);
+            out.push(ctl(if target == ShiftMode::Shifted { SO } else { SI }));
+            *mode = target;
+        }
+        let body = b & 0x7F;
+        // Special case: literal SO / SI bytes in user data must use
+        // the literal-prefix escape (`qctl + body`) rather than the
+        // ctl-encoded form (`qctl + ctl(body)`).  The latter is the
+        // wire form of a shift marker — emitting it for data would
+        // make the decoder mode-flip on a regular byte.
+        if body == SO || body == SI {
+            out.push(q.qctl);
+            out.push(body);
+            return;
+        }
+        if is_kermit_control(body) {
+            out.push(q.qctl);
+            out.push(ctl(body));
+        } else if body == q.qctl || q.rept == Some(body) {
+            out.push(q.qctl);
+            out.push(body);
+        } else {
+            out.push(body);
+        }
+        return;
+    }
+
     // 8-bit prefix goes BEFORE all other prefixes per spec.  Strip the
     // high bit from the body if we're emitting the prefix; the receiver
     // OR's it back on.
@@ -450,6 +519,7 @@ fn encode_one_byte(out: &mut Vec<u8>, b: u8, q: Quoting) {
 /// The output is what goes between TYPE and CHECK on the wire.
 pub(crate) fn encode_data(input: &[u8], q: Quoting) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() * 2 + 8);
+    let mut mode = ShiftMode::Normal;
     let mut i = 0;
     while i < input.len() {
         // Repeat-count compression: only worth using for runs of >= 3
@@ -462,15 +532,40 @@ pub(crate) fn encode_data(input: &[u8], q: Quoting) -> Vec<u8> {
                 run += 1;
             }
             if run >= 3 {
+                // Locking-shift mode must be flipped BEFORE the REPT
+                // marker so the marker + body sit in the right set.
+                // If we let `encode_one_byte` flip mode after `REPT
+                // count`, the decoder would see the shift between the
+                // count and the body and apply it only to the first
+                // replicated byte rather than the whole run.
+                if q.locking_shifts {
+                    let target = if input[i] & 0x80 != 0 {
+                        ShiftMode::Shifted
+                    } else {
+                        ShiftMode::Normal
+                    };
+                    if target != mode {
+                        out.push(q.qctl);
+                        out.push(ctl(if target == ShiftMode::Shifted { SO } else { SI }));
+                        mode = target;
+                    }
+                }
                 out.push(rept_char);
                 out.push(tochar(run as u8));
-                encode_one_byte(&mut out, input[i], q);
+                encode_one_byte(&mut out, input[i], q, &mut mode);
                 i += run;
                 continue;
             }
         }
-        encode_one_byte(&mut out, input[i], q);
+        encode_one_byte(&mut out, input[i], q, &mut mode);
         i += 1;
+    }
+    // Reset to Normal at packet end so each packet starts with a clean
+    // slate (decoder re-initialises per packet but a strict spec peer
+    // expects the closing SI).
+    if q.locking_shifts && mode != ShiftMode::Normal {
+        out.push(q.qctl);
+        out.push(ctl(SI));
     }
     out
 }
@@ -482,8 +577,27 @@ pub(crate) fn encode_data(input: &[u8], q: Quoting) -> Vec<u8> {
 /// protocol mismatch rather than corruption.
 pub(crate) fn decode_data(input: &[u8], q: Quoting) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(input.len());
+    let mut mode = ShiftMode::Normal;
     let mut i = 0;
     while i < input.len() {
+        // Locking-shift markers (`qctl ctl(SO)` / `qctl ctl(SI)`) are
+        // checked BEFORE the REPT prefix so a literal qctl-quoted SO/SI
+        // can't slip past as data.  Literal SO/SI in user data uses the
+        // literal-prefix form (`qctl + raw byte`) which falls through
+        // to `decode_one_byte_at` and decodes correctly.
+        if q.locking_shifts && input[i] == q.qctl && i + 1 < input.len() {
+            let candidate = unctl(input[i + 1]);
+            if candidate == SO {
+                mode = ShiftMode::Shifted;
+                i += 2;
+                continue;
+            }
+            if candidate == SI {
+                mode = ShiftMode::Normal;
+                i += 2;
+                continue;
+            }
+        }
         if Some(input[i]) == q.rept {
             // Repeat-count prefix: consume prefix + count + one quoted body.
             if i + 1 >= input.len() {
@@ -495,15 +609,25 @@ pub(crate) fn decode_data(input: &[u8], q: Quoting) -> Result<Vec<u8>, String> {
             }
             let (decoded, consumed) = decode_one_byte_at(input, i + 2, q)?;
             i += 2 + consumed;
+            let with_mode = if q.locking_shifts && mode == ShiftMode::Shifted {
+                decoded | 0x80
+            } else {
+                decoded
+            };
             for _ in 0..n {
-                out.push(decoded);
+                out.push(with_mode);
             }
             continue;
         }
 
         let (decoded, consumed) = decode_one_byte_at(input, i, q)?;
         i += consumed;
-        out.push(decoded);
+        let with_mode = if q.locking_shifts && mode == ShiftMode::Shifted {
+            decoded | 0x80
+        } else {
+            decoded
+        };
+        out.push(with_mode);
     }
     Ok(out)
 }
@@ -887,6 +1011,17 @@ pub(crate) struct Capabilities {
     pub attribute_packets: bool,
     /// Whether streaming was negotiated (no per-packet ACKs).
     pub streaming: bool,
+    /// Whether RESEND (resume partial transfers) was negotiated.
+    /// Spec gates the disposition='R' / length= mechanism on both
+    /// peers advertising the CAPAS_RESEND bit; we honor that strict
+    /// reading even though most modern Kermits would accept the
+    /// disposition tag without the CAPAS handshake.
+    pub resend: bool,
+    /// Whether locking-shift quoting (SO/SI region markers) was
+    /// negotiated.  Per spec precedence locking-shift > QBIN: when
+    /// active, `qbin` is forced to None and 8-bit data rides through
+    /// the SO/SI mode-switching layer instead.
+    pub locking_shifts: bool,
     /// Optional peer identification text after the CAPAS extension
     /// fields (used for flavor detection only).
     pub peer_id: Option<String>,
@@ -908,6 +1043,8 @@ impl Default for Capabilities {
             long_packets: false,
             attribute_packets: false,
             streaming: false,
+            resend: false,
+            locking_shifts: false,
             peer_id: None,
         }
     }
@@ -951,6 +1088,12 @@ pub(crate) fn build_send_init_payload(c: &Capabilities) -> Vec<u8> {
     }
     if c.window > 1 {
         capas1 |= CAPAS_SLIDING;
+    }
+    if c.resend {
+        capas1 |= CAPAS_RESEND;
+    }
+    if c.locking_shifts {
+        capas1 |= CAPAS_LOCKING_SHIFT;
     }
     let capas1 = if c.streaming {
         capas1 | CAPAS_CONTINUE
@@ -1066,6 +1209,8 @@ pub(crate) fn parse_send_init_payload(data: &[u8]) -> Capabilities {
     if let Some(&first) = capas_bytes.first() {
         c.long_packets = advertises_long;
         c.attribute_packets = first & CAPAS_ATTRIBUTE != 0;
+        c.resend = first & CAPAS_RESEND != 0;
+        c.locking_shifts = first & CAPAS_LOCKING_SHIFT != 0;
         // Sliding-window default: stop-and-wait until peer's CAPAS
         // bit AND the WINDO field below tell us otherwise.
         if !advertises_sliding {
@@ -1124,6 +1269,24 @@ pub(crate) fn parse_send_init_payload(data: &[u8]) -> Capabilities {
 /// the parameters the session will use in our send-direction.  Spec rule:
 /// each side's RECEIVE preferences govern what the OTHER side sends.
 pub(crate) fn intersect_capabilities(ours: &Capabilities, theirs: &Capabilities) -> Capabilities {
+    // Locking-shift / QBIN precedence (Frank da Cruz §3.4): when both
+    // peers advertise CAPAS_LOCKING_SHIFT *and* either side would
+    // otherwise need 8-bit prefixing, use locking shifts and force
+    // QBIN off.  When only one peer advertises locking shifts, fall
+    // back to the existing QBIN logic.  When neither side needs 8-bit
+    // (qbin already None on both sides), neither mechanism is active
+    // — there's nothing to convey.
+    let both_lshift = ours.locking_shifts && theirs.locking_shifts;
+    let need_eight_bit = ours.qbin.is_some() || theirs.qbin.is_some();
+    let use_lshift = both_lshift && need_eight_bit;
+    let qbin_negotiated = if use_lshift {
+        None
+    } else {
+        match (ours.qbin, theirs.qbin) {
+            (Some(c), _) | (_, Some(c)) => Some(c),
+            _ => None,
+        }
+    };
     Capabilities {
         // Sender (us) honors peer's MAXL.
         maxl: theirs.maxl.min(ours.maxl).max(MIN_PACKET_LEN as u16),
@@ -1132,11 +1295,8 @@ pub(crate) fn intersect_capabilities(ours: &Capabilities, theirs: &Capabilities)
         padc: theirs.padc,
         eol: theirs.eol,
         qctl: theirs.qctl,
-        // 8th-bit prefix: if either side requires it, use it.
-        qbin: match (ours.qbin, theirs.qbin) {
-            (Some(c), _) | (_, Some(c)) => Some(c),
-            _ => None,
-        },
+        // 8th-bit prefix: see precedence comment above.
+        qbin: qbin_negotiated,
         chkt: pick_chkt(ours.chkt, theirs.chkt),
         // Repeat compression: only when BOTH advertise it AND on the
         // same prefix character.
@@ -1148,6 +1308,8 @@ pub(crate) fn intersect_capabilities(ours: &Capabilities, theirs: &Capabilities)
         long_packets: ours.long_packets && theirs.long_packets,
         attribute_packets: ours.attribute_packets && theirs.attribute_packets,
         streaming: ours.streaming && theirs.streaming,
+        resend: ours.resend && theirs.resend,
+        locking_shifts: use_lshift,
         peer_id: theirs.peer_id.clone(),
     }
 }
@@ -1321,6 +1483,8 @@ pub(crate) fn config_capabilities() -> Capabilities {
         long_packets: cfg.kermit_long_packets,
         attribute_packets: cfg.kermit_attribute_packets,
         streaming: cfg.kermit_streaming,
+        resend: cfg.kermit_resume_partial,
+        locking_shifts: cfg.kermit_locking_shifts,
         peer_id: Some("Ethernet Gateway Kermit".into()),
     }
 }
@@ -1423,6 +1587,7 @@ async fn send_error(
         qctl: DEFAULT_QCTL,
         qbin: None,
         rept: None,
+        locking_shifts: false,
     };
     let payload = encode_data(msg.as_bytes(), q);
     let pkt = build_packet(TYPE_ERROR, seq, &payload, chkt, pad_count, pad_char, eol);
@@ -1475,6 +1640,21 @@ pub(crate) struct Attributes {
     /// Record length ('-' tag, decimal-string value).  Only meaningful
     /// alongside `record_format` = 'F' or 'V'; otherwise informational.
     pub record_length: Option<u32>,
+    /// Creator's user / login ID ('$' tag).  Surfaced by some VMS / MVS
+    /// Kermits; recorded only on UNIX (we don't act on it).
+    pub creator_id: Option<String>,
+    /// Account / billing ID ('%' tag).  Mainframe-flavoured metadata;
+    /// recorded only.
+    pub account_id: Option<String>,
+    /// Block size ('\'' tag, decimal-string value).  Meaningful only on
+    /// record-oriented filesystems we don't have; recorded only.
+    pub block_size: Option<u32>,
+    /// Access mode ('(' tag) — single character, typically 'N' = new,
+    /// 'R' = read, 'A' = append, 'S' = supersede.  Recorded only.
+    pub access_mode: Option<u8>,
+    /// Encoding alternative (')' tag) — single character; some
+    /// implementations use this in place of '*'.  Recorded only.
+    pub encoding_alt: Option<u8>,
 }
 
 /// Encode an Attributes struct into the A-packet's data field (already
@@ -1541,6 +1721,40 @@ pub(crate) fn encode_attributes(a: &Attributes) -> Vec<u8> {
             out.push(tochar(s.len() as u8));
             out.extend_from_slice(s.as_bytes());
         }
+    }
+    if let Some(creator) = &a.creator_id {
+        let bytes = creator.as_bytes();
+        if bytes.len() <= 94 {
+            out.push(b'$');
+            out.push(tochar(bytes.len() as u8));
+            out.extend_from_slice(bytes);
+        }
+    }
+    if let Some(account) = &a.account_id {
+        let bytes = account.as_bytes();
+        if bytes.len() <= 94 {
+            out.push(b'%');
+            out.push(tochar(bytes.len() as u8));
+            out.extend_from_slice(bytes);
+        }
+    }
+    if let Some(bs) = a.block_size {
+        let s = bs.to_string();
+        if s.len() <= 94 {
+            out.push(b'\'');
+            out.push(tochar(s.len() as u8));
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+    if let Some(am) = a.access_mode {
+        out.push(b'(');
+        out.push(tochar(1));
+        out.push(am);
+    }
+    if let Some(ea) = a.encoding_alt {
+        out.push(b')');
+        out.push(tochar(1));
+        out.push(ea);
     }
     // We don't emit '&' (long_length) ourselves: '!' fits MAX_FILE_SIZE
     // (8 MB) trivially, and emitting both would just bloat the
@@ -1627,11 +1841,101 @@ pub(crate) fn parse_attributes(data: &[u8]) -> Attributes {
                     a.record_length = Some(v);
                 }
             }
+            b'$' => {
+                if let Ok(s) = std::str::from_utf8(val) {
+                    a.creator_id = Some(s.to_string());
+                }
+            }
+            b'%' => {
+                if let Ok(s) = std::str::from_utf8(val) {
+                    a.account_id = Some(s.to_string());
+                }
+            }
+            b'\'' => {
+                if let Ok(s) = std::str::from_utf8(val)
+                    && let Ok(v) = s.trim().parse::<u32>()
+                {
+                    a.block_size = Some(v);
+                }
+            }
+            b'(' => {
+                if !val.is_empty() {
+                    a.access_mode = Some(val[0]);
+                }
+            }
+            b')' => {
+                if !val.is_empty() {
+                    a.encoding_alt = Some(val[0]);
+                }
+            }
             _ => {}
         }
         i += 2 + n;
     }
     a
+}
+
+// =============================================================================
+// RESUME-PARTIAL HELPER
+// =============================================================================
+
+/// Defense-in-depth check applied before joining a sender-supplied
+/// filename onto `transfer_dir` for resume lookup.  Refuses anything
+/// that could escape the directory or hit a hidden file: separator
+/// characters, parent-traversal sequences, NUL bytes, leading dots,
+/// and empty strings.  More restrictive than `validate_filename` in
+/// telnet.rs (e.g. it doesn't enforce the 64-char cap) but covers the
+/// path-traversal threat model that matters here.
+pub(crate) fn is_safe_resume_filename(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('\0')
+}
+
+/// Look up the on-disk size of a partial file eligible for resume,
+/// keyed on the sender's filename.  Returns `Some(size)` only when
+/// every check passes:
+///
+/// - file exists at `transfer_dir/filename` and is a regular file
+///   (not a directory or symlink-to-directory),
+/// - file mtime is within `max_age_hours` of the current wall clock,
+/// - mtime is not in the future (clock-skew sanity check),
+/// - reported size fits in u64.
+///
+/// Returns `None` for any failure: file absent, too old, too new
+/// (clock skew), I/O error, non-regular, or unreadable mtime.  A
+/// zero-byte partial returns `Some(0)` since the spec lets the
+/// receiver advertise that and the sender still skips zero bytes.
+///
+/// `filename` is taken verbatim from the sender's F-packet; the
+/// caller is responsible for path-traversal validation before
+/// invoking this helper (use `is_safe_resume_filename` below).
+pub(crate) fn compute_resume_offset(
+    filename: &str,
+    transfer_dir: &str,
+    max_age_hours: u32,
+) -> Option<u64> {
+    use std::time::SystemTime;
+
+    if !is_safe_resume_filename(filename) {
+        return None;
+    }
+    let path = std::path::Path::new(transfer_dir).join(filename);
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    let now = SystemTime::now();
+    // mtime in the future = clock skew or tampering — treat as ineligible.
+    let age = now.duration_since(mtime).ok()?;
+    if age.as_secs() > (max_age_hours as u64).saturating_mul(3600) {
+        return None;
+    }
+    Some(meta.len())
 }
 
 // =============================================================================
@@ -1650,6 +1954,24 @@ pub(crate) async fn kermit_send(
     is_tcp: bool,
     is_petscii: bool,
     verbose: bool,
+) -> Result<(), String> {
+    kermit_send_with_starting_seq(reader, writer, files, is_tcp, is_petscii, verbose, 0).await
+}
+
+/// Same as `kermit_send` but lets the caller seed the initial sequence
+/// number for our Send-Init.  Used by `kermit_server` after it
+/// dispatches on a peer-supplied R packet: the response S must follow
+/// the R in the same monotonically-increasing seq stream, so it can't
+/// be hard-coded to 0.  All other callers should use `kermit_send`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn kermit_send_with_starting_seq(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    files: &[KermitSendFile<'_>],
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+    starting_seq: u8,
 ) -> Result<(), String> {
     let cfg = config::get_config();
     if files.is_empty() {
@@ -1696,7 +2018,7 @@ pub(crate) async fn kermit_send(
             our_caps.qbin,
         );
     }
-    let mut seq: u8 = 0;
+    let mut seq: u8 = starting_seq & 0x3F;
 
     let peer_caps = send_and_await_ack(
         reader,
@@ -1754,6 +2076,7 @@ pub(crate) async fn kermit_send(
         qctl: session.qctl,
         qbin: session.qbin,
         rept: session.rept,
+        locking_shifts: session.locking_shifts,
     };
 
     seq = (seq + 1) & 0x3F;
@@ -1793,6 +2116,10 @@ pub(crate) async fn kermit_send(
         seq = (seq + 1) & 0x3F;
 
         // A-packet (when negotiated).  Carries length, mtime, mode.
+        // Receiver may reply with disposition='R' + length=N to ask us
+        // to resume — we honor that by slicing `f.data[N..]` for the
+        // D-packets below.
+        let mut data_offset: usize = 0;
         if session.attribute_packets {
             let attrs = Attributes {
                 length: Some(f.data.len() as u64),
@@ -1804,7 +2131,7 @@ pub(crate) async fn kermit_send(
                 ..Attributes::default()
             };
             let a_payload = encode_data(&encode_attributes(&attrs), send_q);
-            let _ = send_and_await_ack(
+            let ack_payload = send_and_await_ack(
                 reader,
                 writer,
                 TYPE_ATTRIBUTE,
@@ -1825,7 +2152,35 @@ pub(crate) async fn kermit_send(
             .await
             .map_err(|e| wrap_send_err("A-packet", e))?;
             seq = (seq + 1) & 0x3F;
+
+            // Receiver-side resume request (Frank da Cruz §5.1): the
+            // ACK payload carries an Attributes block with
+            // disposition='R' and length=N when the receiver already
+            // has N bytes of this file and wants us to skip ahead.
+            // Empty payload = receiver had nothing to say, normal
+            // send-from-zero.
+            if !ack_payload.is_empty()
+                && let Ok(raw) = decode_data(&ack_payload, send_q)
+            {
+                let resp = parse_attributes(&raw);
+                if resp.disposition == Some(b'R')
+                    && let Some(n) = resp.length
+                {
+                    let n = n.min(f.data.len() as u64) as usize;
+                    if n > 0 {
+                        data_offset = n;
+                        if verbose {
+                            glog!(
+                                "Kermit send: receiver requested resume from {} of {}",
+                                n,
+                                f.data.len()
+                            );
+                        }
+                    }
+                }
+            }
         }
+        let data_to_send = &f.data[data_offset..];
 
         // D-packets.  Pick chunk size so that after worst-case quoting
         // blowup the encoded payload still fits in MAXL.  Worst case is
@@ -1866,7 +2221,7 @@ pub(crate) async fn kermit_send(
             seq = send_d_and_z_streaming(
                 reader,
                 writer,
-                f.data,
+                data_to_send,
                 chunk_size,
                 send_q,
                 seq,
@@ -1888,7 +2243,7 @@ pub(crate) async fn kermit_send(
             seq = send_d_packets_windowed(
                 reader,
                 writer,
-                f.data,
+                data_to_send,
                 chunk_size,
                 send_q,
                 seq,
@@ -1907,7 +2262,7 @@ pub(crate) async fn kermit_send(
             // Stop-and-wait path (window=1): unchanged from pre-window
             // implementation — the safe baseline for serial peers and
             // ancient Kermits that don't advertise sliding.
-            for chunk in f.data.chunks(chunk_size) {
+            for chunk in data_to_send.chunks(chunk_size) {
                 let encoded = encode_data(chunk, send_q);
                 d_packets_sent += 1;
                 if verbose && d_packets_sent <= D_PACKET_TRACE_LIMIT {
@@ -2123,6 +2478,7 @@ async fn send_and_await_ack(
                         qctl: DEFAULT_QCTL,
                         qbin: None,
                         rept: None,
+                        locking_shifts: false,
                     };
                     let msg = decode_error_message(&resp.payload, q);
                     return Err(format!("Kermit: peer sent E-packet: {}", msg));
@@ -2318,6 +2674,7 @@ async fn send_d_packets_windowed(
                         qctl: DEFAULT_QCTL,
                         qbin: None,
                         rept: None,
+                        locking_shifts: false,
                     };
                     let msg = decode_error_message(&resp.payload, q);
                     return Err(format!("Kermit: peer sent E-packet: {}", msg));
@@ -2546,6 +2903,7 @@ async fn send_d_and_z_streaming(
                         qctl: DEFAULT_QCTL,
                         qbin: None,
                         rept: None,
+                        locking_shifts: false,
                     };
                     let msg = decode_error_message(&resp.payload, q);
                     return Err(format!("Kermit: peer sent E-packet: {}", msg));
@@ -2665,6 +3023,7 @@ async fn handle_streaming_response(
             qctl: DEFAULT_QCTL,
             qbin: None,
             rept: None,
+            locking_shifts: false,
         };
         let msg = decode_error_message(&resp.payload, q);
         return Err(format!("Kermit: peer sent E-packet: {}", msg));
@@ -2741,12 +3100,30 @@ pub(crate) async fn kermit_receive(
     is_petscii: bool,
     verbose: bool,
 ) -> Result<Vec<KermitReceive>, String> {
+    kermit_receive_with_init(reader, writer, is_tcp, is_petscii, verbose, None).await
+}
+
+/// Same as `kermit_receive` but accepts an optional pre-read S packet.
+/// Used by `kermit_server` after it dispatches on a peer-supplied S:
+/// the server-mode dispatcher has already consumed the S off the wire,
+/// so the receiver can't read it again.  When `init_pkt` is `Some`,
+/// `expected_seq` is derived from its seq (+1 mod 64) so the rest of
+/// the receive flow lines up regardless of where S was in the stream.
+pub(crate) async fn kermit_receive_with_init(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+    init_pkt: Option<Packet>,
+) -> Result<Vec<KermitReceive>, String> {
     let cfg = config::get_config();
     if verbose {
         glog!(
-            "Kermit recv: starting, is_tcp={}, is_petscii={}",
+            "Kermit recv: starting, is_tcp={}, is_petscii={}, pre_read={}",
             is_tcp,
-            is_petscii
+            is_petscii,
+            init_pkt.is_some()
         );
     }
     let our_caps = config_capabilities();
@@ -2757,19 +3134,24 @@ pub(crate) async fn kermit_receive(
     // (spec §3.2).  During the initial Send-Init read we use
     // `neg_deadline` derived from `kermit_negotiation_timeout` instead.
 
-    // 1. Read Send-Init from peer.  Block until it arrives or we timeout.
-    let s_pkt = read_packet(
-        reader,
-        is_tcp,
-        is_petscii,
-        b'1',
-        CR,
-        verbose,
-        &mut state,
-        Some(neg_deadline),
-    )
-    .await
-    .map_err(|e| format!("Kermit recv: Send-Init read failed: {}", e))?;
+    // 1. Read Send-Init from peer (or use the pre-read packet handed
+    //    over by `kermit_server`).  Block until it arrives or we time
+    //    out.
+    let s_pkt = match init_pkt {
+        Some(p) => p,
+        None => read_packet(
+            reader,
+            is_tcp,
+            is_petscii,
+            b'1',
+            CR,
+            verbose,
+            &mut state,
+            Some(neg_deadline),
+        )
+        .await
+        .map_err(|e| format!("Kermit recv: Send-Init read failed: {}", e))?,
+    };
     if s_pkt.kind != TYPE_SEND_INIT {
         return Err(format!(
             "Kermit recv: expected Send-Init, got '{}'",
@@ -2816,14 +3198,25 @@ pub(crate) async fn kermit_receive(
         qctl: session.qctl,
         qbin: session.qbin,
         rept: session.rept,
+        locking_shifts: session.locking_shifts,
     };
 
     let mut received: Vec<KermitReceive> = Vec::new();
-    let mut expected_seq: u8 = 1; // peer increments seq from 0 (Send-Init)
+    // Peer's next packet runs at S.seq + 1 (mod 64).  Hard-coding 1
+    // would break server-mode receive where the S could arrive at any
+    // seq (e.g., after the dispatcher's R/I/G handling has already
+    // advanced the sender's counter).
+    let mut expected_seq: u8 = (s_pkt.seq + 1) & 0x3F;
     // Per-file counter for rate-limiting verbose D-packet success
     // logs.  Resets on every F-packet so each file gets its own first
     // few traced — same pattern as zmodem.rs's subpacket-trace cap.
     let mut d_packets_received = 0u32;
+    // Resume-partial state, set in the F-packet handler when a partial
+    // file is found on disk; consumed in the A-packet handler to
+    // advertise disposition='R' + length=offset back to the sender.
+    // Cleared after the A-packet is acknowledged so subsequent files
+    // in a batch each get their own lookup (commit-3 territory).
+    let mut pending_resume_offset: Option<u64> = None;
     // Bound the read-error retry chain so a wedged peer can't keep
     // us NAKing forever.  Resets on any successful packet.
     let mut consecutive_failures: u32 = 0;
@@ -3034,6 +3427,39 @@ pub(crate) async fn kermit_receive(
                     ));
                 }
                 d_packets_received = 0;
+                // Resume lookup: only meaningful when the negotiated
+                // session lets the sender send an A-packet (that's
+                // where we'll advertise disposition='R').  Sender
+                // also has to honor it, but we discover that only
+                // when our ACK payload comes back via D-packets at
+                // the right offset; so the user opt-in
+                // (`kermit_resume_partial`) carries the trust.
+                pending_resume_offset = None;
+                // Strict spec gate: require BOTH peers to advertise
+                // CAPAS_RESEND (`session.resend`) AND attribute-packet
+                // support (where the disposition='R' coordination
+                // happens) AND the user opt-in.  Falling back to a
+                // looser gate (skip session.resend) would mean older
+                // peers that don't expect disposition='R' in our ACK
+                // payload could mishandle it.
+                if cfg.kermit_resume_partial && session.attribute_packets && session.resend {
+                    let off = compute_resume_offset(
+                        &fname,
+                        &cfg.transfer_dir,
+                        cfg.kermit_resume_max_age_hours,
+                    );
+                    if let Some(n) = off
+                        && n > 0
+                    {
+                        if verbose {
+                            glog!(
+                                "Kermit recv: partial '{}' on disk, will request resume from {} bytes",
+                                fname, n
+                            );
+                        }
+                        pending_resume_offset = Some(n);
+                    }
+                }
                 received.push(KermitReceive {
                     filename: fname,
                     data: Vec::new(),
@@ -3095,16 +3521,114 @@ pub(crate) async fn kermit_receive(
                         ));
                     }
                 }
-                send_ack(
-                    writer,
-                    pkt.seq,
-                    session.chkt,
-                    session.npad,
-                    session.padc,
-                    session.eol,
-                    is_tcp,
-                )
-                .await?;
+                // Resume path: advertise disposition='R' + length=offset
+                // in the A-packet ACK payload, then pre-load the partial
+                // file's bytes into `data` so arriving D-packets append
+                // cleanly.  Guards before doing anything:
+                //
+                // - `declared` (full file size from the just-parsed
+                //   A-packet) must be known.  Without it we can't tell
+                //   whether the on-disk partial is consistent with what
+                //   the sender is offering.
+                // - `offset <= declared` — partial larger than full
+                //   file means the on-disk bytes can't be a valid prefix
+                //   of the new file (renamed-and-replaced, truncated
+                //   upstream, …).  Falling back to a full receive
+                //   overwrites the stale partial cleanly.
+                //
+                // If either guard fails, or the read fails (file
+                // vanished, perms, …), abandon resume and fall through
+                // to a plain ACK — better to re-receive the whole file
+                // than to merge mismatched data.
+                //
+                // CAVEAT: there's no spec checksum exchange to detect a
+                // corrupt-but-same-length partial.  If the user's
+                // partial has bit rot or was truncated to the same byte
+                // count as a different file, the merged result is
+                // silently wrong.  This is a known spec-level limit;
+                // the user owns the risk by enabling
+                // `kermit_resume_partial`.
+                let mut resume_payload: Option<Vec<u8>> = None;
+                let safe_to_resume = matches!(
+                    (pending_resume_offset, declared),
+                    (Some(off), Some(decl)) if off <= decl
+                );
+                if !safe_to_resume {
+                    if verbose
+                        && let Some(off) = pending_resume_offset
+                    {
+                        glog!(
+                            "Kermit recv: abandoning resume — partial={} declared={:?} (must be partial<=declared)",
+                            off, declared
+                        );
+                    }
+                    pending_resume_offset = None;
+                }
+                if let Some(offset) = pending_resume_offset.take()
+                    && let Some(last) = received.last_mut()
+                {
+                    let path = std::path::Path::new(&cfg.transfer_dir).join(&last.filename);
+                    match std::fs::read(&path) {
+                        Ok(mut bytes) => {
+                            // If the file grew between F-packet stat and
+                            // now, truncate to the advertised offset so
+                            // the sender's resumed stream lines up
+                            // exactly.  If it shrank, advertise the
+                            // smaller size we actually have.
+                            let actual = bytes.len() as u64;
+                            let effective = offset.min(actual);
+                            bytes.truncate(effective as usize);
+                            last.data = bytes;
+                            let resume_attrs = Attributes {
+                                disposition: Some(b'R'),
+                                length: Some(effective),
+                                ..Attributes::default()
+                            };
+                            resume_payload = Some(encode_data(
+                                &encode_attributes(&resume_attrs),
+                                recv_q,
+                            ));
+                            if verbose {
+                                glog!(
+                                    "Kermit recv: advertising resume disposition='R' length={}",
+                                    effective
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if verbose {
+                                glog!(
+                                    "Kermit recv: resume read of '{}' failed ({}); falling back to full receive",
+                                    last.filename, e
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(payload) = resume_payload {
+                    send_ack_with_payload(
+                        writer,
+                        pkt.seq,
+                        &payload,
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                } else {
+                    send_ack(
+                        writer,
+                        pkt.seq,
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                }
             }
             TYPE_DATA => {
                 let raw = decode_data(&pkt.payload, recv_q)?;
@@ -3278,6 +3802,583 @@ pub(crate) async fn kermit_receive(
     }
 
     Ok(received)
+}
+
+// =============================================================================
+// SERVER STATE MACHINE
+// =============================================================================
+
+/// Validate a CWD argument from a `G C <subdir>` packet.  Accepts an
+/// empty string (root of `transfer_dir`), single names, and multi-
+/// component relative paths separated by `/`.  Refuses anything that
+/// could escape the transfer dir: leading `/`, embedded `\`, NUL,
+/// any `..` component, or per-component leading dots.  The matching
+/// `effective_transfer_path` joins the result onto `cfg.transfer_dir`.
+pub(crate) fn is_safe_relative_subdir(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    if s.starts_with('/') || s.contains('\\') || s.contains('\0') {
+        return false;
+    }
+    for component in s.split('/') {
+        if component.is_empty() || component == ".." || component.starts_with('.') {
+            return false;
+        }
+        if !component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolve `cfg.transfer_dir` + `subdir` into a single path.  Caller
+/// has already validated `subdir` via `is_safe_relative_subdir`.
+fn effective_transfer_path(cfg: &config::Config, subdir: &str) -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(&cfg.transfer_dir);
+    if !subdir.is_empty() {
+        p.push(subdir);
+    }
+    p
+}
+
+/// Build a one-line-per-file directory listing for a `G D` reply.
+/// Skips entries whose names start with `.` (hidden), unreadable
+/// entries, and reports `<dir>` / `<file size>` annotations.
+/// Returns an empty string if the path can't be read — caller should
+/// emit that as the response body so the client knows we tried.
+fn format_dir_listing(path: &std::path::Path) -> String {
+    let entries = match std::fs::read_dir(path) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let annot = if meta.is_dir() {
+            "<dir>".to_string()
+        } else {
+            format!("{}", meta.len())
+        };
+        lines.push((name, annot));
+    }
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    for (name, annot) in lines {
+        out.push_str(&format!("{}\t{}\n", name, annot));
+    }
+    out
+}
+
+/// Filesystem free-bytes count at `path`, or None if the platform or
+/// the call doesn't support it.  Used by `G $` (SPACE) to report
+/// available storage to the peer.
+#[cfg(unix)]
+// statvfs's `f_bavail` and `f_frsize` are u64 on Linux but u32 on
+// some BSDs / macOS — `as u64` is a no-op on the former and a widen
+// on the latter, but clippy can't see the platform variance and
+// flags `unnecessary_cast`.  Local allow keeps the cross-platform
+// math correct.
+#[allow(clippy::unnecessary_cast)]
+fn fs_free_bytes(path: &std::path::Path) -> Option<u64> {
+    let path_str = path.to_str()?;
+    let cstr = std::ffi::CString::new(path_str).ok()?;
+    // SAFETY: zeroed `statvfs` is a valid initial value; `cstr` is a
+    // null-terminated C string that lives until the call returns.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cstr.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return None;
+    }
+    let avail = buf.f_bavail as u64;
+    let frsize = buf.f_frsize as u64;
+    Some(avail.saturating_mul(frsize))
+}
+#[cfg(not(unix))]
+fn fs_free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Send an X+Z response pair after a G command that produces text
+/// output (DIR/SPACE/KERMIT).  X carries the encoded text body, Z
+/// signals end-of-response.  Both wait for the client's ACK.
+/// Sequence numbering follows the client's G: G@N → ACK@N → X@N+1
+/// → ACK@N+1 → Z@N+2 → ACK@N+2.
+#[allow(clippy::too_many_arguments)]
+async fn send_g_text_response(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    text: &str,
+    after_g_seq: u8,
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+    state: &mut ReadState,
+    max_retries: u32,
+    pkt_timeout: tokio::time::Duration,
+) -> Result<(), String> {
+    let q = Quoting {
+        qctl: DEFAULT_QCTL,
+        qbin: None,
+        rept: Some(DEFAULT_REPT),
+        locking_shifts: false,
+    };
+    let payload = encode_data(text.as_bytes(), q);
+    let x_seq = (after_g_seq + 1) & 0x3F;
+    let z_seq = (after_g_seq + 2) & 0x3F;
+    let _ = send_and_await_ack(
+        reader,
+        writer,
+        TYPE_TEXT,
+        x_seq,
+        &payload,
+        b'1',
+        0,
+        0,
+        CR,
+        is_tcp,
+        is_petscii,
+        verbose,
+        state,
+        Some(tokio::time::Instant::now() + pkt_timeout),
+        max_retries,
+        false,
+    )
+    .await?;
+    let _ = send_and_await_ack(
+        reader,
+        writer,
+        TYPE_EOF,
+        z_seq,
+        &[],
+        b'1',
+        0,
+        0,
+        CR,
+        is_tcp,
+        is_petscii,
+        verbose,
+        state,
+        Some(tokio::time::Instant::now() + pkt_timeout),
+        max_retries,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Server-mode dispatch: idle waiting for an incoming command from a
+/// Kermit client and acting on it.  This commit wires the lightweight
+/// half of the spec — Host-command refusal (`C`), re-init (`I`),
+/// graceful EOT (`B`), peer-abort handling (`E`), and the generic
+/// `G F`/`G L` finish/logout that already lived in `kermit_receive`.
+/// The S-packet (peer wants to send us a file) and R-packet (peer
+/// wants us to send a file) currently respond with an E-packet stub
+/// "not yet implemented" and exit; the real handlers are wired in
+/// the follow-up commit that refactors `kermit_receive` /
+/// `kermit_send` to accept a pre-read first packet.
+///
+/// Returns the list of files received from the peer over the lifetime
+/// of the session (one S command per file batch — multiple batches
+/// possible across a single server-mode session).  Returns `Err` only
+/// on protocol-level I/O failures; clean exits (E-packet, B, G F/L/B,
+/// completed S/R/G commands) return `Ok` with whatever was accumulated.
+pub(crate) async fn kermit_server(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<Vec<KermitReceive>, String> {
+    let cfg = config::get_config();
+    if verbose {
+        glog!(
+            "Kermit server: ready, is_tcp={}, is_petscii={}",
+            is_tcp,
+            is_petscii
+        );
+    }
+    let mut all_received: Vec<KermitReceive> = Vec::new();
+    let mut state = ReadState::default();
+    // Per-session working subdir, settled by G C (CWD).  All R-pulls,
+    // S-receives (via the R/S handlers below), and G D / G $ replies
+    // resolve paths relative to `cfg.transfer_dir / subdir`.
+    let mut subdir: String = String::new();
+    // Server idles indefinitely on the first command from the peer;
+    // re-uses kermit_negotiation_timeout as the inactivity bound so
+    // a wedged peer can't pin us forever.  Re-armed per command.
+    loop {
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout);
+        let pkt = read_packet(
+            reader,
+            is_tcp,
+            is_petscii,
+            b'1',
+            CR,
+            verbose,
+            &mut state,
+            Some(deadline),
+        )
+        .await
+        .map_err(|e| format!("Kermit server: read failed: {}", e))?;
+        if verbose {
+            glog!(
+                "Kermit server: dispatch type='{}' seq={}",
+                pkt.kind as char,
+                pkt.seq
+            );
+        }
+        match pkt.kind {
+            TYPE_HOST => {
+                // Host commands are a remote-code-execution primitive
+                // by design.  Refuse with E-packet regardless of any
+                // future config opt-in — actually executing them is
+                // out of scope and will stay that way unless the
+                // operator explicitly wires in a sandboxed backend.
+                send_error(
+                    writer,
+                    pkt.seq,
+                    "Host commands disabled",
+                    b'1',
+                    0,
+                    0,
+                    CR,
+                    is_tcp,
+                )
+                .await?;
+                if verbose {
+                    glog!("Kermit server: refused C-packet (host commands disabled)");
+                }
+                return Ok(all_received);
+            }
+            TYPE_INIT => {
+                // Re-init mid-session: respond with Y-ACK whose payload
+                // is a fresh Send-Init advertising our current caps.
+                let our_caps = config_capabilities();
+                let ack_payload = build_send_init_payload(&our_caps);
+                send_ack_with_payload(
+                    writer,
+                    pkt.seq,
+                    &ack_payload,
+                    b'1',
+                    0,
+                    0,
+                    CR,
+                    is_tcp,
+                )
+                .await?;
+                if verbose {
+                    glog!("Kermit server: handled I-packet (re-init)");
+                }
+                continue;
+            }
+            TYPE_ERROR => {
+                // Peer signaled abort — log and exit without responding
+                // (per spec, E is fatal both ways; ACKing risks a loop).
+                if verbose {
+                    let q = Quoting {
+                        qctl: DEFAULT_QCTL,
+                        qbin: None,
+                        rept: None,
+                        locking_shifts: false,
+                    };
+                    let msg = decode_error_message(&pkt.payload, q);
+                    glog!("Kermit server: peer E-packet: {}", msg);
+                }
+                return Ok(all_received);
+            }
+            TYPE_EOT => {
+                // Clean session-end signal.  ACK and exit.
+                send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                if verbose {
+                    glog!("Kermit server: B-packet → clean exit");
+                }
+                return Ok(all_received);
+            }
+            TYPE_GENERIC => {
+                // Generic-command dispatch.  Per Frank da Cruz spec §6:
+                // F=Finish, L=Logout, B=BYE end the session;
+                // C=CWD updates per-session subdir;
+                // D=DIR / $=SPACE / K=KERMIT reply with X+Z text data.
+                // Anything else is acknowledged and ignored — that's
+                // the spec-compliant fallback for unknown subcommands.
+                let recv_q = Quoting {
+                    qctl: DEFAULT_QCTL,
+                    qbin: None,
+                    rept: None,
+                    locking_shifts: false,
+                };
+                let raw = decode_data(&pkt.payload, recv_q).unwrap_or_default();
+                let action = raw.first().copied().unwrap_or(0);
+                let arg: &[u8] = if raw.len() > 1 { &raw[1..] } else { &[] };
+                let pkt_timeout = tokio::time::Duration::from_secs(cfg.kermit_packet_timeout);
+                match action {
+                    b'F' | b'L' | b'B' => {
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        if verbose {
+                            glog!("Kermit server: G '{}' → exit", action as char);
+                        }
+                        return Ok(all_received);
+                    }
+                    b'C' => {
+                        let new_subdir = String::from_utf8_lossy(arg).into_owned();
+                        if !is_safe_relative_subdir(&new_subdir) {
+                            send_error(
+                                writer,
+                                pkt.seq,
+                                "Invalid directory",
+                                b'1',
+                                0,
+                                0,
+                                CR,
+                                is_tcp,
+                            )
+                            .await?;
+                            if verbose {
+                                glog!(
+                                    "Kermit server: G C '{}' refused (unsafe path)",
+                                    new_subdir
+                                );
+                            }
+                            return Ok(all_received);
+                        }
+                        subdir = new_subdir;
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        if verbose {
+                            glog!("Kermit server: G C → subdir='{}'", subdir);
+                        }
+                        continue;
+                    }
+                    b'D' => {
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        let dir_path = effective_transfer_path(&cfg, &subdir);
+                        let listing = format_dir_listing(&dir_path);
+                        send_g_text_response(
+                            reader,
+                            writer,
+                            &listing,
+                            pkt.seq,
+                            is_tcp,
+                            is_petscii,
+                            verbose,
+                            &mut state,
+                            cfg.kermit_max_retries,
+                            pkt_timeout,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    b'$' => {
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        let dir_path = effective_transfer_path(&cfg, &subdir);
+                        let body = match fs_free_bytes(&dir_path) {
+                            Some(b) => b.to_string(),
+                            None => "unknown".to_string(),
+                        };
+                        send_g_text_response(
+                            reader,
+                            writer,
+                            &body,
+                            pkt.seq,
+                            is_tcp,
+                            is_petscii,
+                            verbose,
+                            &mut state,
+                            cfg.kermit_max_retries,
+                            pkt_timeout,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    b'K' => {
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        let body = format!(
+                            "Ethernet Gateway Kermit {}",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                        send_g_text_response(
+                            reader,
+                            writer,
+                            &body,
+                            pkt.seq,
+                            is_tcp,
+                            is_petscii,
+                            verbose,
+                            &mut state,
+                            cfg.kermit_max_retries,
+                            pkt_timeout,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    _ => {
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        if verbose {
+                            glog!(
+                                "Kermit server: G '{}' acknowledged (no-op)",
+                                action as char
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+            TYPE_SEND_INIT => {
+                // Peer wants to upload one or more files to us.  Hand
+                // the pre-read S off to the receiver state machine and
+                // accumulate whatever it returns; then loop back for
+                // the next command.  A read failure inside the receive
+                // (timeout, malformed packet, etc.) propagates up.
+                let received = kermit_receive_with_init(
+                    reader,
+                    writer,
+                    is_tcp,
+                    is_petscii,
+                    verbose,
+                    Some(pkt),
+                )
+                .await?;
+                if verbose {
+                    glog!(
+                        "Kermit server: S-dispatch returned {} file(s)",
+                        received.len()
+                    );
+                }
+                all_received.extend(received);
+                continue;
+            }
+            TYPE_R => {
+                // Peer asks us to send a named file from `transfer_dir`.
+                // Decode + validate the filename, look the file up on
+                // disk, then hand off to the sender state machine
+                // starting at seq+1 (so its S follows our just-received
+                // R in the same monotonic stream).
+                let fname = String::from_utf8_lossy(&pkt.payload).into_owned();
+                if !is_safe_resume_filename(&fname) {
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "Invalid filename",
+                        b'1',
+                        0,
+                        0,
+                        CR,
+                        is_tcp,
+                    )
+                    .await?;
+                    if verbose {
+                        glog!("Kermit server: refused R '{}' (unsafe filename)", fname);
+                    }
+                    return Ok(all_received);
+                }
+                let path = effective_transfer_path(&cfg, &subdir).join(&fname);
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        send_error(
+                            writer,
+                            pkt.seq,
+                            "File not found",
+                            b'1',
+                            0,
+                            0,
+                            CR,
+                            is_tcp,
+                        )
+                        .await?;
+                        if verbose {
+                            glog!(
+                                "Kermit server: refused R '{}' (file not found)",
+                                fname
+                            );
+                        }
+                        return Ok(all_received);
+                    }
+                };
+                if bytes.len() as u64 > MAX_FILE_SIZE {
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "File too large",
+                        b'1',
+                        0,
+                        0,
+                        CR,
+                        is_tcp,
+                    )
+                    .await?;
+                    return Ok(all_received);
+                }
+                let modtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                let file = KermitSendFile {
+                    name: &fname,
+                    data: &bytes,
+                    modtime,
+                    mode: None,
+                };
+                let starting_seq = (pkt.seq + 1) & 0x3F;
+                if verbose {
+                    glog!(
+                        "Kermit server: R '{}' → sending {} bytes (starting seq={})",
+                        fname,
+                        bytes.len(),
+                        starting_seq
+                    );
+                }
+                kermit_send_with_starting_seq(
+                    reader,
+                    writer,
+                    &[file],
+                    is_tcp,
+                    is_petscii,
+                    verbose,
+                    starting_seq,
+                )
+                .await?;
+                continue;
+            }
+            other => {
+                // Anything else — treat as protocol error and bail.
+                if verbose {
+                    glog!(
+                        "Kermit server: unexpected type='{}' seq={}",
+                        other as char,
+                        pkt.seq
+                    );
+                }
+                send_error(
+                    writer,
+                    pkt.seq,
+                    "Unexpected packet type",
+                    b'1',
+                    0,
+                    0,
+                    CR,
+                    is_tcp,
+                )
+                .await?;
+                return Ok(all_received);
+            }
+        }
+    }
 }
 
 /// Convert a Kermit "yyyymmdd hh:mm:ss" date string to UNIX seconds.
@@ -3462,6 +4563,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: None,
+            locking_shifts: false,
         };
         let input = b"Hello world";
         let enc = encode_data(input, q);
@@ -3475,6 +4577,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: None,
+            locking_shifts: false,
         };
         let input = b"line1\rline2\nend\x00\x1B!";
         let enc = encode_data(input, q);
@@ -3488,6 +4591,7 @@ mod tests {
             qctl: b'#',
             qbin: Some(b'&'),
             rept: None,
+            locking_shifts: false,
         };
         let input: Vec<u8> = (0..=255u8).collect();
         let enc = encode_data(&input, q);
@@ -3501,6 +4605,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         let input: Vec<u8> = vec![b'A'; 50];
         let enc = encode_data(&input, q);
@@ -3517,6 +4622,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         let input: Vec<u8> = vec![0x42u8; 200];
         let enc = encode_data(&input, q);
@@ -3530,6 +4636,7 @@ mod tests {
             qctl: b'#',
             qbin: Some(b'&'),
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         let mut input: Vec<u8> = Vec::new();
         // Three runs of every byte value followed by an irregular pattern.
@@ -3551,6 +4658,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: None,
+            locking_shifts: false,
         };
         // Quoted prefix at end of buffer with no body: should error.
         assert!(decode_data(b"#", q).is_err());
@@ -3562,8 +4670,132 @@ mod tests {
             qctl: b'#',
             qbin: Some(b'&'),
             rept: None,
+            locking_shifts: false,
         };
         assert!(decode_data(b"&", q).is_err());
+    }
+
+    // ---------- Locking shifts (Frank da Cruz §3.4.5) ----------
+
+    /// Helper: build a Quoting with locking shifts on, qbin off, REPT
+    /// optional.  Mirrors the precedence the spec mandates
+    /// (locking-shift > QBIN).
+    fn lshift_q(rept: Option<u8>) -> Quoting {
+        Quoting {
+            qctl: b'#',
+            qbin: None,
+            rept,
+            locking_shifts: true,
+        }
+    }
+
+    #[test]
+    fn test_lshift_low_only_emits_no_shift_markers() {
+        // All low-bit input: encoder must never emit SO/SI.  Wire output
+        // is the same as a non-locking-shift transparent transmission.
+        let q = lshift_q(None);
+        let input = b"hello world";
+        let enc = encode_data(input, q);
+        // Find any ctl-quoted SO/SI in the output: would appear as
+        // `qctl ctl(SO)` (`# N`) or `qctl ctl(SI)` (`# O`).
+        let mut iter = enc.windows(2);
+        let has_shift = iter.any(|w| w[0] == b'#' && (w[1] == ctl(SO) || w[1] == ctl(SI)));
+        assert!(!has_shift, "no SO/SI markers on low-only input");
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_high_only_emits_so_then_closing_si() {
+        // All high-bit input: one leading SO, optional REPT-compressed
+        // body, one trailing SI to leave the packet in Normal mode.
+        let q = lshift_q(None);
+        let input: Vec<u8> = (0x80u8..=0x90u8).collect();
+        let enc = encode_data(&input, q);
+        // First two bytes must be `qctl ctl(SO)`.
+        assert_eq!(
+            &enc[..2],
+            &[b'#', ctl(SO)],
+            "expected leading SO, got {:?}",
+            &enc[..2]
+        );
+        // Last two bytes must be `qctl ctl(SI)`.
+        let last = enc.len();
+        assert_eq!(
+            &enc[last - 2..],
+            &[b'#', ctl(SI)],
+            "expected trailing SI, got {:?}",
+            &enc[last - 2..]
+        );
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_mixed_round_trip() {
+        let q = lshift_q(None);
+        // Alternate low/high so encoder must flip mode on every byte.
+        let input: Vec<u8> = (0..32u8).map(|i| if i & 1 == 0 { i } else { 0x80 | i }).collect();
+        let enc = encode_data(&input, q);
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_all_byte_values_round_trip() {
+        let q = lshift_q(None);
+        let input: Vec<u8> = (0..=255u8).collect();
+        let enc = encode_data(&input, q);
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_literal_so_in_data_preserved() {
+        // 0x0E (SO) and 0x0F (SI) appearing as DATA must round-trip
+        // unchanged — they go out via the literal-prefix escape
+        // (`qctl + raw byte`) so the decoder doesn't mode-flip.  This
+        // is the most-likely-to-regress edge case for locking shifts.
+        let q = lshift_q(None);
+        let input: Vec<u8> = vec![SO, SI, 0x80 | SO, 0x80 | SI, b'x'];
+        let enc = encode_data(&input, q);
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_with_rept_compression_high_bit_run() {
+        // Run of identical high-bit bytes should compress under REPT
+        // AND ride a single SO/SI mode pair.  The mode flip must come
+        // BEFORE the REPT marker so the marker + body sit in the
+        // shifted set; otherwise the count expands a wrongly-coloured
+        // byte.
+        let q = lshift_q(Some(b'~'));
+        let mut input = vec![b'a'; 5];
+        input.extend(std::iter::repeat_n(0xA5u8, 50));
+        input.extend([b'b'; 3]);
+        let enc = encode_data(&input, q);
+        let dec = decode_data(&enc, q).unwrap();
+        assert_eq!(dec, input);
+    }
+
+    #[test]
+    fn test_lshift_decoder_recognises_ctl_quoted_so_si_only() {
+        // Hand-craft a wire payload: `# N` (qctl ctl(SO)) is a SHIFT,
+        // but `# 0x0E` (qctl + raw byte) is a literal-prefix escape
+        // for byte 0x0E.  Decoder must treat them differently even
+        // though they share the same qctl prefix.
+        let q = lshift_q(None);
+        let shift_to_high = vec![b'#', ctl(SO), b'A', b'#', ctl(SI)];
+        // After shift to high: 'A' becomes 0xC1 (0x41 | 0x80).  After
+        // SI we're back to Normal but no further bytes.
+        let dec = decode_data(&shift_to_high, q).unwrap();
+        assert_eq!(dec, vec![0xC1]);
+
+        // Literal 0x0E in data: encoded as `# 0x0E`.
+        let literal_so = vec![b'#', SO];
+        let dec = decode_data(&literal_so, q).unwrap();
+        assert_eq!(dec, vec![SO]);
     }
 
     #[test]
@@ -3572,6 +4804,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         assert!(decode_data(b"~", q).is_err());
     }
@@ -3713,6 +4946,8 @@ mod tests {
             long_packets: true,
             attribute_packets: true,
             streaming: true,
+            resend: true,
+            locking_shifts: true,
             peer_id: Some("Ethernet Gateway Kermit".into()),
         };
         let payload = build_send_init_payload(&caps);
@@ -3720,6 +4955,8 @@ mod tests {
         assert!(parsed.long_packets);
         assert!(parsed.attribute_packets);
         assert!(parsed.streaming);
+        assert!(parsed.resend);
+        assert!(parsed.locking_shifts);
         assert_eq!(parsed.window, 4);
         assert_eq!(parsed.maxl, 4096);
         assert_eq!(parsed.chkt, b'3');
@@ -3882,6 +5119,11 @@ mod tests {
             encoding: Some(b'B'),
             record_format: Some(b'S'),
             record_length: Some(80),
+            creator_id: Some("rbryce".into()),
+            account_id: Some("ACCT-001".into()),
+            block_size: Some(512),
+            access_mode: Some(b'R'),
+            encoding_alt: Some(b'A'),
             ..Attributes::default()
         };
         let bytes = encode_attributes(&a);
@@ -3896,6 +5138,85 @@ mod tests {
         assert_eq!(parsed.encoding, Some(b'B'));
         assert_eq!(parsed.record_format, Some(b'S'));
         assert_eq!(parsed.record_length, Some(80));
+        assert_eq!(parsed.creator_id.as_deref(), Some("rbryce"));
+        assert_eq!(parsed.account_id.as_deref(), Some("ACCT-001"));
+        assert_eq!(parsed.block_size, Some(512));
+        assert_eq!(parsed.access_mode, Some(b'R'));
+        assert_eq!(parsed.encoding_alt, Some(b'A'));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_creator_id() {
+        let a = Attributes {
+            creator_id: Some("operator".into()),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b'$'));
+        assert_eq!(
+            parse_attributes(&bytes).creator_id.as_deref(),
+            Some("operator")
+        );
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_account_id() {
+        let a = Attributes {
+            account_id: Some("BILL-42".into()),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b'%'));
+        assert_eq!(
+            parse_attributes(&bytes).account_id.as_deref(),
+            Some("BILL-42")
+        );
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_block_size() {
+        let a = Attributes {
+            block_size: Some(1024),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b'\''));
+        assert_eq!(parse_attributes(&bytes).block_size, Some(1024));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_access_mode() {
+        let a = Attributes {
+            access_mode: Some(b'A'),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b'('));
+        assert_eq!(parse_attributes(&bytes).access_mode, Some(b'A'));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_encoding_alt() {
+        let a = Attributes {
+            encoding_alt: Some(b'C'),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b')'));
+        assert_eq!(parse_attributes(&bytes).encoding_alt, Some(b'C'));
+    }
+
+    #[test]
+    fn test_attributes_creator_id_oversize_dropped() {
+        // Per spec, sub-attribute values can't exceed 94 bytes (the
+        // tochar-encoded length field caps at 94).  Encoder must drop
+        // values that would overflow rather than emit a garbled length.
+        let a = Attributes {
+            creator_id: Some("x".repeat(95)),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(!bytes.contains(&b'$'), "oversized '$' must not be emitted");
     }
 
     #[test]
@@ -4002,6 +5323,164 @@ mod tests {
         assert_eq!(a.length, Some(42));
     }
 
+    // ---------- Resume-partial helper ----------
+
+    /// Build a unique scratch directory under the OS temp dir.
+    /// Cleaned by the caller via `let _ = std::fs::remove_dir_all(&dir);`.
+    fn resume_scratch_dir(name: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_{}_{}", pid, name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_compute_resume_offset_existing_file_returns_size() {
+        let dir = resume_scratch_dir("existing");
+        let payload = b"partial bytes on disk";
+        std::fs::write(dir.join("foo.bin"), payload).unwrap();
+        let off = compute_resume_offset("foo.bin", dir.to_str().unwrap(), 168);
+        assert_eq!(off, Some(payload.len() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_zero_byte_file_returns_zero() {
+        // Empty partial is still a partial — spec lets the receiver
+        // advertise length=0, the sender just sends from byte 0.
+        let dir = resume_scratch_dir("zerobyte");
+        std::fs::write(dir.join("empty.bin"), b"").unwrap();
+        let off = compute_resume_offset("empty.bin", dir.to_str().unwrap(), 168);
+        assert_eq!(off, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_missing_file_returns_none() {
+        let dir = resume_scratch_dir("missing");
+        let off = compute_resume_offset("absent.bin", dir.to_str().unwrap(), 168);
+        assert_eq!(off, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_directory_returns_none() {
+        // The "filename" resolves to a directory — must not be treated
+        // as a resumable partial.
+        let dir = resume_scratch_dir("dirnotfile");
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        let off = compute_resume_offset("subdir", dir.to_str().unwrap(), 168);
+        assert_eq!(off, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_too_old_returns_none() {
+        // Backdate the file's mtime past the configured cutoff.
+        // Using max_age_hours=1 with a file backdated to 2 hours ago
+        // gives an unambiguous failure even on slow CI clocks.
+        let dir = resume_scratch_dir("tooold");
+        let path = dir.join("stale.bin");
+        std::fs::write(&path, b"stale partial").unwrap();
+        // Set mtime to 2 hours ago.
+        let two_hours_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(2 * 3600);
+        let f = std::fs::File::open(&path).unwrap();
+        f.set_modified(two_hours_ago).unwrap();
+        drop(f);
+        let off = compute_resume_offset("stale.bin", dir.to_str().unwrap(), 1);
+        assert_eq!(off, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_within_age_window_returns_size() {
+        // Sanity check: same backdating mechanism, but the file is
+        // young enough relative to the configured window — must be
+        // accepted.  Guards against an off-by-one in the cutoff math.
+        let dir = resume_scratch_dir("fresh_aged");
+        let path = dir.join("recent.bin");
+        std::fs::write(&path, b"recent partial").unwrap();
+        // Backdate to 30 minutes ago, max_age_hours = 1 → eligible.
+        let thirty_min_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(1800);
+        let f = std::fs::File::open(&path).unwrap();
+        f.set_modified(thirty_min_ago).unwrap();
+        drop(f);
+        let off = compute_resume_offset("recent.bin", dir.to_str().unwrap(), 1);
+        assert_eq!(off, Some(b"recent partial".len() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_future_mtime_returns_none() {
+        // Clock-skew defense: a file timestamped in the future could
+        // wrap around our age math (now - mtime is Err) and silently
+        // become "always eligible".  Treat as ineligible instead.
+        let dir = resume_scratch_dir("future_mtime");
+        let path = dir.join("future.bin");
+        std::fs::write(&path, b"clock skew payload").unwrap();
+        let one_hour_ahead = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(3600);
+        let f = std::fs::File::open(&path).unwrap();
+        f.set_modified(one_hour_ahead).unwrap();
+        drop(f);
+        let off = compute_resume_offset("future.bin", dir.to_str().unwrap(), 168);
+        assert_eq!(off, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_resume_offset_missing_dir_returns_none() {
+        let off = compute_resume_offset(
+            "anything.bin",
+            "/nonexistent/path/that/does/not/exist",
+            168,
+        );
+        assert_eq!(off, None);
+    }
+
+    #[test]
+    fn test_is_safe_resume_filename_accepts_normal_names() {
+        assert!(is_safe_resume_filename("foo.bin"));
+        assert!(is_safe_resume_filename("a"));
+        assert!(is_safe_resume_filename("file_v2.tar.gz"));
+        assert!(is_safe_resume_filename("UPPER-CASE-NAME.TXT"));
+    }
+
+    #[test]
+    fn test_is_safe_resume_filename_rejects_traversal_and_separators() {
+        // Path-traversal threat model: the receiver joins this name
+        // onto cfg.transfer_dir before stat-ing.  Anything that could
+        // escape the directory must be refused.
+        assert!(!is_safe_resume_filename(""));
+        assert!(!is_safe_resume_filename(".hidden"));
+        assert!(!is_safe_resume_filename("../escape"));
+        assert!(!is_safe_resume_filename("foo/../bar"));
+        assert!(!is_safe_resume_filename("sub/file"));
+        assert!(!is_safe_resume_filename("win\\style"));
+        assert!(!is_safe_resume_filename("nul\0byte"));
+        assert!(!is_safe_resume_filename(".."));
+    }
+
+    #[test]
+    fn test_compute_resume_offset_unsafe_filename_returns_none() {
+        // Even if the on-disk path would accidentally resolve to a
+        // real file, the safety check must short-circuit before any
+        // stat happens.  This guards against a future regression
+        // where we might be tempted to canonicalize the path "after"
+        // the join — by that point a `..` has already escaped.
+        let dir = resume_scratch_dir("unsafe_name");
+        std::fs::write(dir.join("real.bin"), b"shouldn't matter").unwrap();
+        // Construct a filename that would point back at real.bin via
+        // traversal if joining naively from a sibling dir, then make
+        // sure the helper refuses it regardless.
+        let off = compute_resume_offset("../real.bin", dir.to_str().unwrap(), 168);
+        assert_eq!(off, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---------- Date conversion ----------
 
     #[test]
@@ -4034,9 +5513,496 @@ mod tests {
     // CAN×2 abort state machine moved to tnio.rs (shared across
     // xmodem and kermit).  See `tnio::tests::test_can_abort_state_machine`.
 
+    // ---------- Server-mode dispatch (Gap 3a commit 1) ----------
+
+    use tokio::io::{duplex, split, AsyncWriteExt};
+
+    /// Spin up `kermit_server` against a duplex pipe.  The caller's
+    /// closure receives one half of the pipe to play the part of a
+    /// Kermit client (write requests, read server responses).  Returns
+    /// the closure's value plus the server's exit `Result`.
+    async fn run_server_with_client<F, T>(
+        client: F,
+    ) -> (T, Result<Vec<KermitReceive>, String>)
+    where
+        F: AsyncFnOnce(
+            &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        ) -> T,
+    {
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+        let client_result = client(&mut c_write, &mut c_read).await;
+        // Flush so any pending bytes from client side reach the server.
+        let _ = c_write.flush().await;
+        let server_result = server_task.await.unwrap();
+        (client_result, server_result)
+    }
+
+    /// Build a complete on-the-wire packet at session-default settings
+    /// (CHKT=1, no padding, EOL=CR) — what a peer would emit before
+    /// negotiation completes.
+    fn wire_packet(kind: u8, seq: u8, payload: &[u8]) -> Vec<u8> {
+        build_packet(kind, seq, payload, b'1', 0, 0, CR)
+    }
+
+    /// Read one packet from the server's response stream using the
+    /// same protocol the receiver does at default settings.
+    async fn read_server_packet(
+        reader: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    ) -> Packet {
+        let mut state = ReadState::default();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        read_packet(reader, false, false, b'1', CR, false, &mut state, Some(deadline))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_server_refuses_host_command_with_e_packet() {
+        // C-packet (host command) is a remote-code-execution primitive;
+        // server must refuse with an E-packet by default.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_HOST, 0, b"rm -rf /"))
+                .await
+                .unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR, "expected E-packet, got '{}'", resp.kind as char);
+            let q = Quoting::default();
+            let msg = decode_error_message(&resp.payload, q);
+            assert!(
+                msg.to_ascii_lowercase().contains("disabled"),
+                "E-packet message must explain refusal, got: {}",
+                msg
+            );
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_handles_init_with_capas_yack() {
+        // I-packet asks for fresh CAPAS — server must reply with Y-ACK
+        // whose payload is a Send-Init (parseable as Capabilities).
+        // After the I-ACK, the server stays alive; we send B to close.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_INIT, 0, &[])).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK, "expected ACK, got '{}'", resp.kind as char);
+            let parsed = parse_send_init_payload(&resp.payload);
+            // Sanity-check a couple fields that config_capabilities
+            // always sets — proves the payload is a real Send-Init,
+            // not just empty bytes.
+            assert!(parsed.maxl >= MIN_PACKET_LEN as u16);
+            assert!(matches!(parsed.chkt, b'1' | b'2' | b'3'));
+            // Now send B to close the session cleanly.
+            w.write_all(&wire_packet(TYPE_EOT, 1, &[])).await.unwrap();
+            let close = read_server_packet(r).await;
+            assert_eq!(close.kind, TYPE_ACK, "expected ACK to B, got '{}'", close.kind as char);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_eot_acks_and_exits() {
+        // B-packet (EOT) signals clean session-end.  Server ACKs and
+        // returns Ok.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_EOT, 0, &[])).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_peer_e_packet_exits_silently() {
+        // E-packet is fatal both ways.  Server must NOT respond
+        // (responding could trigger a loop with a peer that's also
+        // about to exit on E).  It just logs and returns.
+        let ((), result) = run_server_with_client(async |w, _r| {
+            w.write_all(&wire_packet(TYPE_ERROR, 0, b"client gave up"))
+                .await
+                .unwrap();
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_finish_acks_and_exits() {
+        // G F (Generic Finish): server ACKs then exits.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"F")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_logout_acks_and_exits() {
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"L")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_unknown_subcommand_acks_and_continues() {
+        // Unknown G subcommand (not F/L): ACK and stay in the loop.
+        // Verify by sending a follow-up B and expecting a second ACK.
+        let ((), result) = run_server_with_client(async |w, r| {
+            // Custom unknown G subcommand 'X' — server must ACK and
+            // continue, not exit.  BYE/CWD/DIR/SPACE/KERMIT will be
+            // wired in commit 3.
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"X")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK, "G X should be ACKed");
+            // Follow up with B to close.
+            w.write_all(&wire_packet(TYPE_EOT, 1, &[])).await.unwrap();
+            let close = read_server_packet(r).await;
+            assert_eq!(close.kind, TYPE_ACK);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_dispatches_s_to_receive() {
+        // S-dispatch end-to-end: client uses `kermit_send` to upload
+        // a file via the server's S handler.  After the transfer
+        // completes, client closes the session with G F.  The server
+        // must return the received file in its Vec<KermitReceive>.
+        let payload: Vec<u8> = b"hello kermit server".to_vec();
+        let payload_for_client = payload.clone();
+        let ((), result) = run_server_with_client(async move |w, r| {
+            // Client-side: kermit_send the file, then send G F at
+            // default-chkt to close the server's dispatch loop.
+            let kfile = KermitSendFile {
+                name: "uploaded.bin",
+                data: &payload_for_client,
+                modtime: None,
+                mode: None,
+            };
+            kermit_send(r, w, &[kfile], false, false, false)
+                .await
+                .unwrap();
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"F")).await.unwrap();
+            // Drain the G-F ACK so it doesn't sit in the pipe.
+            let _ = read_server_packet(r).await;
+        })
+        .await;
+        let received = result.unwrap();
+        assert_eq!(received.len(), 1, "exactly one file should round-trip");
+        assert_eq!(received[0].filename, "uploaded.bin");
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_server_r_pulls_existing_file() {
+        // R-dispatch end-to-end: client sends R(filename), server
+        // looks the file up in transfer_dir, sends it.  Client uses
+        // `kermit_receive` to read the server's S/F/A/D/Z/B stream.
+        // expected_seq inside kermit_receive is now derived from
+        // S.seq+1, so the off-by-one (server's S arrives at seq=1
+        // not seq=0) is handled correctly.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_server_r_pull_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i ^ 0xA5) as u8).collect();
+        std::fs::write(dir.join("pull.bin"), &payload).unwrap();
+
+        // Override transfer_dir so the server looks here.  Reset on exit.
+        // (run_server_with_client locks CONFIG_LOCK and calls
+        // init_test_config; we override after that inside the closure.)
+        let dir_str = dir.to_str().unwrap().to_string();
+        let payload_clone = payload.clone();
+        let dir_for_cleanup = dir.clone();
+
+        let (recv_data, result) = run_server_with_client(async move |w, r| {
+            config::update_config_value("transfer_dir", &dir_str);
+            // Client → server: R(pull.bin) at seq 0.
+            w.write_all(&wire_packet(TYPE_R, 0, b"pull.bin")).await.unwrap();
+            // Now act as a receiver against the server's send stream.
+            let received = kermit_receive(r, w, false, false, false)
+                .await
+                .unwrap();
+            // Close the dispatch loop with G F.
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"F")).await.unwrap();
+            let _ = read_server_packet(r).await;
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].data, payload_clone);
+            received[0].data.clone()
+        })
+        .await;
+
+        // Reset transfer_dir for unrelated tests.
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+
+        result.unwrap();
+        assert_eq!(recv_data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_server_r_missing_file_returns_e_packet() {
+        // R for a file that doesn't exist in transfer_dir → server
+        // emits E-packet "File not found" and exits.  Locks in the
+        // safe-by-default behavior — server must NOT, e.g., create
+        // the file or hang.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_R, 0, b"absent.bin")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR, "expected E-packet for missing file");
+            let q = Quoting::default();
+            let msg = decode_error_message(&resp.payload, q).to_ascii_lowercase();
+            assert!(
+                msg.contains("not found") || msg.contains("missing"),
+                "E-packet message must explain absence, got: {}",
+                msg
+            );
+        })
+        .await;
+        result.unwrap();
+    }
+
+    /// Helper: run a G subcommand that produces a text response
+    /// (DIR/SPACE/KERMIT).  Drives the full G→ACK→X→ACK→Z→ACK
+    /// exchange and returns the decoded X-packet body.
+    async fn run_g_text_command(
+        w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        r: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        action: u8,
+        arg: &[u8],
+    ) -> String {
+        let mut payload = vec![action];
+        payload.extend_from_slice(arg);
+        w.write_all(&wire_packet(TYPE_GENERIC, 0, &payload))
+            .await
+            .unwrap();
+        let g_ack = read_server_packet(r).await;
+        assert_eq!(g_ack.kind, TYPE_ACK, "expected ACK to G, got '{}'", g_ack.kind as char);
+        let x = read_server_packet(r).await;
+        assert_eq!(x.kind, TYPE_TEXT, "expected X (text), got '{}'", x.kind as char);
+        w.write_all(&wire_packet(TYPE_ACK, x.seq, &[])).await.unwrap();
+        let z = read_server_packet(r).await;
+        assert_eq!(z.kind, TYPE_EOF, "expected Z (EOF), got '{}'", z.kind as char);
+        w.write_all(&wire_packet(TYPE_ACK, z.seq, &[])).await.unwrap();
+        let q = Quoting::default();
+        let decoded = decode_data(&x.payload, q).unwrap();
+        String::from_utf8(decoded).unwrap()
+    }
+
+    /// Helper: close a server-mode session cleanly with G F.
+    async fn close_server_session(
+        w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        r: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    ) {
+        w.write_all(&wire_packet(TYPE_GENERIC, 0, b"F")).await.unwrap();
+        let _ = read_server_packet(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_is_safe_relative_subdir_accepts_safe_paths() {
+        assert!(is_safe_relative_subdir(""));
+        assert!(is_safe_relative_subdir("foo"));
+        assert!(is_safe_relative_subdir("foo/bar"));
+        assert!(is_safe_relative_subdir("a-b_c.d"));
+    }
+
+    #[tokio::test]
+    async fn test_is_safe_relative_subdir_rejects_unsafe_paths() {
+        assert!(!is_safe_relative_subdir("/abs"));
+        assert!(!is_safe_relative_subdir(".."));
+        assert!(!is_safe_relative_subdir("foo/.."));
+        assert!(!is_safe_relative_subdir(".hidden"));
+        assert!(!is_safe_relative_subdir("foo//bar"));
+        assert!(!is_safe_relative_subdir("win\\path"));
+        assert!(!is_safe_relative_subdir("nul\0byte"));
+        assert!(!is_safe_relative_subdir("has space"));
+    }
+
+    #[tokio::test]
+    async fn test_server_g_bye_exits_like_finish() {
+        // BYE is treated as session-end at the kermit layer.  Telnet
+        // integration may interpret it as "log out the connection"
+        // separately, but the protocol exit path is shared.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"B")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ACK);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_kermit_returns_version() {
+        // G K reports our identity + version via X-packet.
+        let ((), result) = run_server_with_client(async |w, r| {
+            let body = run_g_text_command(w, r, b'K', &[]).await;
+            assert!(
+                body.contains("Ethernet Gateway Kermit"),
+                "missing identity in: {:?}",
+                body
+            );
+            assert!(
+                body.contains(env!("CARGO_PKG_VERSION")),
+                "missing version in: {:?}",
+                body
+            );
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_space_returns_numeric_or_unknown() {
+        // G $ replies with free-bytes count (Unix) or "unknown" (other
+        // platforms).  Either is spec-compliant; what matters is that
+        // we replied with X+Z rather than NAKing.
+        let ((), result) = run_server_with_client(async |w, r| {
+            let body = run_g_text_command(w, r, b'$', &[]).await;
+            assert!(!body.is_empty(), "SPACE response must not be empty");
+            // Body must parse as a u64 OR equal "unknown".
+            assert!(
+                body.parse::<u64>().is_ok() || body == "unknown",
+                "SPACE response must be numeric or 'unknown', got: {:?}",
+                body
+            );
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_dir_returns_listing() {
+        // G D lists files in the current effective dir.  Set up a
+        // temp dir with two files + a hidden file (skipped) and verify
+        // the listing.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_server_g_dir_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.bin"), b"a").unwrap();
+        std::fs::write(dir.join("beta.bin"), b"bb").unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let ((), result) = run_server_with_client(async move |w, r| {
+            config::update_config_value("transfer_dir", &dir_str);
+            let body = run_g_text_command(w, r, b'D', &[]).await;
+            assert!(body.contains("alpha.bin"), "missing alpha.bin in {:?}", body);
+            assert!(body.contains("beta.bin"), "missing beta.bin in {:?}", body);
+            assert!(!body.contains(".hidden"), "hidden file leaked in {:?}", body);
+            close_server_session(w, r).await;
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_cwd_updates_subdir_for_subsequent_pulls() {
+        // G C <subdir> updates the per-session working dir; a
+        // subsequent R must look the file up in <transfer_dir>/<subdir>.
+        // Locks in the cross-command state plumbing.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_server_g_cwd_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let payload = b"sub-dir contents".to_vec();
+        std::fs::write(dir.join("sub").join("file.bin"), &payload).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+        let payload_clone = payload.clone();
+
+        let ((), result) = run_server_with_client(async move |w, r| {
+            config::update_config_value("transfer_dir", &dir_str);
+            // CWD into "sub"
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"Csub")).await.unwrap();
+            let cwd_ack = read_server_packet(r).await;
+            assert_eq!(cwd_ack.kind, TYPE_ACK);
+            // Pull file.bin — must resolve under <transfer_dir>/sub.
+            w.write_all(&wire_packet(TYPE_R, 0, b"file.bin")).await.unwrap();
+            let received = kermit_receive(r, w, false, false, false).await.unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].data, payload_clone);
+            close_server_session(w, r).await;
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_cwd_unsafe_path_refused() {
+        // Path-traversal in CWD argument: server emits E-packet and
+        // exits without modifying the subdir.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"C../etc")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR, "expected E for CWD ../etc");
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_r_unsafe_filename_refused() {
+        // Path-traversal in R filename → reject before any disk I/O.
+        // Reuses the same `is_safe_resume_filename` guard used by the
+        // resume-partial code path.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_R, 0, b"../../etc/passwd")).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR);
+            let q = Quoting::default();
+            let msg = decode_error_message(&resp.payload, q).to_ascii_lowercase();
+            assert!(msg.contains("invalid"), "expected refusal message, got: {}", msg);
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_unexpected_packet_type_returns_e_packet() {
+        // Anything outside the known set: protocol error.  Use a type
+        // letter that isn't claimed by any handler.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(b'Z', 0, &[])).await.unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR);
+        })
+        .await;
+        result.unwrap();
+    }
+
     // ---------- End-to-end round trips ----------
 
-    use tokio::io::{duplex, split};
+    // (`duplex` and `split` already imported at the top of the
+    // server-mode tests section above.)
 
     /// Helper: run kermit_send and kermit_receive against each other in
     /// duplex pipes, returning the receiver's result.
@@ -4194,6 +6160,250 @@ mod tests {
         round_trip(files).await
     }
 
+    #[tokio::test]
+    async fn test_round_trip_resume_partial_in_memory() {
+        // End-to-end resume test: receiver finds a partial on disk,
+        // advertises disposition='R' + length in the A-packet ACK,
+        // sender slices its file from that offset, receiver merges
+        // its pre-loaded partial bytes with the resumed D-packet
+        // stream → the final in-memory data must equal the full
+        // file content.  If anything goes wrong end-to-end (sender
+        // doesn't honor the ACK, receiver double-loads, slice math
+        // is off) we'd see corrupted data length or mismatched bytes.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_e2e_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build full file: 8 KB of distinct bytes so any off-by-one
+        // mismerge would surface as a wrong byte at a known offset.
+        let full: Vec<u8> = (0..8192u32).map(|i| (i ^ (i >> 8)) as u8).collect();
+        // Partial: first 3 KB.  Mid-byte boundary so the sender has
+        // to slice into the middle of a chunk.
+        let partial_len = 3072usize;
+        std::fs::write(dir.join("resume.bin"), &full[..partial_len]).unwrap();
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+        config::update_config_value("kermit_resume_partial", "true");
+
+        let result = round_trip(vec![("resume.bin".into(), full.clone())]).await;
+
+        // Reset the resume flag and transfer_dir so unrelated tests
+        // running after this one see the init_test_config baseline.
+        // (init_test_config doesn't reset these — they aren't part
+        // of its baseline set.)
+        config::update_config_value("kermit_resume_partial", "false");
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = result.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].filename, "resume.bin");
+        assert_eq!(
+            received[0].data.len(),
+            full.len(),
+            "merged data length must equal full file (got {} expected {})",
+            received[0].data.len(),
+            full.len()
+        );
+        assert_eq!(
+            received[0].data, full,
+            "merged data must equal full file byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_resume_partial_larger_than_full_aborts_resume() {
+        // Edge case from the spec doc: partial size > declared full
+        // size.  The on-disk bytes can't be a valid prefix, so the
+        // receiver must abandon resume and accept the full file from
+        // byte 0.  If the guard isn't in place we'd see merged data
+        // that's longer than the sender's file, or the wrong bytes
+        // at the start.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_oversize_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Sender's full file is 1 KB; partial on disk is 4 KB of
+        // entirely different bytes.  If the guard fires correctly,
+        // received[0].data should match the 1 KB sender content.
+        let full: Vec<u8> = (0..1024u32).map(|i| i as u8).collect();
+        std::fs::write(dir.join("oversize.bin"), vec![0xAAu8; 4096]).unwrap();
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+        config::update_config_value("kermit_resume_partial", "true");
+
+        let result = round_trip(vec![("oversize.bin".into(), full.clone())]).await;
+
+        config::update_config_value("kermit_resume_partial", "false");
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = result.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].data.len(),
+            full.len(),
+            "must receive exactly the sender's full file, not the larger partial"
+        );
+        assert_eq!(received[0].data, full);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_resume_partial_equals_full_already_complete() {
+        // Edge case: the on-disk partial is byte-for-byte identical to
+        // the sender's full file (transfer was already complete; we're
+        // just being asked again).  Receiver advertises offset=N, sender
+        // slices `f.data[N..]` = empty, sends 0 D-packets, then Z-packet.
+        // Receiver returns its pre-loaded N bytes which == full content.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_equal_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let full: Vec<u8> = (0..2048u32).map(|i| (i ^ 0x5A) as u8).collect();
+        // Partial byte-for-byte equal to sender content — i.e. the
+        // partial IS the file.
+        std::fs::write(dir.join("complete.bin"), &full).unwrap();
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+        config::update_config_value("kermit_resume_partial", "true");
+
+        let result = round_trip(vec![("complete.bin".into(), full.clone())]).await;
+
+        config::update_config_value("kermit_resume_partial", "false");
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = result.unwrap();
+        assert_eq!(received[0].data, full);
+        assert_eq!(received[0].data.len(), full.len());
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_resume_batch_mixed_resume_and_fresh() {
+        // Multi-file batch: middle file has a partial on disk, outer
+        // two don't.  All three must arrive byte-correct, proving the
+        // per-file `pending_resume_offset` reset works (file 1 starts
+        // fresh, file 2 resumes, file 3 starts fresh again).
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_batch_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three files, each with distinct content so a misroute would
+        // surface as wrong content instead of wrong size.
+        let f1: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+        let f2: Vec<u8> = (0..2048u32).map(|i| (i ^ 0x33) as u8).collect();
+        let f3: Vec<u8> = (0..1024u32).map(|i| (i ^ 0x77) as u8).collect();
+        // Partial for f2 only — first 768 bytes.
+        let f2_partial_len = 768usize;
+        std::fs::write(dir.join("middle.bin"), &f2[..f2_partial_len]).unwrap();
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+        config::update_config_value("kermit_resume_partial", "true");
+
+        let result = round_trip(vec![
+            ("first.bin".into(), f1.clone()),
+            ("middle.bin".into(), f2.clone()),
+            ("last.bin".into(), f3.clone()),
+        ])
+        .await;
+
+        config::update_config_value("kermit_resume_partial", "false");
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = result.unwrap();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0].filename, "first.bin");
+        assert_eq!(received[0].data, f1);
+        assert_eq!(received[1].filename, "middle.bin");
+        assert_eq!(received[1].data, f2);
+        assert_eq!(received[2].filename, "last.bin");
+        assert_eq!(received[2].data, f3);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_resume_disabled_falls_back_to_full_send() {
+        // Same scenario but with kermit_resume_partial=false: the
+        // partial on disk must be ignored, the receiver must NOT
+        // pre-load anything, and the transfer must complete with the
+        // full file content as if no partial existed.  Guards against
+        // an opt-out regression.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_resume_disabled_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let full: Vec<u8> = (0..2048u32).map(|i| i as u8).collect();
+        // Write a deliberately-wrong "partial" — different bytes than
+        // the real content.  If the receiver erroneously pre-loaded
+        // it, the merged data would diverge.
+        std::fs::write(dir.join("noresume.bin"), vec![0xFFu8; 512]).unwrap();
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+        config::update_config_value("kermit_resume_partial", "false");
+
+        let result = round_trip(vec![("noresume.bin".into(), full.clone())]).await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = result.unwrap();
+        assert_eq!(received[0].data, full, "must receive full file unmodified");
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_locking_shifts_negotiated() {
+        // End-to-end: both peers configured with kermit_locking_shifts
+        // = true and 8-bit-quote = on.  Negotiation must pick locking
+        // shifts (qbin off, locking_shifts on); the resulting transfer
+        // must round-trip 8-bit data correctly through the SO/SI mode
+        // switching layer.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        config::update_config_value("kermit_locking_shifts", "true");
+        config::update_config_value("kermit_8bit_quote", "on");
+
+        // Mix of low- and high-bit bytes plus an all-bytes pass —
+        // exercises mode switches, REPT interaction (when enabled),
+        // literal SO/SI in data, and the closing SI on packet end.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"hello low-bit prefix\n");
+        payload.extend((0x80u8..=0xFFu8).collect::<Vec<u8>>());
+        payload.extend_from_slice(b"\nback to low\n");
+        payload.extend([SO, SI, 0x8E, 0x8F, b'!']);
+        payload.extend((0..=255u8).collect::<Vec<u8>>());
+
+        let result = round_trip(vec![("locking.bin".into(), payload.clone())]).await;
+
+        // Reset so unrelated tests don't inherit the locking-shift
+        // settings (init_test_config doesn't reset these).
+        config::update_config_value("kermit_locking_shifts", "false");
+        config::update_config_value("kermit_8bit_quote", "auto");
+
+        let received = result.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload, "locking-shift round-trip must be lossless");
+    }
+
     // ---------- HIGH-priority: round-2 fix coverage ----------
 
     #[test]
@@ -4226,6 +6436,7 @@ mod tests {
             qctl: b'#',
             qbin: Some(b'&'),
             rept: None,
+            locking_shifts: false,
         };
         let encoded = encode_data(&[0xFF], q);
         assert_eq!(decode_error_message(&encoded, q), "(unparseable)");
@@ -4279,6 +6490,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: None,
+            locking_shifts: false,
         };
         let data_payload = encode_data(b"oops", q);
         wire.extend_from_slice(&build_packet(TYPE_DATA, 1, &data_payload, b'1', 0, 0, CR));
@@ -4879,6 +7091,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         // Run-length 3 — just at the encoder's threshold.  Must
         // round-trip whether or not compression actually fires.
@@ -4893,6 +7106,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         // Max single-repeat run length (tochar(94) = '~' is the prefix
         // itself; tochar(94) the count byte = 0x7E).  Verify exactly
@@ -4908,6 +7122,7 @@ mod tests {
             qctl: b'#',
             qbin: None,
             rept: Some(b'~'),
+            locking_shifts: false,
         };
         // 95 identical bytes — must split into two repeat groups.
         let input = vec![b'Q'; 95];
@@ -5120,6 +7335,185 @@ mod tests {
         assert!(parsed.long_packets);
         assert_eq!(parsed.window, 1, "no sliding advertised → window 1");
         assert_eq!(parsed.maxl, 4096);
+    }
+
+    #[test]
+    fn test_send_init_capas_resend_bit_set_when_advertised() {
+        // CAPAS byte 1 lives at payload[9].  Bit 4 (CAPAS_RESEND, 0x10)
+        // tells the peer we can do resume-partial coordination.
+        let caps = Capabilities {
+            attribute_packets: true,
+            resend: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_ne!(capas & CAPAS_RESEND, 0, "RESEND bit must be set");
+        assert_ne!(capas & CAPAS_ATTRIBUTE, 0, "ATTRIBUTE bit must be set");
+    }
+
+    #[test]
+    fn test_send_init_capas_resend_bit_clear_when_not_advertised() {
+        // Default Capabilities has resend=false; the bit must be clear.
+        // Guards against the encoder accidentally setting it for all
+        // sessions (which would mislead a strict peer into expecting
+        // disposition='R' coordination we won't provide).
+        let caps = Capabilities {
+            attribute_packets: true,
+            resend: false,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_eq!(capas & CAPAS_RESEND, 0, "RESEND bit must be clear");
+    }
+
+    #[test]
+    fn test_send_init_resend_round_trips_through_parse() {
+        let caps = Capabilities {
+            resend: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let parsed = parse_send_init_payload(&payload);
+        assert!(parsed.resend, "parse must recover the RESEND bit");
+
+        let caps = Capabilities {
+            resend: false,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let parsed = parse_send_init_payload(&payload);
+        assert!(!parsed.resend, "parse must NOT spuriously set RESEND");
+    }
+
+    #[test]
+    fn test_intersect_capabilities_resend_requires_both_sides() {
+        // Spec rule (and our gate): RESEND is enabled only when BOTH
+        // peers advertise it.  Asymmetric advertisement falls back to
+        // disabled — otherwise an opt-out peer could be surprised by
+        // disposition='R' tags it doesn't understand.
+        let ours = Capabilities {
+            resend: true,
+            ..Capabilities::default()
+        };
+        let theirs = Capabilities {
+            resend: false,
+            ..Capabilities::default()
+        };
+        assert!(!intersect_capabilities(&ours, &theirs).resend);
+        assert!(!intersect_capabilities(&theirs, &ours).resend);
+
+        let both = Capabilities {
+            resend: true,
+            ..Capabilities::default()
+        };
+        assert!(intersect_capabilities(&both, &both).resend);
+    }
+
+    #[test]
+    fn test_send_init_capas_locking_shift_bit_set_when_advertised() {
+        // CAPAS byte 1 lives at payload[9].  Bit 5
+        // (CAPAS_LOCKING_SHIFT, 0x20) tells the peer we can do SO/SI
+        // region quoting.
+        let caps = Capabilities {
+            attribute_packets: true,
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_ne!(capas & CAPAS_LOCKING_SHIFT, 0, "LOCKING_SHIFT bit must be set");
+    }
+
+    #[test]
+    fn test_send_init_capas_locking_shift_bit_clear_when_not_advertised() {
+        // Default: bit must be clear.  Catches a regression where the
+        // encoder accidentally sets it for all sessions, which would
+        // confuse strict-spec peers into expecting SO/SI we won't send.
+        let caps = Capabilities {
+            attribute_packets: true,
+            locking_shifts: false,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_eq!(capas & CAPAS_LOCKING_SHIFT, 0, "LOCKING_SHIFT bit must be clear");
+    }
+
+    #[test]
+    fn test_send_init_locking_shifts_round_trips_through_parse() {
+        let caps = Capabilities {
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        assert!(parse_send_init_payload(&payload).locking_shifts);
+
+        let caps = Capabilities {
+            locking_shifts: false,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        assert!(!parse_send_init_payload(&payload).locking_shifts);
+    }
+
+    #[test]
+    fn test_intersect_locking_shifts_wins_over_qbin_when_both_advertise() {
+        // Spec precedence (Frank da Cruz §3.4): when both peers
+        // advertise CAPAS_LOCKING_SHIFT *and* either side wants 8-bit
+        // transmission, locking shifts replace QBIN entirely.
+        let ours = Capabilities {
+            qbin: Some(b'&'),
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let theirs = Capabilities {
+            qbin: None, // peer is willing but doesn't insist
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let session = intersect_capabilities(&ours, &theirs);
+        assert!(session.locking_shifts, "both advertise + 8-bit needed → locking_shifts on");
+        assert_eq!(
+            session.qbin, None,
+            "QBIN must be off when locking_shifts is on (spec precedence)"
+        );
+    }
+
+    #[test]
+    fn test_intersect_locking_shifts_off_when_only_one_side_advertises() {
+        // Asymmetric advertisement: fall back to QBIN per existing
+        // 8-bit logic.  Otherwise an opt-out peer would see SO/SI it
+        // can't decode.
+        let ours = Capabilities {
+            qbin: Some(b'&'),
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let theirs = Capabilities {
+            qbin: Some(b'&'),
+            locking_shifts: false,
+            ..Capabilities::default()
+        };
+        let session = intersect_capabilities(&ours, &theirs);
+        assert!(!session.locking_shifts);
+        assert_eq!(session.qbin, Some(b'&'), "fall back to QBIN");
+    }
+
+    #[test]
+    fn test_intersect_locking_shifts_off_when_neither_needs_eight_bit() {
+        // Both advertise the capability but neither asserts QBIN
+        // (both 8-bit-clean): there's nothing to convey, so neither
+        // mechanism activates.
+        let both = Capabilities {
+            qbin: None,
+            locking_shifts: true,
+            ..Capabilities::default()
+        };
+        let session = intersect_capabilities(&both, &both);
+        assert!(!session.locking_shifts);
+        assert_eq!(session.qbin, None);
     }
 
     #[test]
@@ -5437,6 +7831,107 @@ mod tests {
         eprintln!("kermit interop flavor: {}", f);
     }
 
+    /// Server-mode interop: spawn C-Kermit as a CLIENT doing `get
+    /// filename` against our `kermit_server`.  Verifies the server
+    /// dispatcher correctly handles the R-packet and hands off to
+    /// the sender state machine, and that ckermit saved the bytes
+    /// it received.  `#[ignore]` because it requires `kermit`
+    /// (ckermit) installed; run with:
+    /// `cargo test test_ckermit_server_get -- --ignored`
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_ckermit_server_get_interop() {
+        use std::process::Stdio;
+        use tokio::net::TcpListener;
+        use tokio::process::Command;
+
+        if Command::new("kermit")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("ckermit not on PATH; skipping interop test");
+            return;
+        }
+
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        // Stage a file in transfer_dir for ckermit to GET.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("kermit_server_interop_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i * 17) as u8).collect();
+        std::fs::write(dir.join("interop.bin"), &payload).unwrap();
+        // Where ckermit will save what it pulls from us.
+        let local_save = dir.join("local_save.bin");
+
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // -B: batch / no controlling terminal.
+        // -j host:port: open TCP connection (telnet protocol).
+        // -i: image (binary) transfer.
+        // -g name: GET name from the server.
+        // -a localname: save received file as localname.
+        // -q: quiet.
+        let mut child = Command::new("kermit")
+            .arg("-B")
+            .arg("-j")
+            .arg(format!("127.0.0.1:{}", port))
+            .arg("-i")
+            .arg("-q")
+            .arg("-g")
+            .arg("interop.bin")
+            .arg("-a")
+            .arg(&local_save)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ckermit");
+
+        let (sock, _) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            listener.accept(),
+        )
+        .await
+        .expect("ckermit didn't connect within 30s")
+        .expect("accept");
+        let (mut r, mut w) = tokio::io::split(sock);
+
+        // is_tcp=true so the IAC/CR-NUL layer is active for the
+        // telnet-mode connection ckermit -j establishes.
+        let server_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            kermit_server(&mut r, &mut w, true, false, true),
+        )
+        .await
+        .expect("kermit_server timed out");
+
+        let _ = child.wait().await;
+
+        // Reset state for unrelated tests, then verify what ckermit
+        // saved.  If anything in the dispatch loop / R handler /
+        // kermit_send_with_starting_seq path is wrong we'll either
+        // fail to find local_save or its bytes will diverge.
+        config::update_config_value("transfer_dir", "transfer");
+        let downloaded = std::fs::read(&local_save)
+            .expect("ckermit should have saved the pulled file");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        server_result.expect("kermit_server returned an error");
+        assert_eq!(downloaded, payload, "downloaded content must equal staged file");
+    }
+
     // ---------- Proptest fuzzers (panic-only assertions) ----------
 
     proptest::proptest! {
@@ -5463,8 +7958,8 @@ mod tests {
         fn proptest_decode_data_no_panic(
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
-            let q1 = Quoting { qctl: b'#', qbin: None, rept: None };
-            let q2 = Quoting { qctl: b'#', qbin: Some(b'&'), rept: Some(b'~') };
+            let q1 = Quoting { qctl: b'#', qbin: None, rept: None, locking_shifts: false };
+            let q2 = Quoting { qctl: b'#', qbin: Some(b'&'), rept: Some(b'~'), locking_shifts: false };
             let _ = decode_data(&data, q1);
             let _ = decode_data(&data, q2);
         }
