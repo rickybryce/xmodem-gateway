@@ -968,8 +968,16 @@ pub(crate) fn build_send_init_payload(c: &Capabilities) -> Vec<u8> {
         p.push(tochar(CAPAS_STREAMING_BYTE3_BIT));
     }
 
-    // Slot 11+: WINDO, MAXLX1, MAXLX2 — present when sliding or long is on.
-    if c.window > 1 || c.long_packets {
+    // Slot 11+: optional extended fields, each gated on its own
+    // CAPAS bit per spec §4.4 ("Send-Init"):
+    //   WINDO is present iff the sliding-window bit is set
+    //         (i.e., advertised window > 1).
+    //   MAXLX1, MAXLX2 are present iff the long-packets bit is set.
+    // Emitting either field unconditionally misaligns a strict-spec
+    // peer's parser — e.g., advertising long-packets without sliding
+    // and emitting a stray WINDO=1 would be misread as MAXLX1=1,
+    // collapsing the negotiated MAXL to ~138 bytes.
+    if c.window > 1 {
         p.push(tochar(c.window.min(MAX_WINDOW_SIZE)));
     }
     if c.long_packets {
@@ -1047,13 +1055,19 @@ pub(crate) fn parse_send_init_payload(data: &[u8]) -> Capabilities {
             break;
         }
     }
+    let advertises_sliding = capas_bytes
+        .first()
+        .map(|&first| first & CAPAS_SLIDING != 0)
+        .unwrap_or(false);
+    let advertises_long = capas_bytes
+        .first()
+        .map(|&first| first & CAPAS_LONGPKT != 0)
+        .unwrap_or(false);
     if let Some(&first) = capas_bytes.first() {
-        c.long_packets = first & CAPAS_LONGPKT != 0;
+        c.long_packets = advertises_long;
         c.attribute_packets = first & CAPAS_ATTRIBUTE != 0;
-        let advertises_sliding = first & CAPAS_SLIDING != 0;
-        // Sliding window: peer needs to set the bit AND we need to find
-        // a WINDO field after the chain.  We default to 1 (stop-and-wait)
-        // until WINDO arrives.
+        // Sliding-window default: stop-and-wait until peer's CAPAS
+        // bit AND the WINDO field below tell us otherwise.
         if !advertises_sliding {
             c.window = 1;
         }
@@ -1061,13 +1075,16 @@ pub(crate) fn parse_send_init_payload(data: &[u8]) -> Capabilities {
     if let Some(&third) = capas_bytes.get(2) {
         c.streaming = third & CAPAS_STREAMING_BYTE3_BIT != 0;
     }
-    // WINDO
-    if data.len() > idx {
+    // WINDO is present iff sliding bit is set in CAPAS byte 1
+    // (spec §4.4).  Reading it unconditionally would consume a byte
+    // that's actually the next field (MAXLX1 if long was advertised,
+    // or trailing CAPAS-extension bytes) and misalign the parse.
+    if advertises_sliding && data.len() > idx {
         c.window = unchar(data[idx]).clamp(1, MAX_WINDOW_SIZE);
         idx += 1;
     }
-    // MAXLX1, MAXLX2
-    if data.len() > idx + 1 {
+    // MAXLX1, MAXLX2 are present iff the long-packets bit is set.
+    if advertises_long && data.len() > idx + 1 {
         let mx1 = unchar(data[idx]) as u16;
         let mx2 = unchar(data[idx + 1]) as u16;
         let extended = mx1 * 95 + mx2;
@@ -4811,6 +4828,130 @@ mod tests {
             ..Capabilities::default()
         };
         assert_eq!(detect_flavor(&c), KermitFlavor::CKermit);
+    }
+
+    // ---------- WINDO/MAXLX conditional emission (spec §4.4) ----------
+    //
+    // WINDO is present in Send-Init iff the sliding-window bit is
+    // set in CAPAS byte 1; MAXLX1/MAXLX2 are present iff the
+    // long-packets bit is set.  Each combination is verified
+    // separately against build/parse round-trip.
+
+    #[test]
+    fn test_send_init_no_windo_when_sliding_off() {
+        // long_packets on, sliding off → MAXLX present, WINDO absent.
+        let caps = Capabilities {
+            maxl: 4096,
+            window: 1, // sliding off
+            long_packets: true,
+            attribute_packets: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        // No streaming → CAPAS chain is one byte at slot 9 (idx 9).
+        // After QCTL/QBIN/CHKT/REPT slots the layout is:
+        //   slots 0..=8 (9 bytes), CAPAS at idx 9, then optional
+        //   fields.  Long-only means slots 10-11 are MAXLX1/MAXLX2.
+        let capas = unchar(payload[9]);
+        assert_eq!(capas & CAPAS_SLIDING, 0, "sliding bit should NOT be set");
+        assert_ne!(capas & CAPAS_LONGPKT, 0, "long bit should be set");
+        // Parse round-trip recovers maxl=4096, window=1.
+        let parsed = parse_send_init_payload(&payload);
+        assert_eq!(parsed.maxl, 4096);
+        assert_eq!(parsed.window, 1);
+        assert!(parsed.long_packets);
+    }
+
+    #[test]
+    fn test_send_init_no_maxlx_when_long_off() {
+        // sliding on, long off → WINDO present, MAXLX absent.
+        let caps = Capabilities {
+            maxl: 80, // classic-only
+            window: 8,
+            long_packets: false,
+            attribute_packets: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_ne!(capas & CAPAS_SLIDING, 0, "sliding bit should be set");
+        assert_eq!(capas & CAPAS_LONGPKT, 0, "long bit should NOT be set");
+        let parsed = parse_send_init_payload(&payload);
+        assert_eq!(parsed.window, 8);
+        assert!(!parsed.long_packets);
+        assert_eq!(parsed.maxl, 80, "maxl should match the slot-1 value");
+    }
+
+    #[test]
+    fn test_send_init_neither_windo_nor_maxlx_when_both_off() {
+        // sliding off, long off → CAPAS chain ends; no WINDO, no MAXLX.
+        let caps = Capabilities {
+            maxl: 80,
+            window: 1,
+            long_packets: false,
+            attribute_packets: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        // Without any optional extensions, the payload should end at
+        // CAPAS byte 1 (offset 9) — no WINDO, no MAXLX1/2.
+        assert_eq!(payload.len(), 10);
+        let parsed = parse_send_init_payload(&payload);
+        assert_eq!(parsed.window, 1);
+        assert!(!parsed.long_packets);
+        assert_eq!(parsed.maxl, 80);
+    }
+
+    #[test]
+    fn test_send_init_both_windo_and_maxlx_when_both_on() {
+        let caps = Capabilities {
+            maxl: 4096,
+            window: 16,
+            long_packets: true,
+            attribute_packets: true,
+            ..Capabilities::default()
+        };
+        let payload = build_send_init_payload(&caps);
+        let capas = unchar(payload[9]);
+        assert_ne!(capas & CAPAS_SLIDING, 0);
+        assert_ne!(capas & CAPAS_LONGPKT, 0);
+        let parsed = parse_send_init_payload(&payload);
+        assert_eq!(parsed.window, 16);
+        assert!(parsed.long_packets);
+        assert_eq!(parsed.maxl, 4096);
+    }
+
+    #[test]
+    fn test_parse_send_init_long_only_no_windo_byte() {
+        // Hand-craft a Send-Init payload that simulates a strict-spec
+        // peer advertising long-packets only (no sliding): CAPAS=long,
+        // followed directly by MAXLX1/MAXLX2.  Verify our parser
+        // doesn't treat MAXLX1 as WINDO.
+        let mut payload: Vec<u8> = vec![
+            tochar(94),               // MAXL = 94 (classic)
+            tochar(15),               // TIME = 15
+            tochar(0),                // NPAD
+            ctl(0),                   // PADC
+            tochar(0x0D),             // EOL = CR
+            b'#',                     // QCTL
+            b'Y',                     // QBIN = willing
+            b'3',                     // CHKT = 3
+            b'~',                     // REPT
+            tochar(CAPAS_LONGPKT),    // CAPAS byte 1 — long only, no continue
+            tochar(43),               // MAXLX1 = 43
+            tochar(11),               // MAXLX2 = 11
+        ];
+        // Add a trailing letter run so the peer_id heuristic doesn't trigger.
+        payload.extend_from_slice(b"");
+        let parsed = parse_send_init_payload(&payload);
+        // Without the conditional fix, our parser would have read
+        // tochar(43)='K' as WINDO=43, then tried to read MAXLX1/2
+        // from beyond the buffer, leaving maxl at the slot-1 value
+        // of 94 (or 138 from misaligned MAXLX bytes).  The spec-
+        // compliant parse recovers maxl = 43*95 + 11 = 4096.
+        assert!(parsed.long_packets);
+        assert_eq!(parsed.window, 1, "no sliding advertised → window 1");
+        assert_eq!(parsed.maxl, 4096);
     }
 
     #[test]
