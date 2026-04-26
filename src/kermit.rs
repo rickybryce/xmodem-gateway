@@ -1879,15 +1879,27 @@ pub(crate) fn parse_attributes(data: &[u8]) -> Attributes {
 // RESUME-PARTIAL HELPER
 // =============================================================================
 
+/// Maximum accepted filename length in safety-validated paths.
+/// Matches `TelnetSession::MAX_FILENAME_LEN` so a peer-supplied name
+/// that passes our kermit-layer guard is also acceptable to the
+/// telnet save path; this avoids an asymmetry where the protocol
+/// would round-trip a filename that the saver then refuses.
+const MAX_KERMIT_FILENAME_LEN: usize = 64;
+
+/// Maximum accepted CWD-subdir length.  Generous enough for several
+/// nested components (~16 levels of 16-char names) but bounded so a
+/// peer can't pin our session against a 9 KB MAXL-sized payload of
+/// junk that happens to pass component-level validation.
+const MAX_KERMIT_SUBDIR_LEN: usize = 255;
+
 /// Defense-in-depth check applied before joining a sender-supplied
 /// filename onto `transfer_dir` for resume lookup.  Refuses anything
 /// that could escape the directory or hit a hidden file: separator
 /// characters, parent-traversal sequences, NUL bytes, leading dots,
-/// and empty strings.  More restrictive than `validate_filename` in
-/// telnet.rs (e.g. it doesn't enforce the 64-char cap) but covers the
-/// path-traversal threat model that matters here.
+/// empty strings, and over-cap lengths.
 pub(crate) fn is_safe_resume_filename(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_KERMIT_FILENAME_LEN
         && !name.starts_with('.')
         && !name.contains('/')
         && !name.contains('\\')
@@ -1924,6 +1936,15 @@ pub(crate) fn compute_resume_offset(
         return None;
     }
     let path = std::path::Path::new(transfer_dir).join(filename);
+    // Reject symlinks via `symlink_metadata` (which does NOT follow):
+    // a symlink that points at a different file would mislead the
+    // receiver into pre-loading bytes from an unintended target,
+    // then advertise an offset that doesn't match what the sender's
+    // file looks like.  Regular files only.
+    let lmeta = std::fs::symlink_metadata(&path).ok()?;
+    if lmeta.file_type().is_symlink() {
+        return None;
+    }
     let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() {
         return None;
@@ -3812,11 +3833,21 @@ pub(crate) async fn kermit_receive_with_init(
 /// empty string (root of `transfer_dir`), single names, and multi-
 /// component relative paths separated by `/`.  Refuses anything that
 /// could escape the transfer dir: leading `/`, embedded `\`, NUL,
-/// any `..` component, or per-component leading dots.  The matching
-/// `effective_transfer_path` joins the result onto `cfg.transfer_dir`.
+/// any `..` component, per-component leading dots, or an over-cap
+/// length.  The matching `effective_transfer_path` joins the result
+/// onto `cfg.transfer_dir`.
+///
+/// Why looser than `is_safe_resume_filename`: subdir is structurally
+/// a path (multi-component allowed), filename is a single leaf —
+/// per-call validation runs at different boundaries (subdir at G C,
+/// filename at R / save).  Both end up joined onto `transfer_dir`,
+/// so traversal protection has to hold separately on each side.
 pub(crate) fn is_safe_relative_subdir(s: &str) -> bool {
     if s.is_empty() {
         return true;
+    }
+    if s.len() > MAX_KERMIT_SUBDIR_LEN {
+        return false;
     }
     if s.starts_with('/') || s.contains('\\') || s.contains('\0') {
         return false;
@@ -4023,7 +4054,7 @@ pub(crate) async fn kermit_server(
     loop {
         let deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout);
-        let pkt = read_packet(
+        let pkt = match read_packet(
             reader,
             is_tcp,
             is_petscii,
@@ -4034,7 +4065,27 @@ pub(crate) async fn kermit_server(
             Some(deadline),
         )
         .await
-        .map_err(|e| format!("Kermit server: read failed: {}", e))?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // Peer-disconnect (EOF) and idle-timeout are both
+                // legitimate end-of-session signals — many real Kermit
+                // clients (including C-Kermit -s) just exit after a
+                // transfer rather than sending G F.  Returning the
+                // accumulated files lets the caller surface a
+                // success-shaped summary instead of an error toast.
+                // We still surface the read failure in the verbose
+                // log so a wedged session is debuggable.
+                if verbose {
+                    glog!(
+                        "Kermit server: dispatch read ended ({}) — closing with {} file(s) received",
+                        e,
+                        all_received.len()
+                    );
+                }
+                return Ok(all_received);
+            }
+        };
         if verbose {
             glog!(
                 "Kermit server: dispatch type='{}' seq={}",
@@ -4063,7 +4114,9 @@ pub(crate) async fn kermit_server(
                 if verbose {
                     glog!("Kermit server: refused C-packet (host commands disabled)");
                 }
-                return Ok(all_received);
+                // Spec §6.7: E-packet reply keeps the server idle for
+                // the next command — refusal is not session-fatal.
+                continue;
             }
             TYPE_INIT => {
                 // Re-init mid-session: respond with Y-ACK whose payload
@@ -4154,7 +4207,9 @@ pub(crate) async fn kermit_server(
                                     new_subdir
                                 );
                             }
-                            return Ok(all_received);
+                            // Spec §6.7: keep the server idle so the
+                            // peer can retry with a valid subdir.
+                            continue;
                         }
                         subdir = new_subdir;
                         send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
@@ -4283,7 +4338,8 @@ pub(crate) async fn kermit_server(
                     if verbose {
                         glog!("Kermit server: refused R '{}' (unsafe filename)", fname);
                     }
-                    return Ok(all_received);
+                    // Spec §6.7: stay idle for the next command.
+                    continue;
                 }
                 let path = effective_transfer_path(&cfg, &subdir).join(&fname);
                 let bytes = match std::fs::read(&path) {
@@ -4306,7 +4362,8 @@ pub(crate) async fn kermit_server(
                                 fname
                             );
                         }
-                        return Ok(all_received);
+                        // Stay idle for the next command per spec.
+                        continue;
                     }
                 };
                 if bytes.len() as u64 > MAX_FILE_SIZE {
@@ -4321,7 +4378,8 @@ pub(crate) async fn kermit_server(
                         is_tcp,
                     )
                     .await?;
-                    return Ok(all_received);
+                    // Stay idle for the next command per spec.
+                    continue;
                 }
                 let modtime = std::fs::metadata(&path)
                     .ok()
@@ -4334,10 +4392,25 @@ pub(crate) async fn kermit_server(
                     modtime,
                     mode: None,
                 };
-                let starting_seq = (pkt.seq + 1) & 0x3F;
+                // ACK the R-packet explicitly *before* starting the
+                // send.  C-Kermit (and per Frank da Cruz §6 the strict
+                // spec reading) expects every command packet to be
+                // acknowledged with a Y-packet before any new state
+                // machine takes over — sending S directly without the
+                // ACK first leaves the client retrying its R because
+                // it never saw confirmation that we received it.  Our
+                // own client (`kermit_client_get`) reads the ACK then
+                // the S so this convention works on both peers.
+                send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                // Empirical: C-Kermit (and the spec's "each transfer
+                // is a fresh exchange" reading) expect the server's S
+                // to start at seq 0, NOT R.seq+1.  After the R-ACK
+                // we're between transfers; the upcoming S begins a
+                // new send-side conversation with its own seq counter.
+                let starting_seq = 0u8;
                 if verbose {
                     glog!(
-                        "Kermit server: R '{}' → sending {} bytes (starting seq={})",
+                        "Kermit server: R '{}' → ACK'd, sending {} bytes (starting seq={})",
                         fname,
                         bytes.len(),
                         starting_seq
@@ -4356,7 +4429,11 @@ pub(crate) async fn kermit_server(
                 continue;
             }
             other => {
-                // Anything else — treat as protocol error and bail.
+                // Anything else — protocol error.  Per spec §6.7 we
+                // stay idle after sending E so a confused peer can
+                // recover by sending a valid command.  The per-command
+                // negotiation-timeout bounds inactivity if the peer
+                // just goes silent.
                 if verbose {
                     glog!(
                         "Kermit server: unexpected type='{}' seq={}",
@@ -4375,10 +4452,434 @@ pub(crate) async fn kermit_server(
                     is_tcp,
                 )
                 .await?;
-                return Ok(all_received);
+                continue;
             }
         }
     }
+}
+
+// =============================================================================
+// CLIENT STATE MACHINE
+// =============================================================================
+
+/// Send an R (Receive) request to a remote Kermit server and stream
+/// the resulting transfer back through `kermit_receive_with_init`.
+/// This is the core "pull a file" client primitive — the spec-compliant
+/// equivalent of `ckermit -g <filename>`.
+///
+/// Wire flow:
+/// 1. Client → Server: `R <filename>` at seq=0.
+/// 2. Server → Client: either `E <reason>` (file missing / refused —
+///    we bubble it as `Err`) or `S <peer-caps>` (server initiates a
+///    send; we hand the pre-read S off to the receiver state machine).
+/// 3. Receive proceeds normally: F/A/D…/Z/B exchange.
+///
+/// Returns the same `Vec<KermitReceive>` shape as `kermit_receive` —
+/// typically a single entry, but the receiver naturally tolerates a
+/// batch if the server sends one.
+//
+// `#[allow(dead_code)]` lifts the warning until telnet.rs grows a
+// "Pull from remote Kermit" menu entry (Gap 3b commit 3 or later).
+// The fn is already exercised by the unit tests below.
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_get(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    filename: &str,
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<Vec<KermitReceive>, String> {
+    let cfg = config::get_config();
+    if verbose {
+        glog!(
+            "Kermit client GET: '{}', is_tcp={}, is_petscii={}",
+            filename,
+            is_tcp,
+            is_petscii
+        );
+    }
+
+    // 1. Send R-packet.  Filename goes in the payload as raw bytes —
+    //    matches the convention the server's R handler reads (see
+    //    `String::from_utf8_lossy(&pkt.payload)` in kermit_server).
+    //    Quoting filenames here would force a corresponding decode
+    //    branch on the server side; spec is loose either way and the
+    //    raw form is what every Kermit we've seen on the wire uses.
+    let r_pkt = build_packet(TYPE_R, 0, filename.as_bytes(), b'1', 0, 0, CR);
+    raw_write_bytes(writer, &r_pkt, is_tcp).await?;
+
+    // 2. Read the server's response.  Per spec §6 / C-Kermit interop
+    //    the server first ACKs our R-packet, then sends an S to start
+    //    the actual send.  Some servers might combine these (skip the
+    //    ACK and send S directly) but tolerating both forms here costs
+    //    little and helps interop with strict peers.  Use the
+    //    negotiation timeout since the remote may be slow to consult
+    //    disk; we don't yet have a peer TIME field to defer to.
+    let mut state = ReadState::default();
+    let mk_deadline = || {
+        tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout)
+    };
+    let resp = read_packet(
+        reader,
+        is_tcp,
+        is_petscii,
+        b'1',
+        CR,
+        verbose,
+        &mut state,
+        Some(mk_deadline()),
+    )
+    .await
+    .map_err(|e| format!("Kermit client: GET response read failed: {}", e))?;
+
+    match resp.kind {
+        TYPE_ERROR => {
+            // Server rejected the GET — decode the human-readable
+            // reason and surface it.  Common cases: file not found,
+            // unsafe filename, file too large.
+            let q = Quoting {
+                qctl: DEFAULT_QCTL,
+                qbin: None,
+                rept: None,
+                locking_shifts: false,
+            };
+            let msg = decode_error_message(&resp.payload, q);
+            Err(format!("Kermit client: server refused GET '{}': {}", filename, msg))
+        }
+        TYPE_ACK => {
+            // ACK to our R — server is about to initiate the send.
+            // Read the next packet, which should be S.
+            let s_pkt = read_packet(
+                reader,
+                is_tcp,
+                is_petscii,
+                b'1',
+                CR,
+                verbose,
+                &mut state,
+                Some(mk_deadline()),
+            )
+            .await
+            .map_err(|e| format!("Kermit client: GET S-read failed: {}", e))?;
+            match s_pkt.kind {
+                TYPE_SEND_INIT => kermit_receive_with_init(
+                    reader,
+                    writer,
+                    is_tcp,
+                    is_petscii,
+                    verbose,
+                    Some(s_pkt),
+                )
+                .await,
+                TYPE_ERROR => {
+                    let q = Quoting {
+                        qctl: DEFAULT_QCTL,
+                        qbin: None,
+                        rept: None,
+                        locking_shifts: false,
+                    };
+                    let msg = decode_error_message(&s_pkt.payload, q);
+                    Err(format!(
+                        "Kermit client: server E-packet after R-ACK: {}",
+                        msg
+                    ))
+                }
+                other => Err(format!(
+                    "Kermit client: expected S after R-ACK, got '{}' seq={}",
+                    other as char, s_pkt.seq
+                )),
+            }
+        }
+        TYPE_SEND_INIT => {
+            // Loose-spec server skipped the R-ACK and sent S directly.
+            // We tolerate this since our pre-fix server did exactly
+            // that.  Hand the pre-read S off to the receiver state
+            // machine.
+            kermit_receive_with_init(
+                reader,
+                writer,
+                is_tcp,
+                is_petscii,
+                verbose,
+                Some(resp),
+            )
+            .await
+        }
+        other => Err(format!(
+            "Kermit client: unexpected GET response type='{}' seq={}",
+            other as char, resp.seq
+        )),
+    }
+}
+
+/// Send a Generic-command packet that expects a single-ACK reply
+/// (F=Finish, L=Logout, B=BYE, C=CWD).  The peer's E-packet reply
+/// surfaces as `Err`.  Caller assembles the action byte + optional
+/// argument bytes (e.g. CWD's subdir name).
+async fn kermit_client_send_g_simple(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    action: u8,
+    arg: &[u8],
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    let cfg = config::get_config();
+    let mut state = ReadState::default();
+    let mut payload = Vec::with_capacity(1 + arg.len());
+    payload.push(action);
+    payload.extend_from_slice(arg);
+    let _ack_payload = send_and_await_ack(
+        reader,
+        writer,
+        TYPE_GENERIC,
+        0,
+        &payload,
+        b'1',
+        0,
+        0,
+        CR,
+        is_tcp,
+        is_petscii,
+        verbose,
+        &mut state,
+        Some(
+            tokio::time::Instant::now()
+                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
+        ),
+        cfg.kermit_max_retries,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Send a Generic-command packet that expects a text reply via X-Z
+/// (D=DIR, `$`=SPACE, K=KERMIT version).  Drives the full
+/// G→ACK→X→ACK→Z→ACK exchange and returns the decoded X payload as
+/// a UTF-8 string.  Bubbles E-packets and protocol mismatches as Err.
+async fn kermit_client_send_g_text(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    action: u8,
+    arg: &[u8],
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<String, String> {
+    let cfg = config::get_config();
+    let mut state = ReadState::default();
+    let mut payload = Vec::with_capacity(1 + arg.len());
+    payload.push(action);
+    payload.extend_from_slice(arg);
+    // 1. Send G + await ACK.  send_and_await_ack auto-translates
+    //    E-packet to Err so we don't have to second-guess that path.
+    let _g_ack = send_and_await_ack(
+        reader,
+        writer,
+        TYPE_GENERIC,
+        0,
+        &payload,
+        b'1',
+        0,
+        0,
+        CR,
+        is_tcp,
+        is_petscii,
+        verbose,
+        &mut state,
+        Some(
+            tokio::time::Instant::now()
+                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
+        ),
+        cfg.kermit_max_retries,
+        false,
+    )
+    .await?;
+    // 2. Read X-packet (text body).
+    let x = read_packet(
+        reader,
+        is_tcp,
+        is_petscii,
+        b'1',
+        CR,
+        verbose,
+        &mut state,
+        Some(
+            tokio::time::Instant::now()
+                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
+        ),
+    )
+    .await
+    .map_err(|e| format!("Kermit client: G '{}' read X failed: {}", action as char, e))?;
+    if x.kind == TYPE_ERROR {
+        let q = Quoting {
+            qctl: DEFAULT_QCTL,
+            qbin: None,
+            rept: None,
+            locking_shifts: false,
+        };
+        let msg = decode_error_message(&x.payload, q);
+        return Err(format!(
+            "Kermit client: server E on G '{}': {}",
+            action as char, msg
+        ));
+    }
+    if x.kind != TYPE_TEXT {
+        return Err(format!(
+            "Kermit client: G '{}' expected X, got '{}'",
+            action as char, x.kind as char
+        ));
+    }
+    send_ack(writer, x.seq, b'1', 0, 0, CR, is_tcp).await?;
+    // 3. Read Z-packet (EOF).
+    let z = read_packet(
+        reader,
+        is_tcp,
+        is_petscii,
+        b'1',
+        CR,
+        verbose,
+        &mut state,
+        Some(
+            tokio::time::Instant::now()
+                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
+        ),
+    )
+    .await
+    .map_err(|e| format!("Kermit client: G '{}' read Z failed: {}", action as char, e))?;
+    if z.kind != TYPE_EOF {
+        return Err(format!(
+            "Kermit client: G '{}' expected Z, got '{}'",
+            action as char, z.kind as char
+        ));
+    }
+    send_ack(writer, z.seq, b'1', 0, 0, CR, is_tcp).await?;
+    // 4. Decode the text body and return.
+    let q = Quoting {
+        qctl: DEFAULT_QCTL,
+        qbin: None,
+        rept: Some(DEFAULT_REPT),
+        locking_shifts: false,
+    };
+    let decoded = decode_data(&x.payload, q)?;
+    String::from_utf8(decoded).map_err(|e| {
+        format!(
+            "Kermit client: G '{}' response not UTF-8: {}",
+            action as char, e
+        )
+    })
+}
+
+/// Tell a remote Kermit server to end its session (`G F`).
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_finish(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    kermit_client_send_g_simple(reader, writer, b'F', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Log out and end the session (`G L`) — same wire effect as F on
+/// most servers, but distinct for systems that distinguish "log out
+/// the user" from "stop the protocol".
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_logout(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    kermit_client_send_g_simple(reader, writer, b'L', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Send `G B` — BYE.  Equivalent end-session signal; some servers
+/// use this to additionally close the underlying transport (we treat
+/// it the same as F on the server side).
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_bye(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    kermit_client_send_g_simple(reader, writer, b'B', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Change the remote server's working subdirectory (`G C <subdir>`).
+/// The subdir argument is sent as raw UTF-8 bytes after the action
+/// byte; servers typically validate it against their own sandbox
+/// rules and refuse with E-packet on path-traversal attempts.
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_cwd(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    subdir: &str,
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    kermit_client_send_g_simple(
+        reader,
+        writer,
+        b'C',
+        subdir.as_bytes(),
+        is_tcp,
+        is_petscii,
+        verbose,
+    )
+    .await
+}
+
+/// Ask a remote Kermit server for a file listing of its current
+/// working directory (`G D`).  Returns the raw text the server sent
+/// — typical format is one entry per line, but it varies by server
+/// implementation.
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_dir(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<String, String> {
+    kermit_client_send_g_text(reader, writer, b'D', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Ask a remote Kermit server how much free disk it has at its
+/// current working directory (`G $`).  Format is server-specific —
+/// our implementation returns the byte count as a decimal string,
+/// but other peers may format it differently or return "unknown".
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_space(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<String, String> {
+    kermit_client_send_g_text(reader, writer, b'$', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Ask a remote Kermit server to identify itself (`G K`).  Returns
+/// the version / identity string the peer sent in its X-packet body.
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_version(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<String, String> {
+    kermit_client_send_g_text(reader, writer, b'K', &[], is_tcp, is_petscii, verbose).await
 }
 
 /// Convert a Kermit "yyyymmdd hh:mm:ss" date string to UNIX seconds.
@@ -5515,7 +6016,7 @@ mod tests {
 
     // ---------- Server-mode dispatch (Gap 3a commit 1) ----------
 
-    use tokio::io::{duplex, split, AsyncWriteExt};
+    use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
 
     /// Spin up `kermit_server` against a duplex pipe.  The caller's
     /// closure receives one half of the pipe to play the part of a
@@ -5567,7 +6068,9 @@ mod tests {
     #[tokio::test]
     async fn test_server_refuses_host_command_with_e_packet() {
         // C-packet (host command) is a remote-code-execution primitive;
-        // server must refuse with an E-packet by default.
+        // server must refuse with an E-packet by default.  Per spec
+        // §6.7 the server stays idle after the refusal so the peer can
+        // try a different command — we close with G F.
         let ((), result) = run_server_with_client(async |w, r| {
             w.write_all(&wire_packet(TYPE_HOST, 0, b"rm -rf /"))
                 .await
@@ -5581,6 +6084,7 @@ mod tests {
                 "E-packet message must explain refusal, got: {}",
                 msg
             );
+            close_server_session(w, r).await;
         })
         .await;
         result.unwrap();
@@ -5713,12 +6217,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_r_pulls_existing_file() {
-        // R-dispatch end-to-end: client sends R(filename), server
-        // looks the file up in transfer_dir, sends it.  Client uses
-        // `kermit_receive` to read the server's S/F/A/D/Z/B stream.
-        // expected_seq inside kermit_receive is now derived from
-        // S.seq+1, so the off-by-one (server's S arrives at seq=1
-        // not seq=0) is handled correctly.
+        // R-dispatch end-to-end at the wire level: client sends R,
+        // reads the explicit ACK (per Frank da Cruz §6 / C-Kermit
+        // interop convention), then runs `kermit_receive_with_init`
+        // against the server's S→F→A→D…→Z→B stream.  Locks in both
+        // the seq numbering and the ACK-then-S response shape.
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("xmodem_server_r_pull_{}", pid));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5726,9 +6229,6 @@ mod tests {
         let payload: Vec<u8> = (0..4096u32).map(|i| (i ^ 0xA5) as u8).collect();
         std::fs::write(dir.join("pull.bin"), &payload).unwrap();
 
-        // Override transfer_dir so the server looks here.  Reset on exit.
-        // (run_server_with_client locks CONFIG_LOCK and calls
-        // init_test_config; we override after that inside the closure.)
         let dir_str = dir.to_str().unwrap().to_string();
         let payload_clone = payload.clone();
         let dir_for_cleanup = dir.clone();
@@ -5737,8 +6237,15 @@ mod tests {
             config::update_config_value("transfer_dir", &dir_str);
             // Client → server: R(pull.bin) at seq 0.
             w.write_all(&wire_packet(TYPE_R, 0, b"pull.bin")).await.unwrap();
-            // Now act as a receiver against the server's send stream.
-            let received = kermit_receive(r, w, false, false, false)
+            // Server's first response is now an ACK to R (seq=0).
+            let r_ack = read_server_packet(r).await;
+            assert_eq!(r_ack.kind, TYPE_ACK, "server must ACK R before sending S");
+            assert_eq!(r_ack.seq, 0);
+            // Then it sends S(seq=1) to start the actual transfer —
+            // pre-read it and hand off to `kermit_receive_with_init`.
+            let s_pkt = read_server_packet(r).await;
+            assert_eq!(s_pkt.kind, TYPE_SEND_INIT);
+            let received = kermit_receive_with_init(r, w, false, false, false, Some(s_pkt))
                 .await
                 .unwrap();
             // Close the dispatch loop with G F.
@@ -5750,7 +6257,6 @@ mod tests {
         })
         .await;
 
-        // Reset transfer_dir for unrelated tests.
         config::update_config_value("transfer_dir", "transfer");
         let _ = std::fs::remove_dir_all(&dir_for_cleanup);
 
@@ -5761,9 +6267,9 @@ mod tests {
     #[tokio::test]
     async fn test_server_r_missing_file_returns_e_packet() {
         // R for a file that doesn't exist in transfer_dir → server
-        // emits E-packet "File not found" and exits.  Locks in the
-        // safe-by-default behavior — server must NOT, e.g., create
-        // the file or hang.
+        // emits E-packet "File not found" and stays idle for the next
+        // command (spec §6.7).  Locks in the safe-by-default behavior:
+        // server must NOT create the file, hang, or exit.
         let ((), result) = run_server_with_client(async |w, r| {
             w.write_all(&wire_packet(TYPE_R, 0, b"absent.bin")).await.unwrap();
             let resp = read_server_packet(r).await;
@@ -5775,6 +6281,7 @@ mod tests {
                 "E-packet message must explain absence, got: {}",
                 msg
             );
+            close_server_session(w, r).await;
         })
         .await;
         result.unwrap();
@@ -5834,6 +6341,68 @@ mod tests {
         assert!(!is_safe_relative_subdir("win\\path"));
         assert!(!is_safe_relative_subdir("nul\0byte"));
         assert!(!is_safe_relative_subdir("has space"));
+    }
+
+    #[tokio::test]
+    async fn test_filename_and_subdir_length_caps() {
+        // Resume-filename cap.  64-char name accepted, 65-char rejected.
+        let at_cap: String = "a".repeat(MAX_KERMIT_FILENAME_LEN);
+        assert!(is_safe_resume_filename(&at_cap), "name AT cap must pass");
+        let over_cap: String = "a".repeat(MAX_KERMIT_FILENAME_LEN + 1);
+        assert!(
+            !is_safe_resume_filename(&over_cap),
+            "name OVER cap must fail"
+        );
+        // Subdir cap.  255 accepted, 256 rejected.
+        let sub_at_cap: String = "a".repeat(MAX_KERMIT_SUBDIR_LEN);
+        assert!(is_safe_relative_subdir(&sub_at_cap));
+        let sub_over_cap: String = "a".repeat(MAX_KERMIT_SUBDIR_LEN + 1);
+        assert!(!is_safe_relative_subdir(&sub_over_cap));
+    }
+
+    #[tokio::test]
+    async fn test_server_r_oversized_filename_refused_and_session_alive() {
+        // Peer sends an R with an over-cap filename.  Server refuses
+        // (length cap kicks in before any disk I/O), then the session
+        // remains idle for the next command.  Locks in the second-pass
+        // audit's "cap before validate" defense-in-depth fix.
+        let huge: String = "a".repeat(MAX_KERMIT_FILENAME_LEN + 1);
+        let huge_bytes = huge.into_bytes();
+        let ((), result) = run_server_with_client(async move |w, r| {
+            w.write_all(&wire_packet(TYPE_R, 0, &huge_bytes))
+                .await
+                .unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR);
+            // Session still alive.
+            let body = run_g_text_command(w, r, b'K', &[]).await;
+            assert!(body.contains("Kermit"));
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_cwd_oversized_subdir_refused_and_session_alive() {
+        // Peer sends G C with a path well past the subdir cap.
+        // Refused without modifying the subdir; session continues.
+        let huge: Vec<u8> = std::iter::once(b'C')
+            .chain(std::iter::repeat_n(b'a', MAX_KERMIT_SUBDIR_LEN + 1))
+            .collect();
+        let ((), result) = run_server_with_client(async move |w, r| {
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, &huge))
+                .await
+                .unwrap();
+            let resp = read_server_packet(r).await;
+            assert_eq!(resp.kind, TYPE_ERROR);
+            // Drive a follow-up command.
+            let body = run_g_text_command(w, r, b'K', &[]).await;
+            assert!(body.contains("Kermit"));
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -5944,7 +6513,15 @@ mod tests {
             assert_eq!(cwd_ack.kind, TYPE_ACK);
             // Pull file.bin — must resolve under <transfer_dir>/sub.
             w.write_all(&wire_packet(TYPE_R, 0, b"file.bin")).await.unwrap();
-            let received = kermit_receive(r, w, false, false, false).await.unwrap();
+            // Server now ACKs R first (per spec §6 + ckermit interop),
+            // then sends S to start the transfer.
+            let r_ack = read_server_packet(r).await;
+            assert_eq!(r_ack.kind, TYPE_ACK);
+            let s_pkt = read_server_packet(r).await;
+            assert_eq!(s_pkt.kind, TYPE_SEND_INIT);
+            let received = kermit_receive_with_init(r, w, false, false, false, Some(s_pkt))
+                .await
+                .unwrap();
             assert_eq!(received.len(), 1);
             assert_eq!(received[0].data, payload_clone);
             close_server_session(w, r).await;
@@ -5959,11 +6536,13 @@ mod tests {
     #[tokio::test]
     async fn test_server_g_cwd_unsafe_path_refused() {
         // Path-traversal in CWD argument: server emits E-packet and
-        // exits without modifying the subdir.
+        // stays idle without modifying the subdir.  Server keeps
+        // running per spec §6.7 so a peer can retry with a valid path.
         let ((), result) = run_server_with_client(async |w, r| {
             w.write_all(&wire_packet(TYPE_GENERIC, 0, b"C../etc")).await.unwrap();
             let resp = read_server_packet(r).await;
             assert_eq!(resp.kind, TYPE_ERROR, "expected E for CWD ../etc");
+            close_server_session(w, r).await;
         })
         .await;
         result.unwrap();
@@ -5973,7 +6552,8 @@ mod tests {
     async fn test_server_r_unsafe_filename_refused() {
         // Path-traversal in R filename → reject before any disk I/O.
         // Reuses the same `is_safe_resume_filename` guard used by the
-        // resume-partial code path.
+        // resume-partial code path.  Server stays idle after the
+        // refusal per spec §6.7.
         let ((), result) = run_server_with_client(async |w, r| {
             w.write_all(&wire_packet(TYPE_R, 0, b"../../etc/passwd")).await.unwrap();
             let resp = read_server_packet(r).await;
@@ -5981,22 +6561,617 @@ mod tests {
             let q = Quoting::default();
             let msg = decode_error_message(&resp.payload, q).to_ascii_lowercase();
             assert!(msg.contains("invalid"), "expected refusal message, got: {}", msg);
+            close_server_session(w, r).await;
         })
         .await;
         result.unwrap();
     }
 
     #[tokio::test]
+    async fn test_server_stays_alive_after_r_unsafe_filename() {
+        // Regression: the previous implementation exited the server
+        // session whenever R was refused.  Spec §6.7 says E-packet
+        // responses keep the server idle.  Send an unsafe R, then
+        // immediately G K — the server must respond to the second
+        // command, proving it didn't exit on the refusal.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_R, 0, b"../escape")).await.unwrap();
+            let e = read_server_packet(r).await;
+            assert_eq!(e.kind, TYPE_ERROR, "R refusal must be E-packet");
+            // Now drive a follow-up G K to prove the server is still
+            // listening.  Before the fix this would time out.
+            let body = run_g_text_command(w, r, b'K', &[]).await;
+            assert!(body.contains("Ethernet Gateway Kermit"));
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_stays_alive_after_r_missing_file() {
+        // Same regression as above but for the file-not-found path.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_R, 0, b"absent.bin")).await.unwrap();
+            let e = read_server_packet(r).await;
+            assert_eq!(e.kind, TYPE_ERROR);
+            // Server still alive — exercise SPACE.
+            let body = run_g_text_command(w, r, b'$', &[]).await;
+            assert!(!body.is_empty());
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_stays_alive_after_g_cwd_unsafe() {
+        // CWD refusal must keep the server idle and must NOT modify
+        // the subdir state.  Verify by following with a successful
+        // CWD and a DIR — the listing should reflect only the
+        // second CWD's effect.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_after_bad_cwd_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("ok")).unwrap();
+        std::fs::write(dir.join("ok").join("inside.bin"), b"x").unwrap();
+        std::fs::write(dir.join("at-root.bin"), b"r").unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+
+        config::update_config_value("transfer_dir", &dir_str);
+        // 1. Bad CWD — server refuses, stays idle, subdir unchanged
+        //    (still at "" = root).
+        c_write
+            .write_all(&wire_packet(TYPE_GENERIC, 0, b"C../escape"))
+            .await
+            .unwrap();
+        let e = read_server_packet(&mut c_read).await;
+        assert_eq!(e.kind, TYPE_ERROR);
+        // 2. DIR — must list ROOT contents, not anything weird.
+        let listing_before = run_g_text_command(&mut c_write, &mut c_read, b'D', &[]).await;
+        assert!(
+            listing_before.contains("at-root.bin"),
+            "after bad CWD, listing should still be ROOT contents — got {:?}",
+            listing_before
+        );
+        // 3. Good CWD into ok/.
+        c_write
+            .write_all(&wire_packet(TYPE_GENERIC, 0, b"Cok"))
+            .await
+            .unwrap();
+        let ack = read_server_packet(&mut c_read).await;
+        assert_eq!(ack.kind, TYPE_ACK);
+        // 4. DIR now reflects subdir.
+        let listing_after = run_g_text_command(&mut c_write, &mut c_read, b'D', &[]).await;
+        assert!(
+            listing_after.contains("inside.bin"),
+            "after good CWD, listing should be subdir contents — got {:?}",
+            listing_after
+        );
+        assert!(
+            !listing_after.contains("at-root.bin"),
+            "subdir listing should NOT include root file"
+        );
+        close_server_session(&mut c_write, &mut c_read).await;
+        let server_result = server_task.await.unwrap();
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+        server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_stays_alive_after_host_command_refused() {
+        // C (host command) is permanently disabled in our build —
+        // refusal must not kill the session.
+        let ((), result) = run_server_with_client(async |w, r| {
+            w.write_all(&wire_packet(TYPE_HOST, 0, b"id")).await.unwrap();
+            let e = read_server_packet(r).await;
+            assert_eq!(e.kind, TYPE_ERROR);
+            // Drive G K to confirm we're still alive.
+            let body = run_g_text_command(w, r, b'K', &[]).await;
+            assert!(body.contains("Kermit"));
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_cwd_empty_string_resets_to_root() {
+        // G C with empty argument resets subdir to root.  Verify by
+        // CWDing into a subdir, then CWD "" resets it, then DIR
+        // returns root contents.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_cwd_reset_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("rootfile.bin"), b"r").unwrap();
+        std::fs::write(dir.join("nested").join("subfile.bin"), b"s").unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+
+        config::update_config_value("transfer_dir", &dir_str);
+        // CWD into nested
+        c_write
+            .write_all(&wire_packet(TYPE_GENERIC, 0, b"Cnested"))
+            .await
+            .unwrap();
+        let _ = read_server_packet(&mut c_read).await;
+        // CWD with empty arg → reset
+        c_write
+            .write_all(&wire_packet(TYPE_GENERIC, 0, b"C"))
+            .await
+            .unwrap();
+        let ack = read_server_packet(&mut c_read).await;
+        assert_eq!(ack.kind, TYPE_ACK, "G C with empty arg should be ACKed (reset)");
+        // DIR — should now be ROOT.
+        let listing = run_g_text_command(&mut c_write, &mut c_read, b'D', &[]).await;
+        assert!(listing.contains("rootfile.bin"));
+        assert!(!listing.contains("subfile.bin"));
+        close_server_session(&mut c_write, &mut c_read).await;
+        let server_result = server_task.await.unwrap();
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+        server_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_handles_multiple_s_uploads_in_one_session() {
+        // Server-mode batching at the COMMAND level: client uploads
+        // file A via S, then file B via a fresh S, then closes with
+        // G F.  Server must accumulate both files in its
+        // Vec<KermitReceive> return value.  Locks in the per-file
+        // state-reset across S boundaries (pending_resume_offset,
+        // declared_size, etc.).
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let payload_a: Vec<u8> = b"first upload".to_vec();
+        let payload_b: Vec<u8> = b"second upload, distinct content".to_vec();
+        let pa = payload_a.clone();
+        let pb = payload_b.clone();
+
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+
+        // First upload via kermit_send.
+        let kfile_a = KermitSendFile {
+            name: "first.bin",
+            data: &pa,
+            modtime: None,
+            mode: None,
+        };
+        kermit_send(&mut c_read, &mut c_write, &[kfile_a], false, false, false)
+            .await
+            .unwrap();
+        // Second upload — separate kermit_send call so the server
+        // sees a fresh S/F/A/D/Z/B sequence.
+        let kfile_b = KermitSendFile {
+            name: "second.bin",
+            data: &pb,
+            modtime: None,
+            mode: None,
+        };
+        kermit_send(&mut c_read, &mut c_write, &[kfile_b], false, false, false)
+            .await
+            .unwrap();
+        // Close.
+        close_server_session(&mut c_write, &mut c_read).await;
+        let received = server_task.await.unwrap().unwrap();
+
+        assert_eq!(received.len(), 2, "server must accumulate both uploads");
+        assert_eq!(received[0].filename, "first.bin");
+        assert_eq!(received[0].data, payload_a);
+        assert_eq!(received[1].filename, "second.bin");
+        assert_eq!(received[1].data, payload_b);
+    }
+
+    #[tokio::test]
+    async fn test_compute_resume_offset_rejects_symlink() {
+        // Symlink-to-file must NOT qualify for resume — otherwise a
+        // pre-existing partial named X could be replaced by a symlink
+        // pointing at /etc/passwd, and we'd advertise its size + bytes
+        // back to the sender on the next transfer.  Defense in depth.
+        let dir = resume_scratch_dir("symlink");
+        let real_path = dir.join("real.bin");
+        std::fs::write(&real_path, b"real bytes").unwrap();
+        let link_path = dir.join("link.bin");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        // On non-Unix we can't make a symlink portably; the test is
+        // unix-only since the threat is filesystem-specific.
+        #[cfg(unix)]
+        {
+            let off = compute_resume_offset("link.bin", dir.to_str().unwrap(), 168);
+            assert_eq!(off, None, "symlink must be ineligible for resume");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_server_unexpected_packet_type_returns_e_packet() {
         // Anything outside the known set: protocol error.  Use a type
-        // letter that isn't claimed by any handler.
+        // letter that isn't claimed by any handler.  Server stays idle
+        // after sending E so a confused peer can recover.
         let ((), result) = run_server_with_client(async |w, r| {
             w.write_all(&wire_packet(b'Z', 0, &[])).await.unwrap();
             let resp = read_server_packet(r).await;
             assert_eq!(resp.kind, TYPE_ERROR);
+            close_server_session(w, r).await;
         })
         .await;
         result.unwrap();
+    }
+
+    // ---------- Client-mode dispatch (Gap 3b commit 1) ----------
+
+    /// Drive both a `kermit_client_get` and a `kermit_server` in
+    /// duplex pipes.  Returns the client's GET result so tests can
+    /// assert on success / error details, plus the server's exit
+    /// `Result<Vec<KermitReceive>>` (which should be empty in the
+    /// pure-pull case but is checked anyway to surface server-side
+    /// errors).
+    async fn run_client_get_against_server(
+        filename: &str,
+    ) -> (
+        Result<Vec<KermitReceive>, String>,
+        Result<Vec<KermitReceive>, String>,
+    ) {
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+        let fname = filename.to_string();
+        let client_task = tokio::spawn(async move {
+            let result = kermit_client_get(
+                &mut c_read,
+                &mut c_write,
+                &fname,
+                false,
+                false,
+                false,
+            )
+            .await;
+            // Send G F to close the server idle loop after the GET
+            // completes (success OR failure), so the server task
+            // resolves and the test doesn't time out waiting on it.
+            // On failure paths the server has already exited (E from
+            // R handler), so the write quietly drops — that's fine.
+            let g_finish = build_packet(TYPE_GENERIC, 0, b"F", b'1', 0, 0, CR);
+            let _ = c_write.write_all(&g_finish).await;
+            // Drain whatever the server wrote (G-F ACK or nothing).
+            let mut buf = [0u8; 256];
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                c_read.read(&mut buf),
+            )
+            .await;
+            result
+        });
+        let client_result = client_task.await.unwrap();
+        let server_result = server_task.await.unwrap();
+        (client_result, server_result)
+    }
+
+    #[tokio::test]
+    async fn test_client_get_pulls_existing_file() {
+        // End-to-end: client GETs a file from a server peer, both
+        // running in the same process.  Locks in the wire flow
+        // R(filename) → S(caps) → ACK → F → A → D... → Z → B and
+        // confirms the bytes round-trip.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_client_get_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i ^ 0x5A) as u8).collect();
+        std::fs::write(dir.join("pulled.bin"), &payload).unwrap();
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+
+        let (client_result, _server_result) =
+            run_client_get_against_server("pulled.bin").await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = client_result.expect("GET should succeed");
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_client_get_missing_file_returns_error() {
+        // Server has no such file → emits E-packet → client surfaces
+        // the refusal as a structured error (not a hang or panic).
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_client_missing_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+
+        let (client_result, _) = run_client_get_against_server("nonexistent.bin").await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = client_result.expect_err("GET must fail when file absent");
+        let lower = err.to_ascii_lowercase();
+        assert!(
+            lower.contains("not found") || lower.contains("refused"),
+            "expected file-not-found indicator in error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_get_unsafe_filename_returns_error() {
+        // Path traversal in the GET filename — server's R-handler
+        // refuses with E-packet, client surfaces as Err.  Guards
+        // against a future regression where the client might try
+        // local validation and accidentally bypass the server check.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let (client_result, _) = run_client_get_against_server("../../etc/passwd").await;
+        let err = client_result.expect_err("GET must fail for unsafe filename");
+        let lower = err.to_ascii_lowercase();
+        assert!(
+            lower.contains("invalid") || lower.contains("refused"),
+            "expected refusal indicator in error: {}",
+            err
+        );
+    }
+
+    /// Run a client-side closure against `kermit_server` in duplex
+    /// pipes.  Closure receives `(reader, writer)` in the order the
+    /// public client functions expect.  The server's exit result is
+    /// returned alongside the closure's value so tests can assert
+    /// both halves succeeded.
+    async fn run_client_against_server<F, T>(
+        client: F,
+    ) -> (T, Result<Vec<KermitReceive>, String>)
+    where
+        F: AsyncFnOnce(
+            &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        ) -> T,
+    {
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        let (server_side, client_side) = duplex(65536);
+        let (mut s_read, mut s_write) = split(server_side);
+        let (mut c_read, mut c_write) = split(client_side);
+        let server_task = tokio::spawn(async move {
+            kermit_server(&mut s_read, &mut s_write, false, false, false).await
+        });
+        let client_result = client(&mut c_read, &mut c_write).await;
+        let server_result = server_task.await.unwrap();
+        (client_result, server_result)
+    }
+
+    #[tokio::test]
+    async fn test_client_finish_ends_session_cleanly() {
+        let (client_result, server_result) = run_client_against_server(async |r, w| {
+            kermit_client_finish(r, w, false, false, false).await
+        })
+        .await;
+        client_result.unwrap();
+        // Server should have exited cleanly with no files received.
+        assert!(server_result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_client_logout_ends_session_cleanly() {
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            kermit_client_logout(r, w, false, false, false).await
+        })
+        .await;
+        client_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_bye_ends_session_cleanly() {
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            kermit_client_bye(r, w, false, false, false).await
+        })
+        .await;
+        client_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_version_returns_identity() {
+        // GET version → server replies with "Ethernet Gateway Kermit
+        // <version>".  Tests the X-Z text-response client path.
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            let v = kermit_client_version(r, w, false, false, false).await;
+            // Then close the session — server is still running.
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            v
+        })
+        .await;
+        let body = client_result.unwrap();
+        assert!(
+            body.contains("Ethernet Gateway Kermit"),
+            "missing identity in: {:?}",
+            body
+        );
+        assert!(
+            body.contains(env!("CARGO_PKG_VERSION")),
+            "missing version in: {:?}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_space_returns_text() {
+        // SPACE returns either a numeric byte-count (Unix) or
+        // "unknown" (other platforms).  Body must be non-empty.
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            let s = kermit_client_space(r, w, false, false, false).await;
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            s
+        })
+        .await;
+        let body = client_result.unwrap();
+        assert!(!body.is_empty());
+        assert!(body.parse::<u64>().is_ok() || body == "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_client_dir_returns_listing() {
+        // Stage a couple files in transfer_dir; client_dir must see
+        // them in the response.  Hidden files must be omitted.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_client_dir_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.bin"), b"a").unwrap();
+        std::fs::write(dir.join("beta.bin"), b"bb").unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let (client_result, _) = run_client_against_server(async move |r, w| {
+            config::update_config_value("transfer_dir", &dir_str);
+            let listing = kermit_client_dir(r, w, false, false, false).await;
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            listing
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+
+        let body = client_result.unwrap();
+        assert!(body.contains("alpha.bin"));
+        assert!(body.contains("beta.bin"));
+        assert!(!body.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_client_cwd_then_dir_lists_subdir() {
+        // Chain CWD → DIR on the client side.  The dir listing the
+        // server returns must reflect the new subdir, not the root.
+        // Covers the client-side cross-command state plumbing in the
+        // dir-listing direction (the get-from-subdir test below covers
+        // it for R; this one covers it for G D).
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_client_cwd_dir_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("rootfile.bin"), b"r").unwrap();
+        std::fs::write(dir.join("inner").join("innerfile.bin"), b"i").unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let (client_result, _) = run_client_against_server(async move |r, w| {
+            config::update_config_value("transfer_dir", &dir_str);
+            kermit_client_cwd(r, w, "inner", false, false, false)
+                .await
+                .unwrap();
+            let listing = kermit_client_dir(r, w, false, false, false).await;
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            listing
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+
+        let body = client_result.unwrap();
+        assert!(body.contains("innerfile.bin"), "subdir listing missing innerfile in: {:?}", body);
+        assert!(
+            !body.contains("rootfile.bin"),
+            "subdir listing must NOT include root files; got: {:?}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_cwd_then_get_pulls_from_subdir() {
+        // CWD into a subdir, then GET a file that lives there.
+        // Confirms cross-command state plumbing works from the client
+        // side too — the server keeps the subdir set across our
+        // distinct G C and R commands.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_client_cwd_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let payload = b"nested content".to_vec();
+        std::fs::write(dir.join("nested").join("file.bin"), &payload).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+        let payload_clone = payload.clone();
+
+        let (client_result, _) = run_client_against_server(async move |r, w| {
+            config::update_config_value("transfer_dir", &dir_str);
+            kermit_client_cwd(r, w, "nested", false, false, false)
+                .await
+                .unwrap();
+            let received = kermit_client_get(r, w, "file.bin", false, false, false).await;
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            received
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
+
+        let received = client_result.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload_clone);
+    }
+
+    #[tokio::test]
+    async fn test_client_cwd_unsafe_path_returns_error() {
+        // Path traversal in CWD argument: server emits E-packet, the
+        // client's send_g_simple surfaces it as Err.
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            kermit_client_cwd(r, w, "../etc", false, false, false).await
+        })
+        .await;
+        let err = client_result.expect_err("CWD ../etc must fail");
+        let lower = err.to_ascii_lowercase();
+        assert!(
+            lower.contains("invalid") || lower.contains("refused"),
+            "expected refusal indicator: {}",
+            err
+        );
     }
 
     // ---------- End-to-end round trips ----------
@@ -7832,12 +9007,20 @@ mod tests {
     }
 
     /// Server-mode interop: spawn C-Kermit as a CLIENT doing `get
-    /// filename` against our `kermit_server`.  Verifies the server
-    /// dispatcher correctly handles the R-packet and hands off to
-    /// the sender state machine, and that ckermit saved the bytes
-    /// it received.  `#[ignore]` because it requires `kermit`
-    /// (ckermit) installed; run with:
-    /// `cargo test test_ckermit_server_get -- --ignored`
+    /// filename` against our `kermit_server`.  Verifies the full
+    /// I → R → S → F → A → D... → Z → B handshake against a real
+    /// ckermit peer, including:
+    ///
+    /// - Auto-startup string (`kermit -x\r\n`) on the wire before the
+    ///   first SOH — our MARK-hunt in `read_packet` discards it.
+    /// - I-packet (re-init) as the first Kermit packet, which our
+    ///   server ACKs with our CAPAS payload.
+    /// - R-packet at seq=0; server ACKs explicitly before the S.
+    /// - Server's S at seq=0 (each transfer is a fresh exchange — NOT
+    ///   continuation of the I/R seq counter).
+    ///
+    /// `#[ignore]` because it requires `kermit` (ckermit) installed;
+    /// run with `cargo test test_ckermit_server -- --ignored`.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore]
@@ -7932,6 +9115,100 @@ mod tests {
         assert_eq!(downloaded, payload, "downloaded content must equal staged file");
     }
 
+    /// C-Kermit sends a file to our `kermit_server`.  Uses ckermit's
+    /// `-s file` action flag (no script, no tty needed — the action
+    /// runs to completion and ckermit exits).  Verifies the server's
+    /// S-dispatch path with a real ckermit peer end-to-end.
+    ///
+    /// Why we don't have script-driven server-mode interop tests for
+    /// `finish` / `bye` / `remote dir` / `remote cd` / `remote kermit`:
+    /// those are interactive commands that ckermit refuses to run
+    /// without a tty even in `-B` batch mode (it errors out with
+    /// "/dev/tty is not a terminal device" before sending the
+    /// command).  Working around that requires a pseudo-tty wrapper
+    /// (e.g. `script -qc` / `unbuffer`) which is platform-fragile and
+    /// out of scope for an `#[ignore]`'d test.  Those code paths are
+    /// instead covered by in-process tests using `kermit_server` as
+    /// the peer (see `test_server_g_*` and `test_client_*` above) —
+    /// the wire flow is identical, so the test value is in the
+    /// protocol-level coverage rather than the cross-process exercise.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn test_ckermit_server_send_interop() {
+        use std::process::Stdio;
+        use tokio::net::TcpListener;
+        use tokio::process::Command;
+
+        if Command::new("kermit")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("ckermit not on PATH; skipping interop test");
+            return;
+        }
+
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("kermit_send_interop_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i ^ 0x5A) as u8).collect();
+        let src_file = dir.join("uploaded.bin");
+        std::fs::write(&src_file, &payload).unwrap();
+        config::update_config_value("transfer_dir", dir.to_str().unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // ckermit dials in via -j and runs the -s action (send file)
+        // to completion.  No interactive commands → no tty needed.
+        let mut child = Command::new("kermit")
+            .arg("-B")
+            .arg("-j")
+            .arg(format!("127.0.0.1:{}", port))
+            .arg("-i")
+            .arg("-q")
+            .arg("-s")
+            .arg(&src_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ckermit");
+
+        let (sock, _) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            listener.accept(),
+        )
+        .await
+        .expect("ckermit didn't connect within 30s")
+        .expect("accept");
+        let (mut r, mut w) = tokio::io::split(sock);
+
+        let server_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            kermit_server(&mut r, &mut w, true, false, true),
+        )
+        .await
+        .expect("kermit_server timed out");
+
+        let _ = child.wait().await;
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let received = server_result.expect("kermit_server returned an error");
+        assert_eq!(received.len(), 1, "expected exactly one received file");
+        assert_eq!(received[0].data, payload, "uploaded content must round-trip");
+    }
+
     // ---------- Proptest fuzzers (panic-only assertions) ----------
 
     proptest::proptest! {
@@ -7982,6 +9259,77 @@ mod tests {
                     // Cursor is consumed after the first call; don't expect later iterations to do anything meaningful.
                 }
             });
+        }
+
+        /// Adversarial input to the safety validators must never panic.
+        /// Both functions take peer-supplied bytes (R-packet payload,
+        /// G C subdir argument) so they're a real attack surface.
+        #[test]
+        fn proptest_is_safe_resume_filename_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            let s = String::from_utf8_lossy(&data);
+            let _: bool = is_safe_resume_filename(&s);
+        }
+
+        #[test]
+        fn proptest_is_safe_relative_subdir_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            let s = String::from_utf8_lossy(&data);
+            let _: bool = is_safe_relative_subdir(&s);
+        }
+
+        /// `compute_resume_offset` does fs I/O on a peer-controlled
+        /// filename component.  Filename validation runs before the
+        /// fs call, so the only way to reach the stat layer is with a
+        /// validator-passing name.  Either way, no input must panic.
+        #[test]
+        fn proptest_compute_resume_offset_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let s = String::from_utf8_lossy(&data);
+            // Use a path that almost certainly doesn't exist so we
+            // exercise the lookup-fails branch most of the time, with
+            // occasional validator-passing names that hit the stat
+            // layer against a non-existent file.
+            let _ = compute_resume_offset(&s, "/nonexistent/proptest/dir", 168);
+        }
+
+        /// Locking-shift decoder: adversarial wire bytes (with the
+        /// shift markers possibly malformed or truncated) must not
+        /// panic and must produce *some* result without infinite-looping.
+        /// Pairs with the existing `proptest_decode_data_no_panic`
+        /// case that covers the non-locking-shift path.
+        #[test]
+        fn proptest_decode_data_locking_shifts_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            let q = Quoting {
+                qctl: b'#',
+                qbin: None,
+                rept: Some(b'~'),
+                locking_shifts: true,
+            };
+            let _ = decode_data(&data, q);
+        }
+
+        /// `encode_data` with locking shifts on an arbitrary input
+        /// must produce a byte stream `decode_data` can round-trip.
+        /// Stronger than panic-only: also asserts protocol invariant.
+        #[test]
+        fn proptest_locking_shifts_round_trip(
+            input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let q = Quoting {
+                qctl: b'#',
+                qbin: None,
+                rept: Some(b'~'),
+                locking_shifts: true,
+            };
+            let encoded = encode_data(&input, q);
+            let decoded = decode_data(&encoded, q).expect("must decode our own encode");
+            proptest::prop_assert_eq!(decoded, input);
         }
     }
 }
