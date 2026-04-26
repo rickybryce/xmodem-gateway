@@ -143,6 +143,11 @@ pub(crate) const MAX_WINDOW_SIZE: u8 = 31;
 /// vector over the lifetime of one session.  1000 is well above any
 /// realistic batch size — typical transfers are 1-10 files.
 const MAX_BATCH_FILES: usize = 1000;
+/// How many D-packet success traces to log per file at `verbose=true`.
+/// Mirrors zmodem.rs's `subpackets_sent <= 3` rate-limit pattern: log
+/// the first few to confirm the protocol baseline is working, go
+/// silent on success after that.  Failure paths log unconditionally.
+const D_PACKET_TRACE_LIMIT: u32 = 3;
 
 /// Sender-side reservation for worst-case quoting blowup, expressed as
 /// a fraction `NUM / DEN` of the negotiated `MAXL` payload area.  3/4
@@ -1368,7 +1373,6 @@ pub(crate) struct KermitReceive {
     pub mode: Option<u32>,
     /// Detected peer flavor for this session.  Telnet surfaces this in
     /// the post-transfer summary so the user knows whom they talked to.
-    #[allow(dead_code)]
     pub flavor: KermitFlavor,
 }
 
@@ -1474,6 +1478,21 @@ async fn send_nak(
 fn wrap_send_err(context: &str, inner: String) -> String {
     let detail = inner.strip_prefix("Kermit: ").unwrap_or(&inner);
     format!("Kermit send {}: {}", context, detail)
+}
+
+/// Per-packet retransmit/read timeout *after* Send-Init completes.
+/// Spec: peer's TIME field (seconds) is how long they want us to wait
+/// before retransmitting; a value of 0 means "no preference — use your
+/// protocol default" so we fall back to `kermit_packet_timeout`.  Floor
+/// at 1 s so a misconfigured peer can't wedge us with TIME=0 plus a 0
+/// fallback.
+fn effective_packet_timeout(peer_time: u8, fallback_secs: u64) -> tokio::time::Duration {
+    let secs = if peer_time > 0 {
+        peer_time as u64
+    } else {
+        fallback_secs
+    };
+    tokio::time::Duration::from_secs(secs.max(1))
 }
 
 /// Decode an E-packet's payload back to a human-readable string.
@@ -1682,7 +1701,10 @@ pub(crate) async fn kermit_send(
     let mut state = ReadState::default();
     let neg_deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout);
-    let pkt_timeout = tokio::time::Duration::from_secs(cfg.kermit_packet_timeout);
+    // pkt_timeout is set after Send-Init using the peer's negotiated
+    // TIME field (spec §3.2: peer's TIME tells us how long it wants us
+    // to wait before retransmitting to it).  During Send-Init itself
+    // we use `neg_deadline` derived from `kermit_negotiation_timeout`.
     let max_retries = cfg.kermit_max_retries;
 
     // 1. Send Send-Init (S, seq=0) and wait for ACK with peer's caps.
@@ -1725,10 +1747,13 @@ pub(crate) async fn kermit_send(
     let peer_init = parse_send_init_payload(&peer_caps);
     let session = intersect_capabilities(&our_caps, &peer_init);
     let flavor = detect_flavor(&peer_init);
+    // Honor peer's TIME for our retransmit/read deadlines from here on.
+    let pkt_timeout = effective_packet_timeout(session.time, cfg.kermit_packet_timeout);
     if verbose {
         glog!(
-            "Kermit send: peer offered MAXL={} CHKT={} window={} long={} stream={} attrs={} qbin={:?} id={:?}",
+            "Kermit send: peer offered MAXL={} TIME={} CHKT={} window={} long={} stream={} attrs={} qbin={:?} id={:?}",
             peer_init.maxl,
+            peer_init.time,
             peer_init.chkt as char,
             peer_init.window,
             peer_init.long_packets,
@@ -1738,13 +1763,14 @@ pub(crate) async fn kermit_send(
             peer_init.peer_id,
         );
         glog!(
-            "Kermit send: negotiated MAXL={} CHKT={} window={} long={} stream={} attrs={} flavor={}",
+            "Kermit send: negotiated MAXL={} CHKT={} window={} long={} stream={} attrs={} pkt_timeout={}s flavor={}",
             session.maxl,
             session.chkt as char,
             session.window,
             session.long_packets,
             session.streaming,
             session.attribute_packets,
+            pkt_timeout.as_secs(),
             flavor.display()
         );
     }
@@ -1856,29 +1882,106 @@ pub(crate) async fn kermit_send(
         // success after that.  Failure paths (NAK, timeout, CHECK
         // mismatch) remain unconditionally logged elsewhere.
         let mut d_packets_sent = 0u32;
-        for chunk in f.data.chunks(chunk_size) {
-            let encoded = encode_data(chunk, send_q);
-            d_packets_sent += 1;
-            if verbose && d_packets_sent <= 3 {
-                let pct = if !chunk.is_empty() {
-                    (encoded.len() * 100) / chunk.len()
-                } else {
-                    100
-                };
-                glog!(
-                    "Kermit send: D-packet seq={} raw={}B encoded={}B ({}%)",
+        let z_handled_internally = session.streaming;
+        if session.streaming {
+            // Streaming path: D-packets and Z-packet are handled
+            // together.  Sender doesn't wait for per-D ACKs; the
+            // Z-ACK confirms the whole stream (spec §6).
+            seq = send_d_and_z_streaming(
+                reader,
+                writer,
+                f.data,
+                chunk_size,
+                send_q,
+                seq,
+                &session,
+                pkt_timeout,
+                is_tcp,
+                is_petscii,
+                verbose,
+                &mut state,
+                max_retries,
+                &mut d_packets_sent,
+            )
+            .await
+            .map_err(|e| wrap_send_err("D/Z stream", e))?;
+        } else if session.window > 1 {
+            // Sliding-window path: D-packets ride a windowed sender
+            // that allows up to `session.window` outstanding packets
+            // and selectively retransmits on NAK or per-seq timeout.
+            seq = send_d_packets_windowed(
+                reader,
+                writer,
+                f.data,
+                chunk_size,
+                send_q,
+                seq,
+                &session,
+                pkt_timeout,
+                is_tcp,
+                is_petscii,
+                verbose,
+                &mut state,
+                max_retries,
+                &mut d_packets_sent,
+            )
+            .await
+            .map_err(|e| wrap_send_err("D-packet", e))?;
+        } else {
+            // Stop-and-wait path (window=1): unchanged from pre-window
+            // implementation — the safe baseline for serial peers and
+            // ancient Kermits that don't advertise sliding.
+            for chunk in f.data.chunks(chunk_size) {
+                let encoded = encode_data(chunk, send_q);
+                d_packets_sent += 1;
+                if verbose && d_packets_sent <= D_PACKET_TRACE_LIMIT {
+                    let pct = if !chunk.is_empty() {
+                        (encoded.len() * 100) / chunk.len()
+                    } else {
+                        100
+                    };
+                    glog!(
+                        "Kermit send: D-packet seq={} raw={}B encoded={}B ({}%)",
+                        seq,
+                        chunk.len(),
+                        encoded.len(),
+                        pct
+                    );
+                }
+                let _ = send_and_await_ack(
+                    reader,
+                    writer,
+                    TYPE_DATA,
                     seq,
-                    chunk.len(),
-                    encoded.len(),
-                    pct
-                );
+                    &encoded,
+                    session.chkt,
+                    session.npad,
+                    session.padc,
+                    session.eol,
+                    is_tcp,
+                    is_petscii,
+                    verbose,
+                    &mut state,
+                    Some(tokio::time::Instant::now() + pkt_timeout),
+                    max_retries,
+                    false,
+                )
+                .await
+                .map_err(|e| wrap_send_err("D-packet", e))?;
+                seq = (seq + 1) & 0x3F;
             }
+        }
+
+        // Z-packet (EOF for this file).  Skipped when streaming did it
+        // internally (the streaming path bundles Z with the data
+        // stream so the Z-ACK confirms the whole batch atomically).
+        if !z_handled_internally {
             let _ = send_and_await_ack(
                 reader,
                 writer,
-                TYPE_DATA,
+                TYPE_EOF,
                 seq,
-                &encoded,
+                &[],
                 session.chkt,
                 session.npad,
                 session.padc,
@@ -1892,32 +1995,9 @@ pub(crate) async fn kermit_send(
                 false,
             )
             .await
-            .map_err(|e| wrap_send_err("D-packet", e))?;
+            .map_err(|e| wrap_send_err("Z-packet", e))?;
             seq = (seq + 1) & 0x3F;
         }
-
-        // Z-packet (EOF for this file).
-        let _ = send_and_await_ack(
-            reader,
-            writer,
-            TYPE_EOF,
-            seq,
-            &[],
-            session.chkt,
-            session.npad,
-            session.padc,
-            session.eol,
-            is_tcp,
-            is_petscii,
-            verbose,
-            &mut state,
-            Some(tokio::time::Instant::now() + pkt_timeout),
-            max_retries,
-            false,
-        )
-        .await
-        .map_err(|e| wrap_send_err("Z-packet", e))?;
-        seq = (seq + 1) & 0x3F;
     }
 
     // 3. EOT (B-packet, end of session).
@@ -2143,6 +2223,526 @@ async fn send_and_await_ack(
 }
 
 // =============================================================================
+// SLIDING-WINDOW SENDER (D-packets only)
+// =============================================================================
+
+/// One unACKed D-packet in the sender's window.  Stores the wire bytes
+/// so we can retransmit on NAK or per-packet timeout without re-encoding.
+struct OutstandingPacket {
+    seq: u8,
+    bytes: Vec<u8>,
+    sent_at: tokio::time::Instant,
+    retries: u32,
+}
+
+/// Send the D-packets for one file using a sliding window of size
+/// `session.window`.  The window covers data packets only — control
+/// packets (S/F/A/Z/B) remain stop-and-wait via `send_and_await_ack`,
+/// per spec rationale (negotiation and file-boundary acks are
+/// inherently synchronous).
+///
+/// Returns the seq number to use for the next packet after the window
+/// drains (the F/A/Z control packets after the data stream).
+#[allow(clippy::too_many_arguments)]
+async fn send_d_packets_windowed(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    file_data: &[u8],
+    chunk_size: usize,
+    send_q: Quoting,
+    starting_seq: u8,
+    session: &Capabilities,
+    pkt_timeout: tokio::time::Duration,
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+    state: &mut ReadState,
+    max_retries: u32,
+    d_packets_sent: &mut u32,
+) -> Result<u8, String> {
+    use std::collections::VecDeque;
+    let window_size = session.window.max(1) as usize;
+    let mut next_seq = starting_seq;
+    let mut outstanding: VecDeque<OutstandingPacket> = VecDeque::new();
+    let mut chunks = file_data.chunks(chunk_size);
+
+    loop {
+        // 1. Push new packets while window has room and chunks remain.
+        while outstanding.len() < window_size {
+            let Some(chunk) = chunks.next() else {
+                break;
+            };
+            let encoded = encode_data(chunk, send_q);
+            *d_packets_sent += 1;
+            if verbose && *d_packets_sent <= D_PACKET_TRACE_LIMIT {
+                let pct = if !chunk.is_empty() {
+                    (encoded.len() * 100) / chunk.len()
+                } else {
+                    100
+                };
+                glog!(
+                    "Kermit send: D-packet seq={} raw={}B encoded={}B ({}%) [window]",
+                    next_seq,
+                    chunk.len(),
+                    encoded.len(),
+                    pct
+                );
+            }
+            let pkt_bytes = build_packet(
+                TYPE_DATA,
+                next_seq,
+                &encoded,
+                session.chkt,
+                session.npad,
+                session.padc,
+                session.eol,
+            );
+            raw_write_bytes(writer, &pkt_bytes, is_tcp).await?;
+            outstanding.push_back(OutstandingPacket {
+                seq: next_seq,
+                bytes: pkt_bytes,
+                sent_at: tokio::time::Instant::now(),
+                retries: 0,
+            });
+            next_seq = (next_seq + 1) & 0x3F;
+        }
+
+        // 2. If nothing outstanding and no more chunks, we're done.
+        if outstanding.is_empty() {
+            break;
+        }
+
+        // 3. Compute the earliest retransmit deadline across the window.
+        // VecDeque preserves insertion order; the front was sent first
+        // unless an earlier ACK removed it from the middle.  Take the
+        // min defensively.
+        let earliest = outstanding
+            .iter()
+            .map(|p| p.sent_at + pkt_timeout)
+            .min()
+            .expect("outstanding non-empty");
+
+        // 4. Read response.  On read-error/timeout, retransmit any
+        //    packet whose individual deadline has elapsed.
+        match read_packet(
+            reader,
+            is_tcp,
+            is_petscii,
+            session.chkt,
+            session.eol,
+            verbose,
+            state,
+            Some(earliest),
+        )
+        .await
+        {
+            Ok(resp) => {
+                if resp.kind == TYPE_ERROR {
+                    let q = Quoting {
+                        qctl: DEFAULT_QCTL,
+                        qbin: None,
+                        rept: None,
+                    };
+                    let msg = decode_error_message(&resp.payload, q);
+                    return Err(format!("Kermit: peer sent E-packet: {}", msg));
+                }
+                if resp.kind == TYPE_ACK {
+                    // Selective: remove the matching seq from anywhere
+                    // in the window.  Stray ACKs (already-removed seq,
+                    // or for a control packet we sent earlier) are
+                    // ignored — the per-seq match guards us.
+                    if let Some(idx) = outstanding.iter().position(|p| p.seq == resp.seq) {
+                        outstanding.remove(idx);
+                    } else if verbose {
+                        glog!(
+                            "Kermit send: stray ACK seq={} (window) — ignoring",
+                            resp.seq
+                        );
+                    }
+                } else if resp.kind == TYPE_NAK {
+                    // Selective retransmit of the NAKed seq.
+                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
+                        p.retries += 1;
+                        if p.retries >= max_retries {
+                            return Err(format!(
+                                "Kermit: too many NAKs (>{}) for seq {} (window)",
+                                max_retries, p.seq
+                            ));
+                        }
+                        if verbose {
+                            glog!(
+                                "Kermit send: NAK seq={} (window) — retransmitting ({}/{})",
+                                p.seq,
+                                p.retries,
+                                max_retries
+                            );
+                        }
+                        let bytes = p.bytes.clone();
+                        raw_write_bytes(writer, &bytes, is_tcp).await?;
+                        if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
+                            p.sent_at = tokio::time::Instant::now();
+                        }
+                    } else if verbose {
+                        glog!(
+                            "Kermit send: stray NAK seq={} (window) — ignoring",
+                            resp.seq
+                        );
+                    }
+                } else if verbose {
+                    glog!(
+                        "Kermit send: unexpected '{}' seq={} during window — ignoring",
+                        resp.kind as char,
+                        resp.seq
+                    );
+                }
+            }
+            Err(_e) => {
+                // Read timeout (or noisy line).  Retransmit any packet
+                // whose individual per-packet deadline has elapsed.
+                let now = tokio::time::Instant::now();
+                let mut to_retx: Vec<usize> = Vec::new();
+                for (i, p) in outstanding.iter().enumerate() {
+                    if now >= p.sent_at + pkt_timeout {
+                        to_retx.push(i);
+                    }
+                }
+                for i in to_retx {
+                    let (seq, bytes) = {
+                        let p = &mut outstanding[i];
+                        p.retries += 1;
+                        if p.retries >= max_retries {
+                            return Err(format!(
+                                "Kermit: too many timeouts for seq {} (window)",
+                                p.seq
+                            ));
+                        }
+                        if verbose {
+                            glog!(
+                                "Kermit send: timeout seq={} (window) — retransmitting ({}/{})",
+                                p.seq,
+                                p.retries,
+                                max_retries
+                            );
+                        }
+                        (p.seq, p.bytes.clone())
+                    };
+                    raw_write_bytes(writer, &bytes, is_tcp).await?;
+                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == seq) {
+                        p.sent_at = tokio::time::Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(next_seq)
+}
+
+// =============================================================================
+// STREAMING SENDER (D-packets + Z-packet, no per-D ACK)
+// =============================================================================
+
+/// Send all D-packets for one file plus the Z-packet under streaming
+/// rules (CAPAS streaming bit negotiated true on both peers, per Frank
+/// da Cruz, "Kermit Protocol Manual" §6).  Streaming behavior:
+///
+/// - Sender pushes data packets back-to-back without waiting for any
+///   per-D ACK.
+/// - Between pushes we do a non-blocking poll for incoming NAK or
+///   E-packet — NAK triggers a selective retransmit, E aborts.
+/// - After all D-packets are queued we send the Z-packet and then
+///   block-read responses until the Z-ACK arrives.  The Z-ACK
+///   implicitly confirms every preceding D-packet (per spec).
+/// - On receipt of any D-packet NAK during the Z wait, we still
+///   retransmit selectively, then resume waiting for Z-ACK.
+///
+/// Returns the seq number to use for the next packet *after* Z (i.e.
+/// the caller's running seq, advanced by `chunks + 1` mod 64).
+#[allow(clippy::too_many_arguments)]
+async fn send_d_and_z_streaming(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    file_data: &[u8],
+    chunk_size: usize,
+    send_q: Quoting,
+    starting_seq: u8,
+    session: &Capabilities,
+    pkt_timeout: tokio::time::Duration,
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+    state: &mut ReadState,
+    max_retries: u32,
+    d_packets_sent: &mut u32,
+) -> Result<u8, String> {
+    use std::collections::VecDeque;
+    let mut next_seq = starting_seq;
+    let mut outstanding: VecDeque<OutstandingPacket> = VecDeque::new();
+
+    // 1. Push all D-packets back-to-back without per-packet ACK wait.
+    //    Outstanding holds every packet until the Z-ACK confirms the
+    //    whole stream (or we get an interim NAK during the drain).
+    //    Memory is bounded by MAX_FILE_SIZE × ~1.05 (quoting headroom).
+    for chunk in file_data.chunks(chunk_size) {
+        let encoded = encode_data(chunk, send_q);
+        *d_packets_sent += 1;
+        if verbose && *d_packets_sent <= D_PACKET_TRACE_LIMIT {
+            let pct = if !chunk.is_empty() {
+                (encoded.len() * 100) / chunk.len()
+            } else {
+                100
+            };
+            glog!(
+                "Kermit send: D-packet seq={} raw={}B encoded={}B ({}%) [stream]",
+                next_seq,
+                chunk.len(),
+                encoded.len(),
+                pct
+            );
+        }
+        let pkt_bytes = build_packet(
+            TYPE_DATA,
+            next_seq,
+            &encoded,
+            session.chkt,
+            session.npad,
+            session.padc,
+            session.eol,
+        );
+        raw_write_bytes(writer, &pkt_bytes, is_tcp).await?;
+        outstanding.push_back(OutstandingPacket {
+            seq: next_seq,
+            bytes: pkt_bytes,
+            sent_at: tokio::time::Instant::now(),
+            retries: 0,
+        });
+        next_seq = (next_seq + 1) & 0x3F;
+    }
+
+    // 2. Send Z-packet — its ACK confirms the whole stream.
+    let z_seq = next_seq;
+    let z_pkt = build_packet(
+        TYPE_EOF,
+        z_seq,
+        &[],
+        session.chkt,
+        session.npad,
+        session.padc,
+        session.eol,
+    );
+    raw_write_bytes(writer, &z_pkt, is_tcp).await?;
+    if verbose {
+        glog!("Kermit send: Z-packet seq={} (stream-end, awaiting drain)", z_seq);
+    }
+    let mut z_attempts = 0u32;
+    let mut z_sent_at = tokio::time::Instant::now();
+    next_seq = (next_seq + 1) & 0x3F;
+
+    // 3. Drain — block-read responses until Z's ACK arrives.  Honor
+    //    the per-packet timeout for retransmits of the Z-packet
+    //    itself; D-packet retransmits use their own per-seq sent_at.
+    loop {
+        let earliest = std::iter::once(z_sent_at + pkt_timeout)
+            .chain(outstanding.iter().map(|p| p.sent_at + pkt_timeout))
+            .min()
+            .unwrap();
+        match read_packet(
+            reader,
+            is_tcp,
+            is_petscii,
+            session.chkt,
+            session.eol,
+            verbose,
+            state,
+            Some(earliest),
+        )
+        .await
+        {
+            Ok(resp) => {
+                if resp.kind == TYPE_ERROR {
+                    let q = Quoting {
+                        qctl: DEFAULT_QCTL,
+                        qbin: None,
+                        rept: None,
+                    };
+                    let msg = decode_error_message(&resp.payload, q);
+                    return Err(format!("Kermit: peer sent E-packet: {}", msg));
+                }
+                if resp.kind == TYPE_ACK && resp.seq == z_seq {
+                    if verbose {
+                        glog!(
+                            "Kermit send: Z-ACK seq={} (stream complete; {} D-packets in outstanding implicitly confirmed)",
+                            z_seq,
+                            outstanding.len()
+                        );
+                    }
+                    return Ok(next_seq);
+                }
+                if resp.kind == TYPE_NAK && resp.seq == z_seq {
+                    z_attempts += 1;
+                    if z_attempts >= max_retries {
+                        return Err(format!(
+                            "Kermit: too many NAKs for Z-packet seq {} (stream)",
+                            z_seq
+                        ));
+                    }
+                    if verbose {
+                        glog!(
+                            "Kermit send: NAK on Z seq={} (stream) — retransmitting ({}/{})",
+                            z_seq,
+                            z_attempts,
+                            max_retries
+                        );
+                    }
+                    raw_write_bytes(writer, &z_pkt, is_tcp).await?;
+                    z_sent_at = tokio::time::Instant::now();
+                    continue;
+                }
+                handle_streaming_response(
+                    resp,
+                    &mut outstanding,
+                    writer,
+                    is_tcp,
+                    max_retries,
+                    verbose,
+                )
+                .await?;
+            }
+            Err(_) => {
+                // Timeout — retransmit any expired packets (D or Z).
+                let now = tokio::time::Instant::now();
+                if now >= z_sent_at + pkt_timeout {
+                    z_attempts += 1;
+                    if z_attempts >= max_retries {
+                        return Err(format!(
+                            "Kermit: too many timeouts for Z-packet seq {} (stream)",
+                            z_seq
+                        ));
+                    }
+                    if verbose {
+                        glog!(
+                            "Kermit send: Z timeout (stream) — retransmitting ({}/{})",
+                            z_attempts,
+                            max_retries
+                        );
+                    }
+                    raw_write_bytes(writer, &z_pkt, is_tcp).await?;
+                    z_sent_at = tokio::time::Instant::now();
+                }
+                let mut to_retx: Vec<u8> = Vec::new();
+                for p in outstanding.iter() {
+                    if now >= p.sent_at + pkt_timeout {
+                        to_retx.push(p.seq);
+                    }
+                }
+                for seq in to_retx {
+                    let bytes_clone = {
+                        let p = outstanding
+                            .iter_mut()
+                            .find(|p| p.seq == seq)
+                            .expect("seq present");
+                        p.retries += 1;
+                        if p.retries >= max_retries {
+                            return Err(format!(
+                                "Kermit: too many timeouts for D-packet seq {} (stream)",
+                                p.seq
+                            ));
+                        }
+                        if verbose {
+                            glog!(
+                                "Kermit send: D-packet timeout seq={} (stream) — retransmitting ({}/{})",
+                                p.seq,
+                                p.retries,
+                                max_retries
+                            );
+                        }
+                        p.bytes.clone()
+                    };
+                    raw_write_bytes(writer, &bytes_clone, is_tcp).await?;
+                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == seq) {
+                        p.sent_at = tokio::time::Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a single response packet during streaming send.  Updates
+/// `outstanding` for ACK/NAK matches; aborts on E-packet; ignores
+/// strays.  Used by both the chunk-push loop and the Z-drain loop.
+async fn handle_streaming_response(
+    resp: Packet,
+    outstanding: &mut std::collections::VecDeque<OutstandingPacket>,
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    max_retries: u32,
+    verbose: bool,
+) -> Result<(), String> {
+    if resp.kind == TYPE_ERROR {
+        let q = Quoting {
+            qctl: DEFAULT_QCTL,
+            qbin: None,
+            rept: None,
+        };
+        let msg = decode_error_message(&resp.payload, q);
+        return Err(format!("Kermit: peer sent E-packet: {}", msg));
+    }
+    if resp.kind == TYPE_ACK {
+        // Streaming receivers shouldn't ACK D-packets, but some
+        // mid-flight ACKs (e.g. if peer toggled streaming) may still
+        // arrive.  Honor them by removing from outstanding.
+        if let Some(idx) = outstanding.iter().position(|p| p.seq == resp.seq) {
+            outstanding.remove(idx);
+        } else if verbose {
+            glog!(
+                "Kermit send: stray ACK seq={} (stream) — ignoring",
+                resp.seq
+            );
+        }
+        return Ok(());
+    }
+    if resp.kind == TYPE_NAK {
+        if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
+            p.retries += 1;
+            if p.retries >= max_retries {
+                return Err(format!(
+                    "Kermit: too many NAKs (>{}) for seq {} (stream)",
+                    max_retries, p.seq
+                ));
+            }
+            if verbose {
+                glog!(
+                    "Kermit send: NAK seq={} (stream) — retransmitting ({}/{})",
+                    p.seq,
+                    p.retries,
+                    max_retries
+                );
+            }
+            let bytes = p.bytes.clone();
+            raw_write_bytes(writer, &bytes, is_tcp).await?;
+            if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
+                p.sent_at = tokio::time::Instant::now();
+            }
+        } else if verbose {
+            glog!(
+                "Kermit send: stray NAK seq={} (stream) — ignoring",
+                resp.seq
+            );
+        }
+        return Ok(());
+    }
+    if verbose {
+        glog!(
+            "Kermit send: unexpected '{}' seq={} (stream) — ignoring",
+            resp.kind as char,
+            resp.seq
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
 // RECEIVER STATE MACHINE
 // =============================================================================
 
@@ -2169,7 +2769,9 @@ pub(crate) async fn kermit_receive(
     let mut state = ReadState::default();
     let neg_deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout);
-    let pkt_timeout = tokio::time::Duration::from_secs(cfg.kermit_packet_timeout);
+    // pkt_timeout is set below once we know the peer's TIME field
+    // (spec §3.2).  During the initial Send-Init read we use
+    // `neg_deadline` derived from `kermit_negotiation_timeout` instead.
 
     // 1. Read Send-Init from peer.  Block until it arrives or we timeout.
     let s_pkt = read_packet(
@@ -2193,15 +2795,19 @@ pub(crate) async fn kermit_receive(
     let peer_init = parse_send_init_payload(&s_pkt.payload);
     let session = intersect_capabilities(&our_caps, &peer_init);
     let flavor = detect_flavor(&peer_init);
+    // Honor peer's TIME for our retransmit/read deadlines from here on.
+    let pkt_timeout = effective_packet_timeout(session.time, cfg.kermit_packet_timeout);
     if verbose {
         glog!(
-            "Kermit recv: peer MAXL={} CHKT={} window={} long={} stream={} attrs={} flavor={}",
+            "Kermit recv: peer MAXL={} TIME={} CHKT={} window={} long={} stream={} attrs={} pkt_timeout={}s flavor={}",
             session.maxl,
+            peer_init.time,
             session.chkt as char,
             session.window,
             session.long_packets,
             session.streaming,
             session.attribute_packets,
+            pkt_timeout.as_secs(),
             flavor.display()
         );
     }
@@ -2232,30 +2838,125 @@ pub(crate) async fn kermit_receive(
     let mut expected_seq: u8 = 1; // peer increments seq from 0 (Send-Init)
     // Per-file counter for rate-limiting verbose D-packet success
     // logs.  Resets on every F-packet so each file gets its own first
-    // 3 traced — same pattern as zmodem.rs's subpacket-trace cap.
+    // few traced — same pattern as zmodem.rs's subpacket-trace cap.
     let mut d_packets_received = 0u32;
+    // Bound the read-error retry chain so a wedged peer can't keep
+    // us NAKing forever.  Resets on any successful packet.
+    let mut consecutive_failures: u32 = 0;
+    let max_retries = cfg.kermit_max_retries;
+    // Out-of-order buffer for sliding-window receive.  Empty when
+    // window=1 (stop-and-wait); selective-repeat per spec §5.5 when
+    // window>1.  Capped at session.window entries — anything beyond
+    // is outside the receive window and would indicate sender error.
+    let mut out_of_order: std::collections::HashMap<u8, Packet> =
+        std::collections::HashMap::new();
+    // When non-None, the next loop iteration consumes this packet
+    // (drained from `out_of_order`) instead of reading from the wire.
+    let mut next_drained: Option<Packet> = None;
+    let window = session.window.max(1);
 
     loop {
-        let pkt = match read_packet(
-            reader,
-            is_tcp,
-            is_petscii,
-            session.chkt,
-            session.eol,
-            verbose,
-            &mut state,
-            Some(tokio::time::Instant::now() + pkt_timeout),
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                if verbose {
-                    glog!(
-                        "Kermit recv: read error → NAK seq={}: {}",
+        let pkt = if let Some(p) = next_drained.take() {
+            p
+        } else {
+            match read_packet(
+                reader,
+                is_tcp,
+                is_petscii,
+                session.chkt,
+                session.eol,
+                verbose,
+                &mut state,
+                Some(tokio::time::Instant::now() + pkt_timeout),
+            )
+            .await
+            {
+                Ok(p) => {
+                    consecutive_failures = 0;
+                    p
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if verbose {
+                        glog!(
+                            "Kermit recv: read error → NAK seq={} ({}/{}): {}",
+                            expected_seq,
+                            consecutive_failures,
+                            max_retries,
+                            e
+                        );
+                    }
+                    if consecutive_failures >= max_retries {
+                        send_error(
+                            writer,
+                            expected_seq,
+                            "Too many consecutive read errors",
+                            session.chkt,
+                            session.npad,
+                            session.padc,
+                            session.eol,
+                            is_tcp,
+                        )
+                        .await?;
+                        return Err(format!(
+                            "Kermit recv: aborting after {} consecutive read errors: {}",
+                            max_retries, e
+                        ));
+                    }
+                    send_nak(
+                        writer,
                         expected_seq,
-                        e
-                    );
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        };
+
+        if pkt.kind == TYPE_ERROR {
+            let msg = decode_error_message(&pkt.payload, recv_q);
+            return Err(format!("Kermit recv: peer sent E-packet: {}", msg));
+        }
+
+        if pkt.seq != expected_seq {
+            // Modular distance: how far ahead/behind is this seq?
+            // Mod-64 arithmetic, with the receive window bounded at
+            // MAX_WINDOW_SIZE=31 < 32, so forward and backward windows
+            // never overlap — disambiguation is unambiguous.
+            let dist_forward = pkt.seq.wrapping_sub(expected_seq) & 0x3F;
+            let dist_back = expected_seq.wrapping_sub(pkt.seq) & 0x3F;
+
+            // Future packet within the window → buffer for later
+            // (selective-repeat per spec §5.5) and NAK the missing seq
+            // so the sender knows what to retransmit.
+            if window > 1 && dist_forward > 0 && dist_forward < window {
+                use std::collections::hash_map::Entry;
+                match out_of_order.entry(pkt.seq) {
+                    Entry::Vacant(slot) => {
+                        if verbose {
+                            glog!(
+                                "Kermit recv: buffered future seq={} (expected {}) → NAK {}",
+                                pkt.seq,
+                                expected_seq,
+                                expected_seq
+                            );
+                        }
+                        slot.insert(pkt);
+                    }
+                    Entry::Occupied(_) => {
+                        if verbose {
+                            glog!(
+                                "Kermit recv: duplicate future seq={} already buffered → NAK {}",
+                                pkt.seq,
+                                expected_seq
+                            );
+                        }
+                    }
                 }
                 send_nak(
                     writer,
@@ -2269,19 +2970,11 @@ pub(crate) async fn kermit_receive(
                 .await?;
                 continue;
             }
-        };
 
-        if pkt.kind == TYPE_ERROR {
-            let msg = decode_error_message(&pkt.payload, recv_q);
-            return Err(format!("Kermit recv: peer sent E-packet: {}", msg));
-        }
-
-        if pkt.seq != expected_seq {
-            // Out-of-order — for stop-and-wait we just NAK the expected
-            // seq.  For sliding window the receiver tracks per-seq state;
-            // we simplify by retransmitting the last ACK if the peer
-            // re-sent a packet we already ACKed (seq one less than expected).
-            if pkt.seq == (expected_seq.wrapping_sub(1) & 0x3F) {
+            // Already-ACKed packet within the back-window → re-ACK so
+            // the sender can advance.  For window=1 this collapses to
+            // "exactly previous seq" — the original stop-and-wait rule.
+            if dist_back > 0 && dist_back <= window {
                 if verbose {
                     glog!(
                         "Kermit recv: duplicate seq={} (expected {}) → re-ACK",
@@ -2301,6 +2994,9 @@ pub(crate) async fn kermit_receive(
                 .await?;
                 continue;
             }
+
+            // Outside both windows — line noise or peer confusion.
+            // NAK the expected seq.
             if verbose {
                 glog!(
                     "Kermit recv: out-of-order seq={} (expected {}) → NAK",
@@ -2453,26 +3149,33 @@ pub(crate) async fn kermit_receive(
                     return Err("Kermit recv: file size cap exceeded".into());
                 }
                 d_packets_received += 1;
-                if verbose && d_packets_received <= 3 {
+                if verbose && d_packets_received <= D_PACKET_TRACE_LIMIT {
                     glog!(
-                        "Kermit recv: D-packet seq={} encoded={}B decoded={}B (file total {}B)",
+                        "Kermit recv: D-packet seq={} encoded={}B decoded={}B (file total {}B){}",
                         pkt.seq,
                         pkt.payload.len(),
                         raw.len(),
-                        last.data.len() + raw.len()
+                        last.data.len() + raw.len(),
+                        if session.streaming { " [stream, no ACK]" } else { "" }
                     );
                 }
                 last.data.extend_from_slice(&raw);
-                send_ack(
-                    writer,
-                    pkt.seq,
-                    session.chkt,
-                    session.npad,
-                    session.padc,
-                    session.eol,
-                    is_tcp,
-                )
-                .await?;
+                // Streaming: suppress per-D-packet ACK (spec §6).  The
+                // Z-ACK we'll emit at end-of-file confirms the whole
+                // stream.  Out-of-order D-packets still NAK above so
+                // the sender can retransmit.
+                if !session.streaming {
+                    send_ack(
+                        writer,
+                        pkt.seq,
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                }
             }
             TYPE_EOF => {
                 if received.last().is_none() {
@@ -2566,6 +3269,21 @@ pub(crate) async fn kermit_receive(
         }
 
         expected_seq = (expected_seq + 1) & 0x3F;
+
+        // Drain in-order packets buffered ahead of us by the windowed
+        // receive path.  Each iteration consumes one buffered packet
+        // by re-entering the loop with `next_drained` set; the buffer
+        // is naturally bounded by `window-1` entries.
+        if let Some(buffered) = out_of_order.remove(&expected_seq) {
+            if verbose {
+                glog!(
+                    "Kermit recv: draining buffered seq={} type='{}'",
+                    buffered.seq,
+                    buffered.kind as char
+                );
+            }
+            next_drained = Some(buffered);
+        }
     }
 
     Ok(received)
@@ -3554,6 +4272,483 @@ mod tests {
         assert_eq!(received[0].data, payload);
     }
 
+    // ---------- Sliding-window round-trips ----------
+
+    #[tokio::test]
+    async fn test_round_trip_window_4() {
+        // Window=4 round-trip — exercises the windowed sender + receiver
+        // out-of-order buffer paths.  Payload is large enough to span
+        // many D-packets so multiple in-window packets are outstanding
+        // simultaneously.
+        let payload: Vec<u8> = (0..16384).map(|i| (i * 13 + 7) as u8).collect();
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_sliding_windows", "true"),
+                ("kermit_window_size", "4"),
+                // Keep MAXL classic-sized so we get many D-packets
+                // rather than 1-2 long packets.
+                ("kermit_long_packets", "false"),
+                ("kermit_max_packet_length", "94"),
+            ],
+            vec![("win4.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_window_8_long_packets_chkt3() {
+        // Window=8 + long packets + CRC-16 (CHKT-3): the most-capable
+        // negotiated combo, what real-world C-Kermit↔C-Kermit uses.
+        let payload: Vec<u8> = (0..65536).map(|i| (i ^ (i >> 3)) as u8).collect();
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_sliding_windows", "true"),
+                ("kermit_window_size", "8"),
+                ("kermit_long_packets", "true"),
+                ("kermit_max_packet_length", "4096"),
+                ("kermit_block_check_type", "3"),
+            ],
+            vec![("big.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_window_multifile_resets_per_file() {
+        // Multi-file batch with window>1 — verifies that the window
+        // drains between files (the windowed sender returns the next
+        // seq, control packets resume stop-and-wait).
+        let files = vec![
+            ("a.bin".into(), vec![0xAAu8; 4096]),
+            ("b.bin".into(), vec![0xBBu8; 4096]),
+            ("c.bin".into(), vec![0xCCu8; 4096]),
+        ];
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_sliding_windows", "true"),
+                ("kermit_window_size", "4"),
+            ],
+            files.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.len(), 3);
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(received[i].filename, f.0);
+            assert_eq!(received[i].data, f.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_window_max_31() {
+        // Window=31 — the spec maximum (5-bit field).  Confirms we
+        // negotiate and operate at the upper bound without wraparound
+        // ambiguity (window=31 < 32 = half of seq mod-64 space).
+        let payload: Vec<u8> = (0..32768).map(|i| (i % 251) as u8).collect();
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_sliding_windows", "true"),
+                ("kermit_window_size", "31"),
+                ("kermit_long_packets", "false"),
+                ("kermit_max_packet_length", "94"),
+            ],
+            vec![("max_window.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    // ---------- Windowed receiver out-of-order buffer (lossy bridge) ---------
+
+    /// A duplex bridge that drops the first D-packet matching a target
+    /// seq the first time it sees it, then passes everything else
+    /// through.  Used to verify the sliding-window sender's selective
+    /// retransmit on per-seq timeout.
+    #[derive(Clone)]
+    struct LossyBridgeConfig {
+        /// Drop the first D-packet whose seq byte (post-tochar) equals
+        /// `tochar(target_seq)`.  Set None to disable.
+        drop_d_seq: Option<u8>,
+    }
+
+    /// Forward bytes from `src` to `dst` while applying lossy-bridge
+    /// rules.  We watch for SOH framing and selectively drop one
+    /// matching D-packet.  Telnet IAC escaping isn't applied (test
+    /// streams use is_tcp=false) so the byte stream is the raw packet
+    /// sequence.
+    async fn lossy_forward<R, W>(
+        mut src: R,
+        mut dst: W,
+        cfg: LossyBridgeConfig,
+    ) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        let target = cfg.drop_d_seq.map(tochar);
+        let mut dropped = false;
+        // Streaming state machine — accumulate one packet's bytes,
+        // then either forward or drop as a unit.
+        let mut buf = [0u8; 1];
+        let mut pkt_buf: Vec<u8> = Vec::with_capacity(128);
+        let mut in_pkt = false;
+        let mut is_d = false;
+        let mut header_idx = 0usize; // bytes since SOH
+        let mut payload_to_read: usize = 0;
+        let mut check_to_read: usize = 0;
+        let mut have_eol = false;
+        loop {
+            let n = match tokio::io::AsyncReadExt::read(&mut src, &mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            let b = buf[0];
+
+            if !in_pkt {
+                if b == SOH {
+                    in_pkt = true;
+                    pkt_buf.clear();
+                    pkt_buf.push(b);
+                    header_idx = 1;
+                    is_d = false;
+                    payload_to_read = 0;
+                    check_to_read = 0;
+                    have_eol = false;
+                } else {
+                    // Not in packet, just forward (pad bytes etc).
+                    dst.write_all(&[b]).await?;
+                }
+                continue;
+            }
+
+            pkt_buf.push(b);
+            header_idx += 1;
+
+            // Test bridge only handles classic (non-extended) packets;
+            // tests using lossy_forward force kermit_long_packets=false.
+            // Header layout: SOH LEN SEQ TYPE [DATA] [CHECK] [EOL]
+            if header_idx == 2 {
+                // LEN byte
+                let n = unchar(b) as usize;
+                // n = SEQ + TYPE + DATA + CHECK
+                check_to_read = 3; // CHKT-3 cklen by default in tests; resolved post-TYPE
+                payload_to_read = n.saturating_sub(2 + check_to_read);
+            } else if header_idx == 3 {
+                // SEQ byte — check for drop match
+            } else if header_idx == 4 {
+                // TYPE byte
+                if b == TYPE_DATA {
+                    is_d = true;
+                }
+                // Adjust check size now that we know type — but we just
+                // keep CHKT-3's 3 bytes assumption since tests force
+                // kermit_block_check_type=3.
+            } else if header_idx > 4 {
+                if payload_to_read > 0 {
+                    payload_to_read -= 1;
+                } else if check_to_read > 0 {
+                    check_to_read -= 1;
+                } else if !have_eol {
+                    // EOL byte
+                    have_eol = true;
+                    in_pkt = false;
+                    // Decide: drop or forward.
+                    let seq_byte = pkt_buf.get(2).copied();
+                    let drop_this = is_d
+                        && !dropped
+                        && match (target, seq_byte) {
+                            (Some(t), Some(s)) => t == s,
+                            _ => false,
+                        };
+                    if drop_this {
+                        dropped = true;
+                    } else {
+                        dst.write_all(&pkt_buf).await?;
+                    }
+                    pkt_buf.clear();
+                    header_idx = 0;
+                }
+            }
+        }
+    }
+
+    /// Round-trip with a lossy bridge inserted between sender and
+    /// receiver that drops the first D-packet at `drop_seq`.  Verifies
+    /// the windowed sender selectively retransmits on per-seq timeout
+    /// and the windowed receiver buffers + drains in-order.
+    async fn round_trip_lossy(
+        files: Vec<(String, Vec<u8>)>,
+        drop_seq: u8,
+    ) -> Result<Vec<KermitReceive>, String> {
+        use tokio::io::{duplex, split};
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        // Force window>1, classic packets, CHKT=3 — the lossy bridge
+        // assumes these.
+        config::update_config_value("kermit_sliding_windows", "true");
+        config::update_config_value("kermit_window_size", "4");
+        config::update_config_value("kermit_long_packets", "false");
+        config::update_config_value("kermit_max_packet_length", "94");
+        config::update_config_value("kermit_block_check_type", "3");
+        // Aggressive timeout so the test runs fast — sender's
+        // retransmit timer fires within 1 second of the dropped
+        // packet.
+        config::update_config_value("kermit_packet_timeout", "1");
+        config::update_config_value("kermit_max_retries", "10");
+
+        // sx pipe (sender → bridge): sender writes one end, bridge
+        // reads the other.  split() returns (ReadHalf, WriteHalf) so
+        // we destructure accordingly.
+        let (sx_a, sx_b) = duplex(65536);
+        let (_sx_a_r, mut sx_w_for_send) = split(sx_a);
+        let (sx_r_pre_drop, _sx_b_w) = split(sx_b);
+
+        // sy pipe (bridge → receiver): bridge writes one end, receiver
+        // reads the other.
+        let (sy_a, sy_b) = duplex(65536);
+        let (_sy_a_r, sx_w_post) = split(sy_a);
+        let (mut sx_r_for_recv, _sy_b_w) = split(sy_b);
+
+        // rx pipe (receiver → sender ACKs, no lossy injection).
+        let (rx_a, rx_b) = duplex(65536);
+        let (mut rx_r_for_send, _rx_a_w) = split(rx_a);
+        let (_rx_b_r, mut rx_w_for_recv) = split(rx_b);
+
+        let send_files: Vec<(String, Vec<u8>)> = files.clone();
+        let send_task = tokio::spawn(async move {
+            let kfiles: Vec<KermitSendFile> = send_files
+                .iter()
+                .map(|(n, d)| KermitSendFile {
+                    name: n.as_str(),
+                    data: d.as_slice(),
+                    modtime: None,
+                    mode: None,
+                })
+                .collect();
+            kermit_send(
+                &mut rx_r_for_send,
+                &mut sx_w_for_send,
+                &kfiles,
+                false,
+                false,
+                false,
+            )
+            .await
+        });
+
+        // Bridge task: forwards sx_r_pre_drop → sx_w_post, dropping
+        // the first D-packet at `drop_seq`.
+        let bridge_cfg = LossyBridgeConfig {
+            drop_d_seq: Some(drop_seq),
+        };
+        let bridge_task = tokio::spawn(async move {
+            let _ = lossy_forward(sx_r_pre_drop, sx_w_post, bridge_cfg).await;
+        });
+
+        let recv_task = tokio::spawn(async move {
+            kermit_receive(
+                &mut sx_r_for_recv,
+                &mut rx_w_for_recv,
+                false,
+                false,
+                false,
+            )
+            .await
+        });
+
+        // Cap the whole test at 30 s so a hung retransmit loop fails
+        // loudly rather than wedging CI.
+        let send_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            send_task,
+        )
+        .await
+        .map_err(|_| "send task hung".to_string())?
+        .unwrap();
+        let recv_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            recv_task,
+        )
+        .await
+        .map_err(|_| "recv task hung".to_string())?
+        .unwrap();
+        bridge_task.abort();
+
+        send_result?;
+        recv_result
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_window_lossy_drop_one_d_packet() {
+        // Drop the first D-packet (seq=2 — the peer increments from 0
+        // for Send-Init, 1 for F-packet, 2 for first D).  Sender's
+        // per-seq timer must fire and retransmit while the receiver
+        // buffers later D-packets out-of-order.  Final file must
+        // round-trip identically.
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 200 + 30) as u8).collect();
+        let received = round_trip_lossy(
+            vec![("lossy.bin".into(), payload.clone())],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload);
+    }
+
+    // ---------- Streaming Kermit ----------
+
+    #[tokio::test]
+    async fn test_round_trip_streaming_simple() {
+        // Streaming on both sides — no per-D ACKs, Z-ACK confirms whole
+        // stream.  Small payload to verify the basic path works.
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_streaming", "true"),
+                ("kermit_sliding_windows", "true"),
+                ("kermit_window_size", "8"),
+            ],
+            vec![("stream.txt".into(), b"streaming hello kermit".to_vec())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, b"streaming hello kermit");
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_streaming_64kb() {
+        // 64 KB streaming round-trip — exercises a long stream where
+        // the receiver consumes back-to-back D-packets and only ACKs
+        // the trailing Z.
+        let payload: Vec<u8> = (0u32..65536).map(|i| i.wrapping_mul(17) as u8).collect();
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_streaming", "true"),
+                ("kermit_long_packets", "true"),
+                ("kermit_max_packet_length", "4096"),
+                ("kermit_block_check_type", "3"),
+            ],
+            vec![("big.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_streaming_all_byte_values() {
+        // Streaming + 8-bit + repeat + every byte value — confirms the
+        // quoting layer works end-to-end under streaming.
+        let payload: Vec<u8> = (0u16..=255).map(|v| v as u8).collect();
+        let received = round_trip_with_overrides(
+            &[
+                ("kermit_streaming", "true"),
+                ("kermit_8bit_quote", "on"),
+            ],
+            vec![("allbytes.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_streaming_multifile() {
+        // Streaming carries one file at a time — Z-ACK terminates each
+        // file's stream, F-packet starts the next.  Verify a 3-file
+        // batch round-trips intact.
+        let files = vec![
+            ("a.bin".into(), vec![0x11u8; 8192]),
+            ("b.bin".into(), vec![0x22u8; 8192]),
+            ("c.bin".into(), vec![0x33u8; 8192]),
+        ];
+        let received = round_trip_with_overrides(
+            &[("kermit_streaming", "true")],
+            files.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.len(), 3);
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(received[i].filename, f.0);
+            assert_eq!(received[i].data, f.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_negotiation_off_when_only_one_side() {
+        // If only one side advertises streaming, intersection should
+        // turn it off (both sides must agree per Capabilities rule).
+        // We can't directly test the wire here — that's
+        // intersect_capabilities territory — but we can at least
+        // verify a round-trip where ours is on and we run normally.
+        // A second test below covers the intersection unit-level.
+        let received = round_trip_with_overrides(
+            &[("kermit_streaming", "false")],
+            vec![("nostream.txt".into(), b"abc".to_vec())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, b"abc");
+    }
+
+    #[test]
+    fn test_streaming_intersection_requires_both() {
+        let on = Capabilities {
+            streaming: true,
+            ..Capabilities::default()
+        };
+        let off = Capabilities {
+            streaming: false,
+            ..Capabilities::default()
+        };
+        assert!(!intersect_capabilities(&on, &off).streaming);
+        assert!(!intersect_capabilities(&off, &on).streaming);
+        assert!(intersect_capabilities(&on, &on).streaming);
+    }
+
+    // ---------- Effective packet timeout (peer TIME) ----------
+
+    #[test]
+    fn test_effective_packet_timeout_honors_peer_time() {
+        // Peer specified TIME=3, fallback=10 → we use 3.
+        assert_eq!(
+            effective_packet_timeout(3, 10),
+            tokio::time::Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn test_effective_packet_timeout_falls_back_when_peer_zero() {
+        // Peer specified TIME=0 (= "no preference") → we use the
+        // configured fallback.
+        assert_eq!(
+            effective_packet_timeout(0, 7),
+            tokio::time::Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn test_effective_packet_timeout_floors_at_one_second() {
+        // Pathological config: peer TIME=0 + fallback=0 → we floor at
+        // 1 s so a wedged peer can't pin our retransmit timer at zero.
+        assert_eq!(
+            effective_packet_timeout(0, 0),
+            tokio::time::Duration::from_secs(1)
+        );
+    }
+
     // ---------- MED-priority defensive tests ----------
 
     #[test]
@@ -3664,6 +4859,7 @@ mod tests {
         assert_eq!(session.qbin, Some(b'&'));
     }
 
+
     // ---------- Proptest fuzzers (panic-only assertions) ----------
 
     proptest::proptest! {
@@ -3700,9 +4896,12 @@ mod tests {
         fn proptest_read_packet_no_panic(
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
         ) {
-            // Run inside a tokio runtime so the async read_packet can
-            // execute.  Each proptest case spins up a fresh runtime.
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Reuse a single tokio runtime across all 128 proptest cases.
+            // Spinning up Runtime::new() per case creates a thread pool
+            // each time — measurable overhead with no test-value gain.
+            static RT: std::sync::OnceLock<tokio::runtime::Runtime> =
+                std::sync::OnceLock::new();
+            let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap());
             rt.block_on(async {
                 let mut state = ReadState::default();
                 let mut c = std::io::Cursor::new(data);

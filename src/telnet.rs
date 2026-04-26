@@ -3750,6 +3750,10 @@ impl TelnetSession {
         };
         let kermit_iac = config::get_config().kermit_iac_escape;
         let is_petscii = self.terminal_type == TerminalType::Petscii;
+        // Captured by the Kermit branch's mapping closure when the
+        // peer's flavor is detected.  Surfaced in the post-transfer
+        // summary so the user sees who they talked to.
+        let mut kermit_flavor: Option<String> = None;
         let result: Result<Received, String> = match protocol {
             UploadProtocol::Zmodem => crate::zmodem::zmodem_receive(
                 &mut self.reader,
@@ -3782,6 +3786,9 @@ impl TelnetSession {
             )
             .await
             .map(|rxs| {
+                // Capture flavor (per-session, identical across files
+                // in a batch).
+                kermit_flavor = rxs.first().map(|r| r.flavor.display());
                 // Map KermitReceive list to (Option<filename>, data, None).
                 // First file gets None for filename so user-entered name
                 // wins (matches XMODEM/YMODEM behavior); subsequent files
@@ -3946,6 +3953,12 @@ impl TelnetSession {
                 ))
                 .await?;
             }
+        }
+        // Surface detected Kermit flavor (auto-classified from the
+        // peer's Send-Init / peer_id) so users see whom they talked to.
+        if let Some(flavor) = &kermit_flavor {
+            self.send_line(&format!("  {} {}", self.dim("Peer:"), flavor))
+                .await?;
         }
         self.send_line("").await?;
         self.send("  Press any key to continue.").await?;
