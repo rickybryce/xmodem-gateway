@@ -42,14 +42,14 @@ pub fn run(cfg: Config, shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title(format!("Vintage Gateway v{}", env!("CARGO_PKG_VERSION")))
+                .with_title(format!("Ethernet Gateway v{}", env!("CARGO_PKG_VERSION")))
                 .with_inner_size([1120.0, 810.0])
                 .with_min_inner_size([640.0, 480.0]),
             ..Default::default()
         };
 
         eframe::run_native(
-            "Vintage Gateway",
+            "Ethernet Gateway",
             options,
             Box::new(|cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -1092,7 +1092,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.heading(
                         egui::RichText::new(format!(
-                            "Vintage Gateway v{}",
+                            "Ethernet Gateway v{}",
                             env!("CARGO_PKG_VERSION")
                         ))
                         .strong()
@@ -1281,7 +1281,7 @@ impl eframe::App for App {
                         .clicked()
                     {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
-                            "https://github.com/rickybryce/vintage-gateway/blob/master/usermanual.pdf",
+                            "https://github.com/rickybryce/ethernet-gateway/blob/master/usermanual.pdf",
                         ));
                     }
                 });
@@ -1321,7 +1321,7 @@ impl eframe::App for App {
                         |ui| {
                             ui.add_space(-32.0);
                             ui.add(
-                                egui::Image::new(egui::include_image!("../vintagelogo.png"))
+                                egui::Image::new(egui::include_image!("../ethernetgatewaylogo.png"))
                                     .texture_options(egui::TextureOptions {
                                         magnification: egui::TextureFilter::Linear,
                                         minification: egui::TextureFilter::Linear,

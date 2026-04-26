@@ -1,10 +1,10 @@
-//! SSH server interface for the Vintage Gateway.
+//! SSH server interface for the Ethernet Gateway.
 //!
 //! Provides encrypted access to the same menus and features available over
 //! telnet.  Uses russh's server implementation with an Ed25519 host key
-//! that is generated on first run and persisted to `vintage_ssh_host_key`.
+//! that is generated on first run and persisted to `ethernet_ssh_host_key`.
 //! Authentication is password-based with credentials configured independently
-//! of the telnet credentials in `vgateway.conf`.
+//! of the telnet credentials in `egateway.conf`.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,13 +17,13 @@ use crate::config;
 use crate::logger::glog;
 use crate::telnet;
 
-const SSH_HOST_KEY_FILE: &str = "vintage_ssh_host_key";
+const SSH_HOST_KEY_FILE: &str = "ethernet_ssh_host_key";
 /// Client keypair used by the outgoing SSH gateway to authenticate
 /// against remote servers via public-key authentication.  Generated on
 /// first use and persisted for the lifetime of the deployment so that
 /// the operator can add the same public key to remote `authorized_keys`
 /// files once and reuse it across sessions.
-pub(crate) const GATEWAY_CLIENT_KEY_FILE: &str = "vintage_gateway_ssh_key";
+pub(crate) const GATEWAY_CLIENT_KEY_FILE: &str = "ethernet_gateway_ssh_key";
 
 // ─── Public API ────────────────────────────────────────────
 
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_host_key_file_constant() {
-        assert_eq!(SSH_HOST_KEY_FILE, "vintage_ssh_host_key");
+        assert_eq!(SSH_HOST_KEY_FILE, "ethernet_ssh_host_key");
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_gateway_client_key_file_constant() {
-        assert_eq!(GATEWAY_CLIENT_KEY_FILE, "vintage_gateway_ssh_key");
+        assert_eq!(GATEWAY_CLIENT_KEY_FILE, "ethernet_gateway_ssh_key");
     }
 
     /// The generator is expected to produce an Ed25519 keypair whose

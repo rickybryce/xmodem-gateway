@@ -1,5 +1,5 @@
 /target
-vgateway.conf
+egateway.conf
 *.swp
 *.swo
 *~
