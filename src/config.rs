@@ -1,6 +1,6 @@
 //! Configuration file management.
 //!
-//! Reads/writes a simple key=value config file (`vgateway.conf`). If the file
+//! Reads/writes a simple key=value config file (`egateway.conf`). If the file
 //! does not exist at startup it is created with sensible defaults. Unknown
 //! keys are silently ignored; missing keys are filled with defaults and the
 //! file is rewritten.
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::logger::glog;
 
 /// Name of the configuration file (lives next to the binary).
-pub const CONFIG_FILE: &str = "vgateway.conf";
+pub const CONFIG_FILE: &str = "egateway.conf";
 
 // ─── Defaults ──────────────────────────────────────────────
 const DEFAULT_TELNET_ENABLED: bool = true;
@@ -74,6 +74,56 @@ const DEFAULT_ZMODEM_MAX_RETRIES: u32 = 10;
 /// the session for long.  The per-session budget is still bounded by
 /// `zmodem_negotiation_timeout`.
 const DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL: u64 = 5;
+/// Kermit negotiation timeout: how long the sender/receiver keeps
+/// retrying the Send-Init handshake before giving up.
+const DEFAULT_KERMIT_NEGOTIATION_TIMEOUT: u64 = 45;
+/// Kermit per-packet read timeout in seconds — bounds how long we
+/// wait for the next response after sending a packet.
+const DEFAULT_KERMIT_PACKET_TIMEOUT: u64 = 10;
+/// Kermit max retries per packet (NAK / timeout retransmits).
+const DEFAULT_KERMIT_MAX_RETRIES: u32 = 5;
+/// Kermit advertised max packet length (10..=9024).  4096 strikes a
+/// balance between throughput and re-transmit cost on a flaky line.
+const DEFAULT_KERMIT_MAX_PACKET_LENGTH: u16 = 4096;
+/// Kermit sliding-window size (1..=31).  1 is stop-and-wait; 4 is a
+/// conservative streaming-friendly default.
+const DEFAULT_KERMIT_WINDOW_SIZE: u8 = 4;
+/// Kermit block-check type advertised: 1 = 6-bit checksum, 2 = 12-bit
+/// checksum, 3 = CRC-16/KERMIT.  Default 3 (strongest).
+const DEFAULT_KERMIT_BLOCK_CHECK_TYPE: u8 = 3;
+const DEFAULT_KERMIT_LONG_PACKETS: bool = true;
+const DEFAULT_KERMIT_SLIDING_WINDOWS: bool = true;
+/// Streaming Kermit: peer skips ACKing each packet on reliable links
+/// (TCP/SSH).  Default true; turn off only if your remote side bridges
+/// into an unreliable serial line.
+const DEFAULT_KERMIT_STREAMING: bool = true;
+const DEFAULT_KERMIT_ATTRIBUTE_PACKETS: bool = true;
+const DEFAULT_KERMIT_REPEAT_COMPRESSION: bool = true;
+/// Kermit 8th-bit quoting policy: "auto" (only when peer asks),
+/// "on" (always), "off" (never).
+const DEFAULT_KERMIT_8BIT_QUOTE: &str = "auto";
+/// Kermit per-session telnet IAC escape — separate from XMODEM's
+/// `xmodem_iac` so an operator can run telnet ↔ raw-bytes Kermit
+/// transfers independently of the XMODEM family setting.
+const DEFAULT_KERMIT_IAC_ESCAPE: bool = false;
+/// Resume partial uploads (Frank da Cruz spec §5.1, disposition='R').
+/// When true, the receiver tells the sender to skip bytes already on
+/// disk under `transfer_dir/<filename>`.  Default false: opt-in,
+/// because a peer that ignores disposition='R' would re-send from
+/// byte 0 and produce a corrupted file once we land the receiver
+/// pre-load logic in commit 2.
+const DEFAULT_KERMIT_RESUME_PARTIAL: bool = false;
+/// Maximum age (hours) of a partial file we'll resume.  Older
+/// partials are treated as stale rot rather than legitimate
+/// resumable transfers.  168 = one week.
+const DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS: u32 = 168;
+/// Locking-shift mode (Frank da Cruz spec §3.4.5): when both peers
+/// advertise CAPAS_LOCKING_SHIFT, the encoder uses SO/SI region
+/// markers instead of QBIN's per-byte 8th-bit prefix.  Off by
+/// default — no modern Kermit peer (C-Kermit, G-Kermit, Kermit-95,
+/// E-Kermit) negotiates it; flip it on if you're talking to a
+/// strict-spec implementation that does.
+const DEFAULT_KERMIT_LOCKING_SHIFTS: bool = false;
 const DEFAULT_SERIAL_ECHO: bool = true;
 const DEFAULT_SERIAL_VERBOSE: bool = true;
 const DEFAULT_SERIAL_QUIET: bool = false;
@@ -105,7 +155,7 @@ const DEFAULT_SSH_PASSWORD: &str = "changeme";
 /// public key on the remote's `~/.ssh/authorized_keys`.
 const DEFAULT_SSH_GATEWAY_AUTH: &str = "password";
 
-/// Runtime configuration loaded from `vgateway.conf`.
+/// Runtime configuration loaded from `egateway.conf`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Enable the telnet server. Set to false for SSH-only access.
@@ -162,6 +212,43 @@ pub struct Config {
     /// negotiation handshake.  Analogous to
     /// `xmodem_negotiation_retry_interval` for the XMODEM family.
     pub zmodem_negotiation_retry_interval: u64,
+    /// Kermit negotiation timeout (Send-Init handshake) in seconds.
+    pub kermit_negotiation_timeout: u64,
+    /// Kermit per-packet read timeout in seconds.
+    pub kermit_packet_timeout: u64,
+    /// Kermit max retries per packet.
+    pub kermit_max_retries: u32,
+    /// Advertised max packet length in our Send-Init (10..=9024).
+    pub kermit_max_packet_length: u16,
+    /// Sliding window size advertised (1..=31).  1 = stop-and-wait.
+    pub kermit_window_size: u8,
+    /// Block-check type advertised (1=6-bit, 2=12-bit, 3=CRC-16/KERMIT).
+    pub kermit_block_check_type: u8,
+    /// Advertise long-packets capability.
+    pub kermit_long_packets: bool,
+    /// Advertise sliding-window capability.
+    pub kermit_sliding_windows: bool,
+    /// Advertise streaming capability.  Auto-degrades to sliding/stop-
+    /// and-wait if the peer doesn't advertise it.
+    pub kermit_streaming: bool,
+    /// Advertise attribute-packet (A) support.
+    pub kermit_attribute_packets: bool,
+    /// Use repeat-count compression.
+    pub kermit_repeat_compression: bool,
+    /// 8th-bit quoting policy: "auto" / "on" / "off".
+    pub kermit_8bit_quote: String,
+    /// Telnet IAC escape during Kermit transfers.
+    pub kermit_iac_escape: bool,
+    /// Resume partial uploads via the spec's disposition='R' tag in the
+    /// receiver's A-packet ACK.  Off by default; flip on once both sides
+    /// are known to honor it (we ship sender support in a follow-up).
+    pub kermit_resume_partial: bool,
+    /// Max age in hours for a partial file to qualify for resume.
+    /// Older partials are ignored (treated as stale rot).
+    pub kermit_resume_max_age_hours: u32,
+    /// Advertise locking-shift (SO/SI) capability for 8-bit transit
+    /// over 7-bit-only links.  Off by default; modern peers use QBIN.
+    pub kermit_locking_shifts: bool,
     /// Enable serial modem emulation.
     pub serial_enabled: bool,
     /// Serial port device (e.g. /dev/ttyUSB0, COM3). Empty = not configured.
@@ -236,6 +323,22 @@ impl Default for Config {
             zmodem_frame_timeout: DEFAULT_ZMODEM_FRAME_TIMEOUT,
             zmodem_max_retries: DEFAULT_ZMODEM_MAX_RETRIES,
             zmodem_negotiation_retry_interval: DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL,
+            kermit_negotiation_timeout: DEFAULT_KERMIT_NEGOTIATION_TIMEOUT,
+            kermit_packet_timeout: DEFAULT_KERMIT_PACKET_TIMEOUT,
+            kermit_max_retries: DEFAULT_KERMIT_MAX_RETRIES,
+            kermit_max_packet_length: DEFAULT_KERMIT_MAX_PACKET_LENGTH,
+            kermit_window_size: DEFAULT_KERMIT_WINDOW_SIZE,
+            kermit_block_check_type: DEFAULT_KERMIT_BLOCK_CHECK_TYPE,
+            kermit_long_packets: DEFAULT_KERMIT_LONG_PACKETS,
+            kermit_sliding_windows: DEFAULT_KERMIT_SLIDING_WINDOWS,
+            kermit_streaming: DEFAULT_KERMIT_STREAMING,
+            kermit_attribute_packets: DEFAULT_KERMIT_ATTRIBUTE_PACKETS,
+            kermit_repeat_compression: DEFAULT_KERMIT_REPEAT_COMPRESSION,
+            kermit_8bit_quote: DEFAULT_KERMIT_8BIT_QUOTE.into(),
+            kermit_iac_escape: DEFAULT_KERMIT_IAC_ESCAPE,
+            kermit_resume_partial: DEFAULT_KERMIT_RESUME_PARTIAL,
+            kermit_resume_max_age_hours: DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS,
+            kermit_locking_shifts: DEFAULT_KERMIT_LOCKING_SHIFTS,
             serial_enabled: DEFAULT_SERIAL_ENABLED,
             serial_port: DEFAULT_SERIAL_PORT.into(),
             serial_baud: DEFAULT_SERIAL_BAUD,
@@ -422,6 +525,78 @@ fn read_config_file(path: &str) -> Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &u64| v >= 1)
             .unwrap_or(DEFAULT_ZMODEM_NEGOTIATION_RETRY_INTERVAL),
+        kermit_negotiation_timeout: map
+            .get("kermit_negotiation_timeout")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_KERMIT_NEGOTIATION_TIMEOUT),
+        kermit_packet_timeout: map
+            .get("kermit_packet_timeout")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u64| v >= 1)
+            .unwrap_or(DEFAULT_KERMIT_PACKET_TIMEOUT),
+        kermit_max_retries: map
+            .get("kermit_max_retries")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u32| v >= 1)
+            .unwrap_or(DEFAULT_KERMIT_MAX_RETRIES),
+        kermit_max_packet_length: map
+            .get("kermit_max_packet_length")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u16| (10..=9024).contains(&v))
+            .unwrap_or(DEFAULT_KERMIT_MAX_PACKET_LENGTH),
+        kermit_window_size: map
+            .get("kermit_window_size")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u8| (1..=31).contains(&v))
+            .unwrap_or(DEFAULT_KERMIT_WINDOW_SIZE),
+        kermit_block_check_type: map
+            .get("kermit_block_check_type")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u8| matches!(v, 1..=3))
+            .unwrap_or(DEFAULT_KERMIT_BLOCK_CHECK_TYPE),
+        kermit_long_packets: map
+            .get("kermit_long_packets")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_LONG_PACKETS),
+        kermit_sliding_windows: map
+            .get("kermit_sliding_windows")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_SLIDING_WINDOWS),
+        kermit_streaming: map
+            .get("kermit_streaming")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_STREAMING),
+        kermit_attribute_packets: map
+            .get("kermit_attribute_packets")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_ATTRIBUTE_PACKETS),
+        kermit_repeat_compression: map
+            .get("kermit_repeat_compression")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_REPEAT_COMPRESSION),
+        kermit_8bit_quote: map
+            .get("kermit_8bit_quote")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| matches!(v.as_str(), "auto" | "on" | "off"))
+            .unwrap_or_else(|| DEFAULT_KERMIT_8BIT_QUOTE.into()),
+        kermit_iac_escape: map
+            .get("kermit_iac_escape")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_IAC_ESCAPE),
+        kermit_resume_partial: map
+            .get("kermit_resume_partial")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_RESUME_PARTIAL),
+        kermit_resume_max_age_hours: map
+            .get("kermit_resume_max_age_hours")
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &u32| v >= 1)
+            .unwrap_or(DEFAULT_KERMIT_RESUME_MAX_AGE_HOURS),
+        kermit_locking_shifts: map
+            .get("kermit_locking_shifts")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(DEFAULT_KERMIT_LOCKING_SHIFTS),
         serial_enabled: map
             .get("serial_enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -546,7 +721,7 @@ pub fn save_config(cfg: &Config) {
 fn write_config_file(path: &str, cfg: &Config) {
     let content = format!(
         "\
-# Vintage Gateway Configuration
+# Ethernet Gateway Configuration
 #
 # This file is auto-generated if it does not exist.
 # Edit values below to customise the server.
@@ -631,6 +806,55 @@ zmodem_frame_timeout = {}
 zmodem_max_retries = {}
 zmodem_negotiation_retry_interval = {}
 
+# Kermit protocol tunables.
+# kermit_negotiation_timeout:  seconds to wait for the Send-Init handshake.
+# kermit_packet_timeout:       seconds to wait for each packet response.
+# kermit_max_retries:          retry limit per packet on NAK / timeout.
+# kermit_max_packet_length:    advertised MAXL (10..=9024).  Long packets are
+#                              negotiated separately; values >94 require the
+#                              peer to also support extended-length packets.
+# kermit_window_size:          sliding-window depth (1..=31).  1 = stop-and-wait.
+# kermit_block_check_type:     1 = 6-bit checksum, 2 = 12-bit, 3 = CRC-16/KERMIT.
+# kermit_long_packets:         advertise long-packet capability.
+# kermit_sliding_windows:      advertise sliding-window capability.
+# kermit_streaming:            advertise streaming-Kermit (no per-packet ACKs).
+#                              Big speed win on TCP/SSH; turn this off only if
+#                              your remote side bridges into an unreliable
+#                              serial line (some WiFi modems do this).
+# kermit_attribute_packets:    advertise A-packet (file metadata) support.
+# kermit_repeat_compression:   use repeat-count compression (RLE).
+# kermit_8bit_quote:           auto (only when peer asks), on, or off.
+# kermit_iac_escape:           apply telnet IAC escaping during transfers.
+# kermit_resume_partial:       resume partial uploads (spec disposition='R').
+#                              Off by default; turn on only when the peer is
+#                              known to honor disposition='R' in the A-packet
+#                              ACK, otherwise the transfer can corrupt the
+#                              file.
+# kermit_resume_max_age_hours: ignore on-disk partials older than this when
+#                              deciding whether to resume.  168 = one week.
+# kermit_locking_shifts:       advertise SO/SI region-shift capability for
+#                              8-bit transit on 7-bit links (Frank da Cruz
+#                              §3.4.5).  Off by default — no modern Kermit
+#                              peer (C-Kermit, G-Kermit, Kermit-95, E-Kermit)
+#                              negotiates it; flip on only if you're talking
+#                              to a strict-spec implementation that does.
+kermit_negotiation_timeout = {}
+kermit_packet_timeout = {}
+kermit_max_retries = {}
+kermit_max_packet_length = {}
+kermit_window_size = {}
+kermit_block_check_type = {}
+kermit_long_packets = {}
+kermit_sliding_windows = {}
+kermit_streaming = {}
+kermit_attribute_packets = {}
+kermit_repeat_compression = {}
+kermit_8bit_quote = {}
+kermit_iac_escape = {}
+kermit_resume_partial = {}
+kermit_resume_max_age_hours = {}
+kermit_locking_shifts = {}
+
 # Serial modem emulation (Hayes AT commands)
 # Set serial_enabled = true and configure the port to activate.
 serial_enabled = {}
@@ -685,7 +909,7 @@ ssh_password = {}
 # proxies to a remote SSH server).  Values:
 #   key      — use the gateway's built-in Ed25519 client key.  Copy the
 #              public half (shown in the GUI Server > More popup, or
-#              extract with `ssh-keygen -y -f vintage_gateway_ssh_key`)
+#              extract with `ssh-keygen -y -f ethernet_gateway_ssh_key`)
 #              into the remote's ~/.ssh/authorized_keys first.
 #   password — prompt the operator for the remote account's password on
 #              each connect.  No key is offered.
@@ -714,6 +938,22 @@ ssh_gateway_auth = {}
         cfg.zmodem_frame_timeout,
         cfg.zmodem_max_retries,
         cfg.zmodem_negotiation_retry_interval,
+        cfg.kermit_negotiation_timeout,
+        cfg.kermit_packet_timeout,
+        cfg.kermit_max_retries,
+        cfg.kermit_max_packet_length,
+        cfg.kermit_window_size,
+        cfg.kermit_block_check_type,
+        cfg.kermit_long_packets,
+        cfg.kermit_sliding_windows,
+        cfg.kermit_streaming,
+        cfg.kermit_attribute_packets,
+        cfg.kermit_repeat_compression,
+        sanitize_value(&cfg.kermit_8bit_quote),
+        cfg.kermit_iac_escape,
+        cfg.kermit_resume_partial,
+        cfg.kermit_resume_max_age_hours,
+        cfg.kermit_locking_shifts,
         cfg.serial_enabled,
         sanitize_value(&cfg.serial_port),
         cfg.serial_baud,
@@ -865,6 +1105,71 @@ fn apply_config_key(cfg: &mut Config, key: &str, value: &str) {
             if let Ok(v) = value.parse::<u64>() && v >= 1 {
                 cfg.zmodem_negotiation_retry_interval = v;
             }
+        }
+        "kermit_negotiation_timeout" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.kermit_negotiation_timeout = v;
+            }
+        }
+        "kermit_packet_timeout" => {
+            if let Ok(v) = value.parse::<u64>() && v >= 1 {
+                cfg.kermit_packet_timeout = v;
+            }
+        }
+        "kermit_max_retries" => {
+            if let Ok(v) = value.parse::<u32>() && v >= 1 {
+                cfg.kermit_max_retries = v;
+            }
+        }
+        "kermit_max_packet_length" => {
+            if let Ok(v) = value.parse::<u16>() && (10..=9024).contains(&v) {
+                cfg.kermit_max_packet_length = v;
+            }
+        }
+        "kermit_window_size" => {
+            if let Ok(v) = value.parse::<u8>() && (1..=31).contains(&v) {
+                cfg.kermit_window_size = v;
+            }
+        }
+        "kermit_block_check_type" => {
+            if let Ok(v) = value.parse::<u8>() && matches!(v, 1..=3) {
+                cfg.kermit_block_check_type = v;
+            }
+        }
+        "kermit_long_packets" => {
+            cfg.kermit_long_packets = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_sliding_windows" => {
+            cfg.kermit_sliding_windows = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_streaming" => {
+            cfg.kermit_streaming = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_attribute_packets" => {
+            cfg.kermit_attribute_packets = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_repeat_compression" => {
+            cfg.kermit_repeat_compression = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_8bit_quote" => {
+            let lower = value.trim().to_ascii_lowercase();
+            if matches!(lower.as_str(), "auto" | "on" | "off") {
+                cfg.kermit_8bit_quote = lower;
+            }
+        }
+        "kermit_iac_escape" => {
+            cfg.kermit_iac_escape = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_resume_partial" => {
+            cfg.kermit_resume_partial = value.eq_ignore_ascii_case("true");
+        }
+        "kermit_resume_max_age_hours" => {
+            if let Ok(v) = value.parse::<u32>() && v >= 1 {
+                cfg.kermit_resume_max_age_hours = v;
+            }
+        }
+        "kermit_locking_shifts" => {
+            cfg.kermit_locking_shifts = value.eq_ignore_ascii_case("true");
         }
         "serial_enabled" => cfg.serial_enabled = value.eq_ignore_ascii_case("true"),
         "serial_port" => cfg.serial_port = value.to_string(),
@@ -1089,6 +1394,22 @@ mod tests {
         assert_eq!(cfg.zmodem_frame_timeout, 30);
         assert_eq!(cfg.zmodem_max_retries, 10);
         assert_eq!(cfg.zmodem_negotiation_retry_interval, 5);
+        assert_eq!(cfg.kermit_negotiation_timeout, 45);
+        assert_eq!(cfg.kermit_packet_timeout, 10);
+        assert_eq!(cfg.kermit_max_retries, 5);
+        assert_eq!(cfg.kermit_max_packet_length, 4096);
+        assert_eq!(cfg.kermit_window_size, 4);
+        assert_eq!(cfg.kermit_block_check_type, 3);
+        assert!(cfg.kermit_long_packets);
+        assert!(cfg.kermit_sliding_windows);
+        assert!(cfg.kermit_streaming);
+        assert!(cfg.kermit_attribute_packets);
+        assert!(cfg.kermit_repeat_compression);
+        assert_eq!(cfg.kermit_8bit_quote, "auto");
+        assert!(!cfg.kermit_iac_escape);
+        assert!(!cfg.kermit_resume_partial);
+        assert_eq!(cfg.kermit_resume_max_age_hours, 168);
+        assert!(!cfg.kermit_locking_shifts);
         assert!(!cfg.serial_enabled);
         assert_eq!(cfg.serial_port, "");
         assert_eq!(cfg.serial_baud, 9600);
@@ -1264,6 +1585,22 @@ mod tests {
             zmodem_frame_timeout: 45,
             zmodem_max_retries: 7,
             zmodem_negotiation_retry_interval: 8,
+            kermit_negotiation_timeout: 60,
+            kermit_packet_timeout: 12,
+            kermit_max_retries: 8,
+            kermit_max_packet_length: 2048,
+            kermit_window_size: 8,
+            kermit_block_check_type: 2,
+            kermit_long_packets: false,
+            kermit_sliding_windows: false,
+            kermit_streaming: false,
+            kermit_attribute_packets: false,
+            kermit_repeat_compression: false,
+            kermit_8bit_quote: "on".into(),
+            kermit_iac_escape: true,
+            kermit_resume_partial: true,
+            kermit_resume_max_age_hours: 72,
+            kermit_locking_shifts: true,
             serial_enabled: true,
             serial_port: "/dev/ttyUSB0".into(),
             serial_baud: 115200,
@@ -1325,6 +1662,49 @@ mod tests {
         assert_eq!(
             loaded.zmodem_negotiation_retry_interval,
             original.zmodem_negotiation_retry_interval
+        );
+        assert_eq!(
+            loaded.kermit_negotiation_timeout,
+            original.kermit_negotiation_timeout
+        );
+        assert_eq!(loaded.kermit_packet_timeout, original.kermit_packet_timeout);
+        assert_eq!(loaded.kermit_max_retries, original.kermit_max_retries);
+        assert_eq!(
+            loaded.kermit_max_packet_length,
+            original.kermit_max_packet_length
+        );
+        assert_eq!(loaded.kermit_window_size, original.kermit_window_size);
+        assert_eq!(
+            loaded.kermit_block_check_type,
+            original.kermit_block_check_type
+        );
+        assert_eq!(loaded.kermit_long_packets, original.kermit_long_packets);
+        assert_eq!(
+            loaded.kermit_sliding_windows,
+            original.kermit_sliding_windows
+        );
+        assert_eq!(loaded.kermit_streaming, original.kermit_streaming);
+        assert_eq!(
+            loaded.kermit_attribute_packets,
+            original.kermit_attribute_packets
+        );
+        assert_eq!(
+            loaded.kermit_repeat_compression,
+            original.kermit_repeat_compression
+        );
+        assert_eq!(loaded.kermit_8bit_quote, original.kermit_8bit_quote);
+        assert_eq!(loaded.kermit_iac_escape, original.kermit_iac_escape);
+        assert_eq!(
+            loaded.kermit_resume_partial,
+            original.kermit_resume_partial
+        );
+        assert_eq!(
+            loaded.kermit_resume_max_age_hours,
+            original.kermit_resume_max_age_hours
+        );
+        assert_eq!(
+            loaded.kermit_locking_shifts,
+            original.kermit_locking_shifts
         );
         assert_eq!(loaded.serial_enabled, original.serial_enabled);
         assert_eq!(loaded.serial_port, original.serial_port);
@@ -1614,7 +1994,7 @@ mod tests {
     }
 
     /// When zmodem keys are absent from the file, defaults kick in.
-    /// Covers the rollout case where an existing vgateway.conf predates
+    /// Covers the rollout case where an existing egateway.conf predates
     /// the zmodem_* additions.
     #[test]
     fn test_read_config_missing_zmodem_keys_fall_back_to_defaults() {

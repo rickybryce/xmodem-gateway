@@ -1,8 +1,10 @@
 /target
-vgateway.conf
+egateway.conf
 *.swp
 *.swo
 *~
 CLAUDE.md
+todo.md
+.claude/
 *.AppImage
 *.AppImage.sha256

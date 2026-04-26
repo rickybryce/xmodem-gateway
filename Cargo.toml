@@ -1,12 +1,12 @@
 [package]
-name = "vintage-gateway"
-version = "0.4.0"
+name = "ethernet-gateway"
+version = "0.5.1"
 edition = "2024"
 authors = ["Ricky Bryce"]
 license = "GPL-3.0-or-later"
 description = "Telnet/SSH gateway and Hayes AT modem emulator for retro terminals — PETSCII, ANSI, and ASCII. Bridges Commodore 64, CP/M, and similar machines to modern networks with XMODEM/XMODEM-1K/YMODEM/ZMODEM file transfer, a web browser, AI chat, weather, SSH and telnet gateways."
-repository = "https://github.com/rickybryce/vintage-gateway"
-homepage = "https://github.com/rickybryce/vintage-gateway"
+repository = "https://github.com/rickybryce/ethernet-gateway"
+homepage = "https://github.com/rickybryce/ethernet-gateway"
 readme = "README.md"
 keywords = ["telnet", "ssh", "zmodem", "xmodem", "retrocomputing"]
 categories = ["command-line-utilities", "network-programming", "emulators"]
@@ -18,7 +18,7 @@ exclude = [
     "/.github",
     "/index.html",
     "*.AppImage",
-    "vgateway.conf",
+    "egateway.conf",
     "CLAUDE.md",
 ]
 

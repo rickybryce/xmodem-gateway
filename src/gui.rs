@@ -42,14 +42,14 @@ pub fn run(cfg: Config, shutdown: Arc<AtomicBool>, restart: Arc<AtomicBool>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title(format!("Vintage Gateway v{}", env!("CARGO_PKG_VERSION")))
+                .with_title(format!("Ethernet Gateway v{}", env!("CARGO_PKG_VERSION")))
                 .with_inner_size([1120.0, 810.0])
                 .with_min_inner_size([640.0, 480.0]),
             ..Default::default()
         };
 
         eframe::run_native(
-            "Vintage Gateway",
+            "Ethernet Gateway",
             options,
             Box::new(|cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -220,6 +220,12 @@ struct App {
     zmodem_frame_timeout_buf: String,
     zmodem_max_retries_buf: String,
     zmodem_negotiation_retry_interval_buf: String,
+    kermit_negotiation_timeout_buf: String,
+    kermit_packet_timeout_buf: String,
+    kermit_max_retries_buf: String,
+    kermit_max_packet_length_buf: String,
+    kermit_window_size_buf: String,
+    kermit_block_check_type_buf: String,
     serial_baud_buf: String,
     // Detected serial ports for the dropdown
     serial_ports: Vec<String>,
@@ -256,6 +262,12 @@ impl App {
         let zmodem_max_retries_buf = cfg.zmodem_max_retries.to_string();
         let zmodem_negotiation_retry_interval_buf =
             cfg.zmodem_negotiation_retry_interval.to_string();
+        let kermit_negotiation_timeout_buf = cfg.kermit_negotiation_timeout.to_string();
+        let kermit_packet_timeout_buf = cfg.kermit_packet_timeout.to_string();
+        let kermit_max_retries_buf = cfg.kermit_max_retries.to_string();
+        let kermit_max_packet_length_buf = cfg.kermit_max_packet_length.to_string();
+        let kermit_window_size_buf = cfg.kermit_window_size.to_string();
+        let kermit_block_check_type_buf = cfg.kermit_block_check_type.to_string();
         let serial_baud_buf = cfg.serial_baud.to_string();
         let serial_ports = detect_serial_ports();
         let last_synced_cfg = cfg.clone();
@@ -279,6 +291,12 @@ impl App {
             zmodem_frame_timeout_buf,
             zmodem_max_retries_buf,
             zmodem_negotiation_retry_interval_buf,
+            kermit_negotiation_timeout_buf,
+            kermit_packet_timeout_buf,
+            kermit_max_retries_buf,
+            kermit_max_packet_length_buf,
+            kermit_window_size_buf,
+            kermit_block_check_type_buf,
             serial_baud_buf,
             serial_ports,
             dirty: false,
@@ -302,6 +320,12 @@ impl App {
         if let Ok(v) = self.zmodem_frame_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.zmodem_frame_timeout = v; }
         if let Ok(v) = self.zmodem_max_retries_buf.parse::<u32>() && v >= 1 { self.cfg.zmodem_max_retries = v; }
         if let Ok(v) = self.zmodem_negotiation_retry_interval_buf.parse::<u64>() && v >= 1 { self.cfg.zmodem_negotiation_retry_interval = v; }
+        if let Ok(v) = self.kermit_negotiation_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.kermit_negotiation_timeout = v; }
+        if let Ok(v) = self.kermit_packet_timeout_buf.parse::<u64>() && v >= 1 { self.cfg.kermit_packet_timeout = v; }
+        if let Ok(v) = self.kermit_max_retries_buf.parse::<u32>() && v >= 1 { self.cfg.kermit_max_retries = v; }
+        if let Ok(v) = self.kermit_max_packet_length_buf.parse::<u16>() && (10..=9024).contains(&v) { self.cfg.kermit_max_packet_length = v; }
+        if let Ok(v) = self.kermit_window_size_buf.parse::<u8>() && (1..=31).contains(&v) { self.cfg.kermit_window_size = v; }
+        if let Ok(v) = self.kermit_block_check_type_buf.parse::<u8>() && matches!(v, 1..=3) { self.cfg.kermit_block_check_type = v; }
         if let Ok(v) = self.serial_baud_buf.parse::<u32>() && v >= 300 { self.cfg.serial_baud = v; }
     }
 
@@ -701,6 +725,82 @@ impl App {
                     .small(),
             );
         });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("KERMIT").strong().color(AMBER));
+        ui.label(
+            egui::RichText::new(
+                "Full-spec Kermit — auto-negotiates with the peer's CAPAS bits. \
+                 Streaming is a big speed win on TCP/SSH; turn it off only when \
+                 bridging into an unreliable serial line.",
+            )
+            .italics()
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            labeled_field(
+                ui,
+                "Negotiate (s):",
+                &mut self.kermit_negotiation_timeout_buf,
+                50.0,
+            );
+            labeled_field(
+                ui,
+                "Packet (s):",
+                &mut self.kermit_packet_timeout_buf,
+                50.0,
+            );
+            labeled_field(ui, "Retries:", &mut self.kermit_max_retries_buf, 50.0);
+        });
+        ui.horizontal(|ui| {
+            labeled_field(
+                ui,
+                "Max packet:",
+                &mut self.kermit_max_packet_length_buf,
+                60.0,
+            );
+            labeled_field(ui, "Window:", &mut self.kermit_window_size_buf, 40.0);
+            labeled_field(
+                ui,
+                "Check (1/2/3):",
+                &mut self.kermit_block_check_type_buf,
+                40.0,
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.cfg.kermit_long_packets, "Long packets");
+            ui.checkbox(&mut self.cfg.kermit_sliding_windows, "Sliding window");
+            ui.checkbox(&mut self.cfg.kermit_streaming, "Streaming");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.cfg.kermit_attribute_packets, "Attribute pkts");
+            ui.checkbox(&mut self.cfg.kermit_repeat_compression, "Repeat compress");
+            ui.checkbox(&mut self.cfg.kermit_iac_escape, "IAC escape");
+        });
+        ui.horizontal(|ui| {
+            ui.label("8-bit quote:");
+            egui::ComboBox::from_id_salt("kermit_8bit_quote_combo")
+                .selected_text(&self.cfg.kermit_8bit_quote)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.cfg.kermit_8bit_quote,
+                        "auto".into(),
+                        "auto",
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg.kermit_8bit_quote,
+                        "on".into(),
+                        "on",
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg.kermit_8bit_quote,
+                        "off".into(),
+                        "off",
+                    );
+                });
+        });
     }
 
     /// Flush numeric text buffers into `cfg`, persist to disk, refresh
@@ -837,6 +937,15 @@ impl App {
         self.zmodem_max_retries_buf = self.cfg.zmodem_max_retries.to_string();
         self.zmodem_negotiation_retry_interval_buf =
             self.cfg.zmodem_negotiation_retry_interval.to_string();
+        self.kermit_negotiation_timeout_buf =
+            self.cfg.kermit_negotiation_timeout.to_string();
+        self.kermit_packet_timeout_buf = self.cfg.kermit_packet_timeout.to_string();
+        self.kermit_max_retries_buf = self.cfg.kermit_max_retries.to_string();
+        self.kermit_max_packet_length_buf =
+            self.cfg.kermit_max_packet_length.to_string();
+        self.kermit_window_size_buf = self.cfg.kermit_window_size.to_string();
+        self.kermit_block_check_type_buf =
+            self.cfg.kermit_block_check_type.to_string();
         self.serial_baud_buf = self.cfg.serial_baud.to_string();
     }
 }
@@ -1092,7 +1201,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.heading(
                         egui::RichText::new(format!(
-                            "Vintage Gateway v{}",
+                            "Ethernet Gateway v{}",
                             env!("CARGO_PKG_VERSION")
                         ))
                         .strong()
@@ -1185,7 +1294,7 @@ impl eframe::App for App {
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("File Transfer (XMODEM)").strong().color(AMBER));
                                     ui.label(
-                                        egui::RichText::new("(More for YMODEM / ZMODEM)")
+                                        egui::RichText::new("(More for others)")
                                             .italics()
                                             .color(AMBER_DIM),
                                     );
@@ -1281,7 +1390,7 @@ impl eframe::App for App {
                         .clicked()
                     {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
-                            "https://github.com/rickybryce/vintage-gateway/blob/master/usermanual.pdf",
+                            "https://github.com/rickybryce/ethernet-gateway/blob/master/usermanual.pdf",
                         ));
                     }
                 });
@@ -1320,12 +1429,21 @@ impl eframe::App for App {
                         egui::Layout::top_down(egui::Align::Max),
                         |ui| {
                             ui.add_space(-32.0);
+                            // Texture-options note: the source PNG is now
+                            // pre-resized to 1024x512 (Lanczos) which is
+                            // a small minification ratio versus our
+                            // ~366x183 display size — so mipmaps add
+                            // little and Linear-mipmap-Linear filtering
+                            // was contributing a faint mauve cast on
+                            // dark-blue gradients via pre-filtered level
+                            // bleeding.  Plain Linear minification with
+                            // mipmaps disabled is sharp and clean here.
                             ui.add(
-                                egui::Image::new(egui::include_image!("../vintagelogo.png"))
+                                egui::Image::new(egui::include_image!("../ethernetgatewaylogo.png"))
                                     .texture_options(egui::TextureOptions {
                                         magnification: egui::TextureFilter::Linear,
                                         minification: egui::TextureFilter::Linear,
-                                        mipmap_mode: Some(egui::TextureFilter::Linear),
+                                        mipmap_mode: None,
                                         ..Default::default()
                                     })
                                     .fit_to_exact_size(egui::vec2(logo_w, logo_h)),
@@ -1463,6 +1581,12 @@ impl eframe::App for App {
                 || self.zmodem_frame_timeout_buf != self.last_synced_cfg.zmodem_frame_timeout.to_string()
                 || self.zmodem_max_retries_buf != self.last_synced_cfg.zmodem_max_retries.to_string()
                 || self.zmodem_negotiation_retry_interval_buf != self.last_synced_cfg.zmodem_negotiation_retry_interval.to_string()
+                || self.kermit_negotiation_timeout_buf != self.last_synced_cfg.kermit_negotiation_timeout.to_string()
+                || self.kermit_packet_timeout_buf != self.last_synced_cfg.kermit_packet_timeout.to_string()
+                || self.kermit_max_retries_buf != self.last_synced_cfg.kermit_max_retries.to_string()
+                || self.kermit_max_packet_length_buf != self.last_synced_cfg.kermit_max_packet_length.to_string()
+                || self.kermit_window_size_buf != self.last_synced_cfg.kermit_window_size.to_string()
+                || self.kermit_block_check_type_buf != self.last_synced_cfg.kermit_block_check_type.to_string()
                 || self.serial_baud_buf != self.last_synced_cfg.serial_baud.to_string();
         }
     }
@@ -1509,6 +1633,30 @@ mod tests {
             app.zmodem_negotiation_retry_interval_buf,
             app.cfg.zmodem_negotiation_retry_interval.to_string()
         );
+        assert_eq!(
+            app.kermit_negotiation_timeout_buf,
+            app.cfg.kermit_negotiation_timeout.to_string()
+        );
+        assert_eq!(
+            app.kermit_packet_timeout_buf,
+            app.cfg.kermit_packet_timeout.to_string()
+        );
+        assert_eq!(
+            app.kermit_max_retries_buf,
+            app.cfg.kermit_max_retries.to_string()
+        );
+        assert_eq!(
+            app.kermit_max_packet_length_buf,
+            app.cfg.kermit_max_packet_length.to_string()
+        );
+        assert_eq!(
+            app.kermit_window_size_buf,
+            app.cfg.kermit_window_size.to_string()
+        );
+        assert_eq!(
+            app.kermit_block_check_type_buf,
+            app.cfg.kermit_block_check_type.to_string()
+        );
         assert_eq!(app.serial_baud_buf, app.cfg.serial_baud.to_string());
     }
 
@@ -1539,6 +1687,12 @@ mod tests {
         app.zmodem_frame_timeout_buf = "45".into();
         app.zmodem_max_retries_buf = "7".into();
         app.zmodem_negotiation_retry_interval_buf = "8".into();
+        app.kermit_negotiation_timeout_buf = "55".into();
+        app.kermit_packet_timeout_buf = "11".into();
+        app.kermit_max_retries_buf = "6".into();
+        app.kermit_max_packet_length_buf = "2048".into();
+        app.kermit_window_size_buf = "8".into();
+        app.kermit_block_check_type_buf = "2".into();
         app.serial_baud_buf = "115200".into();
         app.sync_numeric_fields();
         assert_eq!(app.cfg.telnet_port, 8080);
@@ -1553,7 +1707,70 @@ mod tests {
         assert_eq!(app.cfg.zmodem_frame_timeout, 45);
         assert_eq!(app.cfg.zmodem_max_retries, 7);
         assert_eq!(app.cfg.zmodem_negotiation_retry_interval, 8);
+        assert_eq!(app.cfg.kermit_negotiation_timeout, 55);
+        assert_eq!(app.cfg.kermit_packet_timeout, 11);
+        assert_eq!(app.cfg.kermit_max_retries, 6);
+        assert_eq!(app.cfg.kermit_max_packet_length, 2048);
+        assert_eq!(app.cfg.kermit_window_size, 8);
+        assert_eq!(app.cfg.kermit_block_check_type, 2);
         assert_eq!(app.cfg.serial_baud, 115200);
+    }
+
+    #[test]
+    fn test_kermit_window_clamps_to_range() {
+        let mut app = test_app();
+        let orig_window = app.cfg.kermit_window_size;
+        // Out-of-range values should leave config untouched.
+        app.kermit_window_size_buf = "0".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_window_size, orig_window);
+        app.kermit_window_size_buf = "32".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_window_size, orig_window);
+        // In-range value should apply.
+        app.kermit_window_size_buf = "31".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_window_size, 31);
+    }
+
+    #[test]
+    fn test_kermit_max_packet_length_clamps() {
+        let mut app = test_app();
+        let orig = app.cfg.kermit_max_packet_length;
+        // Below MIN (10)
+        app.kermit_max_packet_length_buf = "9".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_max_packet_length, orig);
+        // Above MAX (9024)
+        app.kermit_max_packet_length_buf = "9025".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_max_packet_length, orig);
+        // Boundary — 10 and 9024 both accepted.
+        app.kermit_max_packet_length_buf = "10".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_max_packet_length, 10);
+        app.kermit_max_packet_length_buf = "9024".into();
+        app.sync_numeric_fields();
+        assert_eq!(app.cfg.kermit_max_packet_length, 9024);
+    }
+
+    #[test]
+    fn test_kermit_block_check_type_clamps() {
+        let mut app = test_app();
+        let orig = app.cfg.kermit_block_check_type;
+        for bad in &["0", "4", "abc", "-1"] {
+            app.kermit_block_check_type_buf = (*bad).into();
+            app.sync_numeric_fields();
+            assert_eq!(app.cfg.kermit_block_check_type, orig);
+        }
+        for good in &["1", "2", "3"] {
+            app.kermit_block_check_type_buf = (*good).into();
+            app.sync_numeric_fields();
+            assert_eq!(
+                app.cfg.kermit_block_check_type,
+                good.parse::<u8>().unwrap()
+            );
+        }
     }
 
     #[test]

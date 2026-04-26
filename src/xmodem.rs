@@ -6,11 +6,12 @@
 //! - Raw I/O helpers with telnet IAC escaping
 //! - CRC-16 (CCITT polynomial 0x1021) computation
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config;
 use crate::logger::glog;
 use crate::telnet::is_esc_key;
+use crate::tnio::{is_can_abort, nvt_read_byte, raw_write_bytes, ReadState, CAN};
 
 // XMODEM protocol constants
 const SOH: u8 = 0x01;
@@ -19,18 +20,11 @@ const STX: u8 = 0x02;
 const EOT: u8 = 0x04;
 const ACK: u8 = 0x06;
 const NAK: u8 = 0x15;
-const CAN: u8 = 0x18;
 const SUB: u8 = 0x1A;
 const CRC_REQUEST: u8 = b'C';
 
-// Telnet protocol bytes
-const IAC: u8 = 0xFF;
-const SB: u8 = 250;
-const SE: u8 = 240;
-const WILL: u8 = 251;
-const WONT: u8 = 252;
-const DO_CMD: u8 = 253;
-const DONT: u8 = 254;
+// Telnet IAC + raw I/O now live in `crate::tnio` (shared with kermit
+// and zmodem).  Local-only XMODEM bytes stay above.
 
 pub(crate) const XMODEM_BLOCK_SIZE: usize = 128;
 /// XMODEM-1K block size.  The sender chooses per-block; the receiver
@@ -1148,213 +1142,19 @@ fn crc16_xmodem(data: &[u8]) -> u16 {
 }
 
 // =============================================================================
-// RAW I/O - TELNET IAC AWARE
+// SINGLE-BYTE WRITER (multi-byte raw_write_bytes lives in tnio.rs)
 // =============================================================================
 
-/// Write a single raw byte, with telnet IAC escaping and CR-NUL
-/// stuffing for TCP connections.  The control-byte set XMODEM uses
-/// (SOH/STX/EOT/ACK/NAK/CAN/'C') never includes 0x0D, so a single-byte
-/// write only needs the IAC rule.  CR-NUL stuffing is handled by the
-/// multi-byte writer which is what sends data blocks.
+/// Write a single raw byte through the telnet IAC + CR-NUL escaping
+/// layer.  Thin wrapper over `tnio::raw_write_bytes` for the XMODEM
+/// control-byte sites (sending ACK / NAK / CAN / 'C' singletons) so
+/// each call site stays at one statement.
 async fn raw_write_byte(
     writer: &mut (impl AsyncWrite + Unpin),
     byte: u8,
     is_tcp: bool,
 ) -> Result<(), String> {
-    if is_tcp && byte == IAC {
-        writer
-            .write_all(&[IAC, IAC])
-            .await
-            .map_err(|e| e.to_string())?;
-    } else if is_tcp && byte == 0x0D {
-        // Defensive: if a caller ever single-writes a 0x0D data byte on
-        // a telnet stream, stuff the NUL so the peer's telnet layer
-        // doesn't eat the following byte as part of a CR LF / CR NUL
-        // pair.  In practice the multi-byte writer sees all data blocks
-        // that could contain 0x0D.
-        writer
-            .write_all(&[0x0D, 0x00])
-            .await
-            .map_err(|e| e.to_string())?;
-    } else {
-        writer
-            .write_all(&[byte])
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    writer.flush().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Write multiple raw bytes, applying telnet IAC escaping and NVT
-/// CR-NUL stuffing when `is_tcp` is true.  Both transforms are required
-/// for XMODEM/YMODEM over telnet NVT (RFC 854): the peer reconstructs
-/// the original bytes by collapsing `IAC IAC` to `0xFF` and dropping
-/// `NUL` after `CR`.  Skipping either causes mid-block desync at the
-/// first 0xFF or 0x0D byte in the payload.
-async fn raw_write_bytes(
-    writer: &mut (impl AsyncWrite + Unpin),
-    data: &[u8],
-    is_tcp: bool,
-) -> Result<(), String> {
-    if is_tcp {
-        let mut buf = Vec::with_capacity(data.len() + 8);
-        for &byte in data {
-            if byte == IAC {
-                buf.push(IAC);
-                buf.push(IAC);
-            } else if byte == 0x0D {
-                buf.push(0x0D);
-                buf.push(0x00);
-            } else {
-                buf.push(byte);
-            }
-        }
-        writer.write_all(&buf).await.map_err(|e| e.to_string())?;
-        writer.flush().await.map_err(|e| e.to_string())?;
-    } else {
-        writer.write_all(data).await.map_err(|e| e.to_string())?;
-        writer.flush().await.map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Per-stream state threaded through NVT reads so we can implement
-/// RFC 854's rule that a bare CR on the wire appears as `CR NUL`, and
-/// collapse the NUL so XMODEM byte counts stay aligned.  The pushback
-/// slot holds a byte we looked ahead for CR-NUL detection that turned
-/// out not to be a NUL; the next call returns it before reading more.
-///
-/// `pending_can` tracks whether the most recently read byte at the
-/// protocol level was CAN.  Forsberg's protocol notes recommend that
-/// abort-on-CAN require **two consecutive** CAN bytes so a single
-/// stray 0x18 from line noise doesn't false-abort an in-flight
-/// transfer.  Each CAN-handling site sets the flag on a first CAN,
-/// checks it on a second CAN to abort, and clears it on any non-CAN
-/// byte.  See `is_can_abort` for the canonical state transition.
-#[derive(Default)]
-struct ReadState {
-    pushback: Option<u8>,
-    pending_can: bool,
-}
-
-/// Forsberg's CAN×2 abort rule, factored out so every read site
-/// applies the same state transitions:
-///
-/// - On CAN: if a previous CAN was already pending, return `true`
-///   (caller aborts).  Otherwise set `pending_can` and return `false`
-///   so the caller treats the byte as "ignore for now, keep reading."
-/// - On any other byte: clear `pending_can` and return `false`.  The
-///   caller proceeds with normal handling for that byte.
-///
-/// Crucially, `pending_can` persists across read calls: a CAN seen
-/// during one block, followed by ACK from the receiver, then another
-/// CAN, must NOT abort — only **consecutive** CANs do.
-fn is_can_abort(byte: u8, state: &mut ReadState) -> bool {
-    if byte == CAN {
-        if state.pending_can {
-            state.pending_can = false;
-            return true;
-        }
-        state.pending_can = true;
-        false
-    } else {
-        state.pending_can = false;
-        false
-    }
-}
-
-/// NVT-aware byte reader: wraps [`raw_read_byte`] with CR-NUL stripping
-/// for telnet streams.  After returning a CR (0x0D) we look one byte
-/// ahead; if it's NUL we swallow it, otherwise we stash it in `state`
-/// for the next call.  Production XMODEM/YMODEM transfers use this
-/// function so IAC + CR-NUL + pushback are all handled uniformly.
-async fn nvt_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-    state: &mut ReadState,
-) -> Result<u8, String> {
-    if let Some(b) = state.pushback.take() {
-        return Ok(b);
-    }
-    let byte = raw_read_byte(reader, is_tcp).await?;
-    if is_tcp && byte == 0x0D {
-        let next = raw_read_byte(reader, is_tcp).await?;
-        if next != 0x00 {
-            state.pushback = Some(next);
-        }
-    }
-    Ok(byte)
-}
-
-/// Read a single raw byte, handling telnet IAC sequences for TCP connections.
-async fn raw_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-) -> Result<u8, String> {
-    let mut buf = [0u8; 1];
-    loop {
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if is_tcp && buf[0] == IAC {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-            if buf[0] == IAC {
-                return Ok(IAC);
-            }
-            consume_telnet_command(reader, buf[0]).await?;
-        } else {
-            return Ok(buf[0]);
-        }
-    }
-}
-
-/// Consume a telnet command sequence after the IAC and command byte were read.
-async fn consume_telnet_command(
-    reader: &mut (impl AsyncRead + Unpin),
-    command: u8,
-) -> Result<(), String> {
-    let mut buf = [0u8; 1];
-    match command {
-        SB => {
-            let sb_result = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-                loop {
-                    reader
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if buf[0] == IAC {
-                        reader
-                            .read_exact(&mut buf)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        if buf[0] == SE {
-                            break;
-                        }
-                    }
-                }
-                Ok::<(), String>(())
-            })
-            .await;
-            match sb_result {
-                Err(_) => return Err("Telnet subnegotiation timed out".into()),
-                Ok(r) => r?,
-            }
-        }
-        WILL | WONT | DO_CMD | DONT => {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        _ => {}
-    }
-    Ok(())
+    raw_write_bytes(writer, &[byte], is_tcp).await
 }
 
 // =============================================================================
@@ -1364,6 +1164,11 @@ async fn consume_telnet_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests reach into the raw I/O layer directly to verify telnet-NVT
+    // and IAC handling; pull the helpers and telnet constants in via
+    // tnio to keep the test bodies unchanged after the refactor.
+    use crate::tnio::{consume_telnet_command, raw_read_byte, IAC, SB, SE, WILL};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_crc16_xmodem() {

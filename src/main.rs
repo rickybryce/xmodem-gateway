@@ -9,10 +9,12 @@
 mod aichat;
 mod config;
 mod gui;
+mod kermit;
 mod logger;
 mod serial;
 mod ssh;
 mod telnet;
+mod tnio;
 mod webbrowser;
 mod xmodem;
 mod zmodem;
@@ -25,7 +27,7 @@ use logger::glog;
 fn main() {
     logger::init();
 
-    glog!("Vintage Gateway v{}", env!("CARGO_PKG_VERSION"));
+    glog!("Ethernet Gateway v{}", env!("CARGO_PKG_VERSION"));
     glog!("Author: Ricky Bryce");
     glog!();
 

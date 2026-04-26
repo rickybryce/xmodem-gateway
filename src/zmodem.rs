@@ -19,10 +19,11 @@
 //! - [`zmodem_receive`] — read a single file from the peer (upload)
 //! - [`zmodem_send`] — send a single file to the peer (download)
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config;
 use crate::logger::glog;
+use crate::tnio::{nvt_read_byte, raw_write_bytes, ReadState};
 
 // ─── Wire constants ──────────────────────────────────────────
 const ZPAD: u8 = b'*';          // 0x2A, frame padding
@@ -64,15 +65,8 @@ const CANFDX: u8 = 0x01;        // full-duplex link
 const CANOVIO: u8 = 0x02;       // can overlap I/O
 const CANFC32: u8 = 0x20;       // can receive CRC-32 frames
 
-// Telnet protocol bytes (same as xmodem.rs; duplicated to keep the
-// modules decoupled).
-const IAC: u8 = 0xFF;
-const SB: u8 = 250;
-const SE: u8 = 240;
-const WILL: u8 = 251;
-const WONT: u8 = 252;
-const DO_CMD: u8 = 253;
-const DONT: u8 = 254;
+// Telnet IAC + raw I/O now live in `crate::tnio` (shared with xmodem
+// and kermit).
 
 // Limits
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
@@ -279,126 +273,8 @@ impl ZHeader {
     }
 }
 
-// =============================================================================
-// Raw I/O (telnet NVT aware) — parallel to xmodem.rs helpers
-// =============================================================================
-
-#[derive(Default)]
-struct ReadState {
-    pushback: Option<u8>,
-}
-
-async fn raw_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-) -> Result<u8, String> {
-    let mut buf = [0u8; 1];
-    loop {
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-        if is_tcp && buf[0] == IAC {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-            if buf[0] == IAC {
-                return Ok(IAC);
-            }
-            consume_telnet_command(reader, buf[0]).await?;
-        } else {
-            return Ok(buf[0]);
-        }
-    }
-}
-
-async fn consume_telnet_command(
-    reader: &mut (impl AsyncRead + Unpin),
-    command: u8,
-) -> Result<(), String> {
-    let mut buf = [0u8; 1];
-    match command {
-        SB => {
-            let sb_result = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-                loop {
-                    reader
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if buf[0] == IAC {
-                        reader
-                            .read_exact(&mut buf)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        if buf[0] == SE {
-                            break;
-                        }
-                    }
-                }
-                Ok::<(), String>(())
-            })
-            .await;
-            match sb_result {
-                Err(_) => return Err("Telnet subnegotiation timed out".into()),
-                Ok(r) => r?,
-            }
-        }
-        WILL | WONT | DO_CMD | DONT => {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn nvt_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-    state: &mut ReadState,
-) -> Result<u8, String> {
-    if let Some(b) = state.pushback.take() {
-        return Ok(b);
-    }
-    let byte = raw_read_byte(reader, is_tcp).await?;
-    if is_tcp && byte == 0x0D {
-        let next = raw_read_byte(reader, is_tcp).await?;
-        if next != 0x00 {
-            state.pushback = Some(next);
-        }
-    }
-    Ok(byte)
-}
-
-async fn raw_write_bytes(
-    writer: &mut (impl AsyncWrite + Unpin),
-    data: &[u8],
-    is_tcp: bool,
-) -> Result<(), String> {
-    if is_tcp {
-        let mut buf = Vec::with_capacity(data.len() + 8);
-        for &b in data {
-            if b == IAC {
-                buf.push(IAC);
-                buf.push(IAC);
-            } else if b == 0x0D {
-                buf.push(0x0D);
-                buf.push(0x00);
-            } else {
-                buf.push(b);
-            }
-        }
-        writer.write_all(&buf).await.map_err(|e| e.to_string())?;
-        writer.flush().await.map_err(|e| e.to_string())?;
-    } else {
-        writer.write_all(data).await.map_err(|e| e.to_string())?;
-        writer.flush().await.map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
+// Raw I/O (telnet IAC + NVT CR-NUL stripping) lives in `crate::tnio`,
+// shared with xmodem.rs and kermit.rs.
 
 // =============================================================================
 // Header decoder
@@ -1649,6 +1525,9 @@ async fn send_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests drive duplex pipes directly, so the AsyncRead/Write
+    // extension traits (write_all, read, flush) need to be in scope.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ─── CRC ────────────────────────────────────────────────
 
@@ -2332,7 +2211,12 @@ mod tests {
     // nothing beyond the checked-in bytes.
     //
     // To refresh the fixtures (requires lrzsz on PATH, Unix-only):
-    //     cargo test record_lrzsz_fixtures -- --ignored --exact --nocapture
+    //     ZMODEM_RECORD_FIXTURES=1 \
+    //         cargo test record_lrzsz_fixtures -- --ignored --exact --nocapture
+    //
+    // The env-var gate keeps `cargo test -- --ignored` (a natural
+    // way to run all interop tests at once) from quietly rewriting
+    // the committed fixtures with timestamp-bearing equivalents.
     //
     // The replay catches any future divergence between our decoder
     // and the wire format real senders actually emit — e.g. if sz
@@ -2451,6 +2335,19 @@ mod tests {
     async fn record_lrzsz_fixtures() {
         use std::process::Stdio;
         use tokio::process::Command;
+
+        // Two-step opt-in: `#[ignore]` keeps this off the default
+        // test pass, and the env-var check keeps it off accidental
+        // bulk runs of `cargo test -- --ignored` (where it would
+        // silently rewrite the committed fixtures with timestamp-
+        // bearing equivalents).  The deliberate refresh path sets
+        // the var and uses `--exact`.
+        if std::env::var("ZMODEM_RECORD_FIXTURES").is_err() {
+            eprintln!(
+                "record_lrzsz_fixtures: skipped (set ZMODEM_RECORD_FIXTURES=1 to refresh)"
+            );
+            return;
+        }
 
         // Bail clearly if lrzsz isn't installed — this is a manual
         // fixture-refresh test, the user ran it on purpose.

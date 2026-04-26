@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **vintage-gateway** are documented in this file.
+All notable changes to **ethernet-gateway** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -13,35 +13,35 @@ _No unreleased changes._
 
 ### Changed
 
-#### Project rename: XMODEM Gateway → Vintage Gateway
-- The product is now **Vintage Gateway**. The original name no longer
+#### Project rename: XMODEM Gateway → Ethernet Gateway
+- The product is now **Ethernet Gateway**. The original name no longer
   reflected the scope (SSH, web browser, AI chat, weather, modem
   emulator, gateway proxies — only one of which is XMODEM).
   Functionality is unchanged; this is purely a naming refresh.
-- Cargo package renamed `xmodem-gateway` → `vintage-gateway`.
+- Cargo package renamed `xmodem-gateway` → `ethernet-gateway`.
 - GitHub repository moved to
-  [`rickybryce/vintage-gateway`](https://github.com/rickybryce/vintage-gateway).
-- Configuration file renamed `xmodem.conf` → `vgateway.conf`.
-- SSH host key file renamed `xmodem_ssh_host_key` → `vintage_ssh_host_key`.
+  [`rickybryce/ethernet-gateway`](https://github.com/rickybryce/ethernet-gateway).
+- Configuration file renamed `xmodem.conf` → `egateway.conf`.
+- SSH host key file renamed `xmodem_ssh_host_key` → `ethernet_ssh_host_key`.
 - Outbound SSH gateway client key renamed `xmodem_gateway_ssh_key` →
-  `vintage_gateway_ssh_key`.
+  `ethernet_gateway_ssh_key`.
 - AppImage renamed `XMODEM_Gateway-x86_64.AppImage` →
-  `Vintage_Gateway-x86_64.AppImage`.
-- systemd unit renamed `xmodem-gateway.service` → `vintage-gateway.service`.
-- Telnet menu prompt path renamed `xmodem> ` → `vintage> ` (and all
-  sub-paths: `vintage/xfer`, `vintage/web`, `vintage/config/...`).
-- Hayes dial shortcut: `ATDT xmodem-gateway` → `ATDT vintage-gateway`
+  `Ethernet_Gateway-x86_64.AppImage`.
+- systemd unit renamed `xmodem-gateway.service` → `ethernet-gateway.service`.
+- Telnet menu prompt path renamed `xmodem> ` → `ethernet> ` (and all
+  sub-paths: `ethernet/xfer`, `ethernet/web`, `ethernet/config/...`).
+- Hayes dial shortcut: `ATDT xmodem-gateway` → `ATDT ethernet-gateway`
   (the `1001000` shortcut number is unchanged).
-- HTTP browser User-Agent: `XmodemGateway/1.0` → `VintageGateway/1.0`.
+- HTTP browser User-Agent: `XmodemGateway/1.0` → `EthernetGateway/1.0`.
 
 **Migration**: existing deployments that want to preserve identity should
-rename `xmodem.conf` → `vgateway.conf` and `xmodem_ssh_host_key` →
-`vintage_ssh_host_key` (and the gateway client key) before first start.
+rename `xmodem.conf` → `egateway.conf` and `xmodem_ssh_host_key` →
+`ethernet_ssh_host_key` (and the gateway client key) before first start.
 Otherwise the gateway will create fresh files and SSH clients will see a
 "host key changed" warning.
 
 #### GUI refresh
-- New logo (`vintagelogo.png`, 1774×887, 2:1 aspect ratio) displayed at
+- New logo (`ethernetgatewaylogo.png`, 1774×887, 2:1 aspect ratio) displayed at
   366×183 with trilinear (mipmap) texture filtering for clean
   downscaling.
 - Window/panel background darkened from `#050E1A` to `#000510` to match
@@ -168,7 +168,7 @@ Otherwise the gateway will create fresh files and SSH clients will see a
 - **Gateway Configuration menu** at `Configuration → G` in the telnet
   session: toggles the outbound Telnet mode (Telnet / Raw TCP) and the
   outbound SSH auth mode (Key / Password) at runtime, persists to
-  `vgateway.conf`, and takes effect on the next gateway connection with no
+  `egateway.conf`, and takes effect on the next gateway connection with no
   server restart. Replaces the per-connection interactive prompts that
   used to live inside the Telnet Gateway and SSH Gateway flows.
 - **Config key `ssh_gateway_auth`** (`"key"` or `"password"`, default
@@ -264,7 +264,7 @@ Otherwise the gateway will create fresh files and SSH clients will see a
 - **Raw-TCP escape hatch** (`telnet_gateway_raw = true`): bypasses the
   telnet IAC layer entirely for destinations that aren't really telnet.
   Toggleable live from the Telnet Gateway menu with the **T** key; choice
-  persists to `vgateway.conf`.
+  persists to `egateway.conf`.
 - **8 KiB subnegotiation body cap**: malicious remotes cannot exhaust
   memory by sending huge `SB` bodies without a terminating `IAC SE`.
 - **Property-based fuzz test** (`qmethod_proptest`) covers the full Q-method
@@ -273,7 +273,7 @@ Otherwise the gateway will create fresh files and SSH clients will see a
 
 #### Outgoing SSH Gateway
 - **Public-key authentication** with auto-generated Ed25519 client keypair
-  (`vintage_gateway_ssh_key`, 0o600 on Unix). Tried before password; on
+  (`ethernet_gateway_ssh_key`, 0o600 on Unix). Tried before password; on
   acceptance, the password prompt is skipped entirely.
 - **"Show gateway public key" menu**: press **K** at the SSH Gateway
   menu to display the one-line OpenSSH-format public key for pasting
@@ -311,8 +311,8 @@ Otherwise the gateway will create fresh files and SSH clients will see a
   blocked for 5 minutes across both protocols — an attacker can't bounce
   between them to reset the counter.
 - **0o600 file permissions on Unix** for all sensitive files:
-  `vgateway.conf`, `dialup.conf`, `gateway_hosts`, `vintage_ssh_host_key`,
-  `vintage_gateway_ssh_key`.
+  `egateway.conf`, `dialup.conf`, `gateway_hosts`, `ethernet_ssh_host_key`,
+  `ethernet_gateway_ssh_key`.
 - **Per-PID temporary filenames** for atomic config writes; closes a
   TOCTOU window on shared working directories.
 - **`save_config` now acquires the `CONFIG` mutex before disk write**,
@@ -362,11 +362,11 @@ Otherwise the gateway will create fresh files and SSH clients will see a
 - Windows build fix for `GetDiskFreeSpaceExW`.
 - S-register persistence via `AT&W`.
 
-[Unreleased]: https://github.com/rickybryce/vintage-gateway/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.4.0
-[0.3.5]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.5
-[0.3.4]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.4
-[0.3.3]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.3
-[0.3.2]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.2
-[0.3.1]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.1
-[0.3.0]: https://github.com/rickybryce/vintage-gateway/releases/tag/v0.3.0
+[Unreleased]: https://github.com/rickybryce/ethernet-gateway/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.4.0
+[0.3.5]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.5
+[0.3.4]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.4
+[0.3.3]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.3
+[0.3.2]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.2
+[0.3.1]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.1
+[0.3.0]: https://github.com/rickybryce/ethernet-gateway/releases/tag/v0.3.0

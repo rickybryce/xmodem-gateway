@@ -1,12 +1,14 @@
-# Vintage Gateway
+# Ethernet Gateway
 
-A telnet-based XMODEM file transfer server, SSH gateway, Hayes-compatible
-modem emulator for serial-attached retro hardware, text-mode web browser,
-and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI,
-and ASCII terminals. Designed for local network use with retro and modern
-terminal clients.
+A telnet-based XMODEM/YMODEM/ZMODEM/Kermit file transfer server, SSH
+gateway, Hayes-compatible modem emulator for serial-attached retro
+hardware, text-mode web browser, and AI chat client written in Rust.
+Supports PETSCII (Commodore 64), ANSI, and ASCII terminals. Designed
+for local network use with retro and modern terminal clients.
 
-**[User Manual](http://telnetbible.com/vintage-gateway/index.html)**
+**[User Manual](http://ethernetgateway.com/index.html)**
+&nbsp;&middot;&nbsp;
+**[Kermit Reference](http://ethernetgateway.com/kermit.html)**
 
 Once you run the server on your PC, you can telnet to that server from
 anywhere on your network (allow firewall port 2323).
@@ -20,7 +22,7 @@ stop and aux1 up.
 
 Run IMP8, then hit T for terminal mode on the Altairduino.
 
-Example: `ATDT :2323` — for gateway options: `ATDT vintage-gateway`
+Example: `ATDT :2323` — for gateway options: `ATDT ethernet-gateway`
 
 Note: For the Altairduino, I simply connected my USB to RS232 adapter to
 the 9 pin RS232 connector.
@@ -54,7 +56,7 @@ Additionally, gateway addresses (those ending in `.1`, such as `192.168.1.1`)
 are rejected to prevent accidental exposure through router interfaces.
 
 To accept connections from **any IP address**, you must enable security
-(`security_enabled = true` in `vgateway.conf`) and set a strong username and
+(`security_enabled = true` in `egateway.conf`) and set a strong username and
 password. Even with security enabled, running this software on a public network
 is **not recommended** — telnet credentials are transmitted in cleartext and can
 be intercepted. Use the SSH interface for any non-local access.
@@ -115,7 +117,7 @@ escaping on outbound, no IAC parsing on inbound, no negotiation.
 Intended for destinations that clearly aren't telnet at all (legacy
 MUDs, hand-rolled BBS software).  Supersedes `telnet_gateway_negotiate`.
 The Telnet Gateway menu shows the current mode and lets you toggle it
-with a single keystroke; the change is saved to `vgateway.conf` so future
+with a single keystroke; the change is saved to `egateway.conf` so future
 sessions start in the selected mode.  Bytes written to the local user
 are still IAC-escaped so their telnet client doesn't misinterpret a
 stray 0xFF as a protocol byte.
@@ -225,7 +227,7 @@ cmake --version
 cargo build --release
 ```
 
-The binary will be at `target/release/vintage-gateway`.
+The binary will be at `target/release/ethernet-gateway`.
 
 ## Verifying Releases
 
@@ -233,7 +235,7 @@ Pre-built binaries are published to the [GitHub Releases][releases] page
 for Linux (x86_64), macOS (aarch64), and Windows (x86_64). Every release
 ships with:
 
-- The binary archive (`vintage-gateway-vX.Y.Z-<target>.tar.gz` or `.zip`).
+- The binary archive (`ethernet-gateway-vX.Y.Z-<target>.tar.gz` or `.zip`).
 - A SHA-256 checksum (`<archive>.sha256`).
 - Optionally a detached GPG signature (`<archive>.asc`) — produced if the
   release signer has a GPG key configured.
@@ -241,13 +243,13 @@ ships with:
   `<archive>.pem`) bound to the publisher's GitHub identity. Produced on
   every release automatically; no key management required.
 
-[releases]: https://github.com/rickybryce/vintage-gateway/releases
+[releases]: https://github.com/rickybryce/ethernet-gateway/releases
 [sigstore]: https://www.sigstore.dev/
 
 ### Verifying the checksum
 
 ```sh
-sha256sum -c vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 ### Verifying the GPG signature (if present)
@@ -255,8 +257,8 @@ sha256sum -c vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```sh
 gpg --keyserver keys.openpgp.org --recv-keys <KEY_FINGERPRINT>
 gpg --verify \
-    vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.asc \
-    vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.asc \
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 ### Verifying the Sigstore signature
@@ -266,11 +268,11 @@ free):
 
 ```sh
 cosign verify-blob \
-    --certificate vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.pem \
-    --signature   vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sig \
-    --certificate-identity-regexp "https://github.com/rickybryce/vintage-gateway/.*" \
+    --certificate ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.pem \
+    --signature   ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.sig \
+    --certificate-identity-regexp "https://github.com/rickybryce/ethernet-gateway/.*" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    vintage-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 This ties the binary to a specific GitHub Actions workflow run on
@@ -297,10 +299,10 @@ reproducibility.
 ## Running
 
 ```sh
-./vintage-gateway
+./ethernet-gateway
 ```
 
-On first run, a default configuration file `vgateway.conf` is created in the
+On first run, a default configuration file `egateway.conf` is created in the
 working directory. The telnet server listens on port 2323 by default.
 
 Connect with any telnet client:
@@ -318,27 +320,27 @@ ssh <ssh-user>@<server-ip> -p 2222
 ### Running as a systemd Service (Linux)
 
 A hardened systemd unit file is provided at
-[`contrib/systemd/vintage-gateway.service`](contrib/systemd/vintage-gateway.service).
+[`contrib/systemd/ethernet-gateway.service`](contrib/systemd/ethernet-gateway.service).
 To install:
 
 ```sh
 # Create a dedicated unprivileged user
-sudo useradd --system --home-dir /var/lib/vintage-gateway \
-             --shell /usr/sbin/nologin vintage-gateway
-sudo install -d -m 0750 -o vintage-gateway -g vintage-gateway \
-             /var/lib/vintage-gateway
+sudo useradd --system --home-dir /var/lib/ethernet-gateway \
+             --shell /usr/sbin/nologin ethernet-gateway
+sudo install -d -m 0750 -o ethernet-gateway -g ethernet-gateway \
+             /var/lib/ethernet-gateway
 
 # Install the binary
-sudo install -m 0755 target/release/vintage-gateway /usr/local/bin/
+sudo install -m 0755 target/release/ethernet-gateway /usr/local/bin/
 
 # Install and start the service
-sudo install -m 0644 contrib/systemd/vintage-gateway.service \
+sudo install -m 0644 contrib/systemd/ethernet-gateway.service \
              /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now vintage-gateway.service
+sudo systemctl enable --now ethernet-gateway.service
 
 # Watch the log
-journalctl -u vintage-gateway -f
+journalctl -u ethernet-gateway -f
 ```
 
 The unit ships with defensive hardening enabled by default:
@@ -357,7 +359,7 @@ When `enable_console = true` (the default), a graphical configuration window
 opens on startup. The GUI provides:
 
 - **Live console output** -- server log messages stream in the bottom panel
-- **Configuration editing** -- all `vgateway.conf` settings can be changed and
+- **Configuration editing** -- all `egateway.conf` settings can be changed and
   saved without editing the file by hand
 - **Serial port auto-detection** -- the Serial Modem section lists detected
   serial ports in a dropdown; click the refresh button to re-scan
@@ -366,7 +368,7 @@ opens on startup. The GUI provides:
   File Transfer popup exposes the XMODEM-family timeouts plus the independent
   ZMODEM tunables (handshake, frame timeout, retry cap) side by side.
 - **User Manual button** -- opens the PDF user manual on GitHub in your browser
-- **Save and Restart Server** -- writes changes to `vgateway.conf` and restarts
+- **Save and Restart Server** -- writes changes to `egateway.conf` and restarts
   the server so all changes (including security, ports, and credentials) take
   effect immediately
 
@@ -376,7 +378,7 @@ clicked (the GUI reopens after the restart completes). Closing the GUI window
 does **not** stop the server -- it continues running headless until a shutdown
 signal is received.
 
-To disable the GUI, set `enable_console = false` in `vgateway.conf` or uncheck
+To disable the GUI, set `enable_console = false` in `egateway.conf` or uncheck
 "Show GUI on Startup" in the Other Settings section and save.
 
 ## Main Menu
@@ -419,8 +421,8 @@ Most settings can be changed from within a telnet or SSH session using the
   logging, GUI on startup
 - **R** Reset Defaults -- restore all settings to factory defaults
 
-All settings are persisted to `vgateway.conf` automatically. You can also edit
-`vgateway.conf` by hand. All options:
+All settings are persisted to `egateway.conf` automatically. You can also edit
+`egateway.conf` by hand. All options:
 
 ```ini
 # Telnet server: set to false to disable (SSH-only mode)
@@ -550,9 +552,9 @@ ssh_password = changeme
 ### Setting Up Authentication
 
 To require a username and password, either use the in-app Configuration menu
-(**C** > **E** Security) or edit `vgateway.conf` by hand:
+(**C** > **E** Security) or edit `egateway.conf` by hand:
 
-1. Open `vgateway.conf` in a text editor
+1. Open `egateway.conf` in a text editor
 2. Set `security_enabled = true`
 3. Change `username` and `password` to your desired credentials
 4. Restart the server
@@ -561,7 +563,7 @@ When enabled, users must authenticate after terminal detection. Failed login
 attempts are tracked per IP address -- after 3 failures, the IP is locked out
 for 5 minutes.
 
-**Note:** Credentials are stored in plaintext in `vgateway.conf`. This is
+**Note:** Credentials are stored in plaintext in `egateway.conf`. This is
 consistent with the telnet protocol itself, which transmits all data
 (including passwords) in cleartext. Do not reuse sensitive passwords here.
 This authentication is intended as a lightweight access control for private
@@ -575,7 +577,7 @@ access to fast LLM inference. To enable it:
 1. Go to https://console.groq.com and create a free account
 2. Navigate to **API Keys** and generate a new key (starts with `gsk_`)
 3. Set the key via Configuration > Other Settings > **A** (Set AI API key), or
-   open `vgateway.conf` and set: `groq_api_key = gsk_your_key_here`
+   open `egateway.conf` and set: `groq_api_key = gsk_your_key_here`
 4. Restart the server
 
 If no API key is configured, selecting AI Chat from the menu will display
@@ -585,9 +587,9 @@ instructions on how to obtain one.
 
 The browser loads `http://telnetbible.com` by default. To change it, use
 Configuration > Other Settings > **B** (Set browser homepage), or edit
-`vgateway.conf`:
+`egateway.conf`:
 
-1. Open `vgateway.conf`
+1. Open `egateway.conf`
 2. Set `browser_homepage` to a URL, e.g.: `browser_homepage = example.com`
 3. Restart the server
 
@@ -679,7 +681,7 @@ encryption is preferred over plaintext telnet.
 ### Enabling the SSH Server
 
 Use Configuration > Server Configuration to toggle SSH and set the port, and
-Configuration > Security to set SSH credentials. Or edit `vgateway.conf` by hand:
+Configuration > Security to set SSH credentials. Or edit `egateway.conf` by hand:
 
 1. Set `ssh_enabled = true`
 2. Change `ssh_username` and `ssh_password` to your desired credentials
@@ -687,7 +689,7 @@ Configuration > Security to set SSH credentials. Or edit `vgateway.conf` by hand
 4. Restart the server
 
 On first start with SSH enabled, the server generates an Ed25519 host key and
-saves it to `vintage_ssh_host_key` in the working directory. This key is reused
+saves it to `ethernet_ssh_host_key` in the working directory. This key is reused
 on subsequent starts so that clients can verify the server's identity.
 
 ### Connecting
@@ -696,7 +698,7 @@ on subsequent starts so that clients can verify the server's identity.
 ssh <username>@<server-ip> -p 2222
 ```
 
-After authenticating, you are presented with the same Vintage Gateway menu
+After authenticating, you are presented with the same Ethernet Gateway menu
 system as a telnet connection, using ANSI terminal mode. All features (file
 transfer, SSH/telnet gateway, browser, AI chat, modem emulator, weather) are
 available.
@@ -705,11 +707,11 @@ available.
 
 The SSH server has its own username and password (`ssh_username` /
 `ssh_password`), independent of the telnet credentials (`username` /
-`password`). When `vgateway.conf` is first created, both sets default to the same
+`password`). When `egateway.conf` is first created, both sets default to the same
 values (`admin` / `changeme`). After that, each set can be changed
 independently.
 
-**Note:** SSH credentials in `vgateway.conf` are stored in plaintext. While the
+**Note:** SSH credentials in `egateway.conf` are stored in plaintext. While the
 SSH connection itself is encrypted, the config file is not. Protect it with
 appropriate file permissions.
 
@@ -741,7 +743,7 @@ PETSCII and 80x24 for ANSI/ASCII terminals.
 ### Public-Key Authentication
 
 On the first outbound SSH dial, the gateway generates an Ed25519 client keypair
-and stores it as `vintage_gateway_ssh_key` (0o600 on Unix). Every subsequent
+and stores it as `ethernet_gateway_ssh_key` (0o600 on Unix). Every subsequent
 dial tries public-key authentication with this key *before* falling back to a
 password prompt. If the remote accepts the key, you skip the password prompt
 entirely — identical to how OpenSSH from the command line behaves.
@@ -772,8 +774,8 @@ out to be a man-in-the-middle attempt.
 ### SSH Gateway vs SSH Server
 
 `gateway_hosts` holds the *remote* servers' public keys (similar to an OpenSSH
-client's `~/.ssh/known_hosts`). `vintage_ssh_host_key` is the Vintage Gateway's
-*own* SSH server host key. `vintage_gateway_ssh_key` is the gateway's outgoing-
+client's `~/.ssh/known_hosts`). `ethernet_ssh_host_key` is the Ethernet Gateway's
+*own* SSH server host key. `ethernet_gateway_ssh_key` is the gateway's outgoing-
 client keypair used for public-key authentication to remote servers. All three
 are independent.
 
@@ -801,13 +803,13 @@ section above. In short:
 - **Telnet protocol (default)** — the gateway parses IAC framing in both
   directions, accepts cooperative ECHO from the remote, refuses other options.
   Works with any real telnet server.
-- **Cooperative mode** (`telnet_gateway_negotiate = true` in `vgateway.conf`) —
+- **Cooperative mode** (`telnet_gateway_negotiate = true` in `egateway.conf`) —
   adds proactive TTYPE, NAWS, and DO ECHO offers so modern BBSes can adapt
   content and render full-screen layouts at your actual window size.
 - **Raw TCP** (toggled with **T** at the gateway menu, saved persistently) —
   the IAC layer is disabled entirely. Use this when dialing destinations that
   don't speak telnet at all (legacy MUDs, hand-rolled BBS software, some
-  services on port 23). The toggle persists to `vgateway.conf` so you only need
+  services on port 23). The toggle persists to `egateway.conf` so you only need
   to set it once per destination type.
 
 ## Modem Emulator
@@ -826,7 +828,7 @@ modem commands.
 5. Configure baud rate, data bits, parity, stop bits, and flow control as needed
 6. Press **Q** to apply -- settings take effect immediately (no restart needed)
 
-Or edit `vgateway.conf` directly and restart the server.
+Or edit `egateway.conf` directly and restart the server.
 
 ### Supported AT Commands
 
@@ -836,7 +838,7 @@ Or edit `vgateway.conf` directly and restart the server.
 | `AT?`   | Show AT command help |
 | `ATZ`   | Reset modem to stored settings (saved by AT&W) |
 | `AT&F`  | Reset modem to factory defaults (gateway-friendly, see below) |
-| `AT&W`  | Save current modem settings to `vgateway.conf` |
+| `AT&W`  | Save current modem settings to `egateway.conf` |
 | `AT&V`  | Display current modem configuration |
 | `ATE0` / `ATE1` | Echo off / on |
 | `ATV0` / `ATV1` | Numeric / verbose result codes |
@@ -855,7 +857,7 @@ Or edit `vgateway.conf` directly and restart the server.
 | `ATDL`  | Redial last number |
 | `ATDS` / `ATDS`*n* | Dial stored number from slot *n* (0–3; default 0) |
 | `AT&Z`*n*`=`*s* | Store phone number or host *s* in slot *n* (0–3) |
-| `ATDT vintage-gateway` | Connect to this gateway's menus |
+| `ATDT ethernet-gateway` | Connect to this gateway's menus |
 | `ATDT host:port` | Dial a remote telnet host |
 | `ATDP host:port` | Pulse dial (same as ATDT — no distinction for TCP) |
 | `A/`    | Repeat the last command (no `AT` prefix, no CR required) |
@@ -898,7 +900,7 @@ Numeric `CONNECT` codes follow Hayes conventions: 1 = 300, 5 = 1200,
 baud rates fall back to code 1.
 
 **S-registers:** Query with `ATSn?`, set with `ATSn=v`, or type `ATS?` for help.
-`AT&W` saves all registers to `vgateway.conf`; `ATZ` restores saved values;
+`AT&W` saves all registers to `egateway.conf`; `ATZ` restores saved values;
 `AT&F` resets to gateway-friendly factory defaults.
 
 | Register | Default | Description |
@@ -933,7 +935,7 @@ AT&K, AT&Z (stored numbers), ATD (with T/P/L/S variants), ATSn, S-registers
 S0–S26, the `A/` repeat-last-command shortcut, and the `+++` escape with
 S2/S12 guard-time semantics. `AT&W` persists every Hayes setting — echo,
 verbose, quiet, X, &C, &D, &K, all 27 S-registers, and four stored-number
-slots — to `vgateway.conf`; `ATZ` restores them. Numeric and verbose result
+slots — to `egateway.conf`; `ATZ` restores them. Numeric and verbose result
 codes honor the ATX level.
 
 Commands the emulator can't meaningfully implement over TCP (`ATB`, `ATC`,
@@ -945,7 +947,7 @@ and return `OK` so that legacy init strings run to completion.
 | Setting | Gateway default | Hayes default | Why we differ |
 |---------|-----------------|---------------|---------------|
 | `AT&D` | `&D0` (ignore DTR) | `&D2` (hang up on DTR drop) | Many retro clients don't drive DTR correctly. `&D2` would cause spurious disconnects. |
-| `AT&K` | `&K0` (no modem-level flow control) | `&K3` (RTS/CTS) | C64, CP/M, and similar clients rarely implement hardware flow control. The physical port flow control is still set by `serial_flowcontrol` in `vgateway.conf`. |
+| `AT&K` | `&K0` (no modem-level flow control) | `&K3` (RTS/CTS) | C64, CP/M, and similar clients rarely implement hardware flow control. The physical port flow control is still set by `serial_flowcontrol` in `egateway.conf`. |
 | `S7` | 15 seconds | 50 seconds | Keeps failed TCP dials responsive. Raising S7 is allowed up to an internal cap of 60 s. |
 
 All three deviations can be overridden interactively (e.g. `AT&D2`,
@@ -978,8 +980,8 @@ Telnet and SSH users can simulate an incoming phone call to the serial device
 from the Modem Emulator menu (**I** — Ring emulator). The modem sends `RING`
 to the serial port at standard US phone cadence (every 6 seconds). After S0
 rings (default 5), the modem auto-answers and the serial device receives the
-Vintage Gateway main menu, just as if it had dialed in with
-`ATDT vintage-gateway`. The serial device can also answer manually with `ATA`
+Ethernet Gateway main menu, just as if it had dialed in with
+`ATDT ethernet-gateway`. The serial device can also answer manually with `ATA`
 during ringing.
 
 ### Serial Safety
@@ -995,8 +997,8 @@ The Dialup Mapping feature (modem menu **D**) lets you map phone numbers to
 `host:port` targets. When a number is dialed with `ATDT`, `ATDP`, or `ATD`,
 the server looks up the number and connects to the mapped host instead.
 
-A built-in entry maps **1001000** to the local Vintage Gateway menu (equivalent
-to `ATDT vintage-gateway`). This entry cannot be deleted.
+A built-in entry maps **1001000** to the local Ethernet Gateway menu (equivalent
+to `ATDT ethernet-gateway`). This entry cannot be deleted.
 
 Mappings are stored in `dialup.conf` (created automatically on first access
 with a default starter entry). Phone numbers are matched by digits only --
@@ -1030,7 +1032,7 @@ hardware signal pins that those commands nominally control:
   USB-to-serial adapter and platform). Use `ATH` or `+++` to hang up.
 - **CTS/RTS (Clear to Send / Request to Send, pins 8/7)** -- `AT&K3`/`AT&K4`
   is accepted and persisted. Actual hardware or software flow control on the
-  wire is controlled by the `serial_flowcontrol` setting in `vgateway.conf`
+  wire is controlled by the `serial_flowcontrol` setting in `egateway.conf`
   (not by `AT&K`), so retro clients that can't do RTS/CTS keep working at
   the default `serial_flowcontrol = none`.
 
@@ -1149,7 +1151,7 @@ key required).
 2. Enter a 5-digit US zip code, or press Enter to use the last one
 3. Current temperature, humidity, wind, and a 3-day forecast are displayed
 
-The last-used zip code is saved to `vgateway.conf` so it becomes the default
+The last-used zip code is saved to `egateway.conf` so it becomes the default
 for all future sessions.
 
 ## Signals

@@ -1,20 +1,20 @@
-; systemd service unit for vintage-gateway.
+; systemd service unit for ethernet-gateway.
 ;
-; Copy to /etc/systemd/system/vintage-gateway.service (or
+; Copy to /etc/systemd/system/ethernet-gateway.service (or
 ; /usr/lib/systemd/system/ for distro packaging), edit User/Group and
 ; WorkingDirectory below, then:
 ;
 ;   sudo systemctl daemon-reload
-;   sudo systemctl enable --now vintage-gateway.service
+;   sudo systemctl enable --now ethernet-gateway.service
 ;
-; Check status:     systemctl status vintage-gateway
-; Live logs:        journalctl -u vintage-gateway -f
-; Graceful reload:  systemctl reload vintage-gateway  (SIGHUP)
-; Stop:             systemctl stop vintage-gateway
+; Check status:     systemctl status ethernet-gateway
+; Live logs:        journalctl -u ethernet-gateway -f
+; Graceful reload:  systemctl reload ethernet-gateway  (SIGHUP)
+; Stop:             systemctl stop ethernet-gateway
 
 [Unit]
-Description=Vintage Gateway — telnet/SSH/Hayes gateway for retro terminals
-Documentation=https://github.com/rickybryce/vintage-gateway
+Description=Ethernet Gateway — telnet/SSH/Hayes gateway for retro terminals
+Documentation=https://github.com/rickybryce/ethernet-gateway
 After=network-online.target
 Wants=network-online.target
 
@@ -23,18 +23,18 @@ Type=simple
 
 ; ── Identity ──────────────────────────────────────────────
 ; Create a dedicated service user first:
-;   sudo useradd --system --home-dir /var/lib/vintage-gateway \
-;                --shell /usr/sbin/nologin vintage-gateway
+;   sudo useradd --system --home-dir /var/lib/ethernet-gateway \
+;                --shell /usr/sbin/nologin ethernet-gateway
 ; Then the directory and its contents belong to that user.
-User=vintage-gateway
-Group=vintage-gateway
+User=ethernet-gateway
+Group=ethernet-gateway
 
 ; ── Paths ─────────────────────────────────────────────────
-; WorkingDirectory is where vgateway.conf, gateway_hosts, and the SSH
+; WorkingDirectory is where egateway.conf, gateway_hosts, and the SSH
 ; host/client keys will be created and maintained.  It should be owned
 ; by the service user with mode 0750 or tighter.
-WorkingDirectory=/var/lib/vintage-gateway
-ExecStart=/usr/local/bin/vintage-gateway
+WorkingDirectory=/var/lib/ethernet-gateway
+ExecStart=/usr/local/bin/ethernet-gateway
 
 ; Reload semantics: the binary handles SIGHUP as "re-read config and
 ; restart listeners without dropping sessions if possible."
@@ -75,9 +75,9 @@ AmbientCapabilities=
 UMask=0077
 
 ; Allow writing only to the working directory (which contains
-; vgateway.conf, the transfer dir, and the SSH keys).  Everything else
+; egateway.conf, the transfer dir, and the SSH keys).  Everything else
 ; is read-only.
-ReadWritePaths=/var/lib/vintage-gateway
+ReadWritePaths=/var/lib/ethernet-gateway
 
 ; Allow binding low ports (telnet 23 / SSH 22) if the operator chose
 ; those.  If you stick to the defaults (telnet 2323, SSH 2222) you can

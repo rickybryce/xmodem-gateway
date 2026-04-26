@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ethernet Gateway v0.5.1 &mdash; Kermit Protocol Reference</title>
+    <meta name="description" content="Kermit file-transfer protocol reference for Ethernet Gateway: server-mode commands, client primitives, G subcommands, RESEND, locking shifts, and capability negotiation.">
+    <style>
+        :root {
+            --green: #33ff33;
+            --cyan: #00ffff;
+            --yellow: #ffff00;
+            --white: #f0f0f0;
+            --amber: #ffcc00;
+            --magenta: #ff66ff;
+            --red: #ff4444;
+            --dim: #888888;
+            --bg: #0a0a2e;
+            --bg-dark: #060620;
+            --bg-light: #101040;
+            --border: #3333aa;
+            --border-bright: #5555ff;
+            --link: #00ccff;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+            background: var(--bg);
+            color: var(--white);
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 19px;
+            line-height: 1.6;
+        }
+
+        .page {
+            max-width: 1100px;
+            margin: 0 auto;
+            border-left: 2px solid var(--border);
+            border-right: 2px solid var(--border);
+            background: var(--bg-dark);
+        }
+
+        .site-header {
+            background: var(--bg-dark);
+            padding: 36px 32px 24px;
+            text-align: center;
+            border-bottom: 2px dashed var(--border);
+        }
+
+        .header-photos {
+            display: inline-flex;
+            justify-content: center;
+            align-items: flex-end;
+            gap: 0;
+            margin-bottom: 14px;
+            border: 1px solid var(--cyan);
+            box-shadow: 0 0 12px rgba(0, 255, 255, 0.3);
+        }
+
+        .logo-photo {
+            height: 180px;
+            width: auto;
+            display: block;
+        }
+
+        .sysop-photo {
+            height: 180px;
+            width: auto;
+            image-rendering: pixelated;
+            display: block;
+        }
+
+        .site-header h1 {
+            font-size: 2.4em;
+            color: var(--yellow);
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            text-shadow: 0 0 10px rgba(255, 255, 0, 0.4);
+            line-height: 1.1;
+        }
+
+        .hdr-tagline {
+            color: var(--green);
+            font-size: 0.95em;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+
+        .hdr-version {
+            display: inline-block;
+            font-size: 0.8em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 3px 12px;
+            border: 1px solid var(--green);
+            color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+            margin-top: 14px;
+        }
+
+        .hdr-badges {
+            margin-top: 10px;
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .hdr-badge {
+            font-size: 0.8em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 3px 12px;
+            border: 1px solid var(--green);
+            color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+        }
+
+        .site-nav {
+            background: var(--bg-light);
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            border-bottom: 1px solid var(--border);
+            padding: 2px 0;
+        }
+
+        .site-nav a {
+            color: var(--cyan);
+            text-decoration: none;
+            padding: 10px 14px;
+            font-size: 0.85em;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .site-nav a:hover {
+            color: var(--yellow);
+            background: rgba(255, 255, 0, 0.08);
+        }
+
+        .divider {
+            border: none;
+            border-top: 1px dashed var(--border);
+            margin: 0;
+        }
+
+        .body-content {
+            padding: 0 32px 36px;
+        }
+
+        .section {
+            margin-top: 28px;
+        }
+
+        .section-title {
+            color: var(--yellow);
+            font-size: 1.2em;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            text-align: center;
+            padding: 8px 0;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .section > .intro {
+            font-size: 0.95em;
+            color: var(--dim);
+            margin-bottom: 16px;
+            text-align: center;
+        }
+
+        .cat {
+            font-size: 0.95em;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--bg-dark);
+            background: var(--cyan);
+            display: inline-block;
+            padding: 2px 14px;
+            margin: 20px 0 10px;
+        }
+
+        .cat:first-of-type { margin-top: 0; }
+
+        p {
+            font-size: 0.95em;
+            color: var(--white);
+            margin-bottom: 12px;
+        }
+
+        .dim-text { color: var(--dim); }
+
+        .feature-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 6px;
+            margin-bottom: 4px;
+        }
+
+        .feature-table td {
+            padding: 8px 10px;
+            vertical-align: top;
+            font-size: 0.95em;
+            border-bottom: 1px solid rgba(51, 51, 170, 0.4);
+        }
+
+        .feature-table tr:last-child td { border-bottom: none; }
+
+        .feature-table .key-col {
+            width: 50px;
+            text-align: center;
+            color: var(--yellow);
+            font-weight: bold;
+            white-space: nowrap;
+        }
+
+        .feature-table .name-col {
+            color: var(--green);
+            white-space: nowrap;
+            width: 1%;
+            padding-right: 16px;
+        }
+
+        .feature-table .desc-col { color: var(--dim); }
+
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0 16px;
+            font-size: 0.9em;
+        }
+
+        .data-table th {
+            background: var(--bg-light);
+            color: var(--yellow);
+            text-align: left;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+
+        .data-table td {
+            padding: 8px 14px;
+            border: 1px solid rgba(51, 51, 170, 0.4);
+            color: var(--white);
+        }
+
+        .data-table tr:hover td {
+            background: rgba(255, 255, 0, 0.03);
+        }
+
+        .data-table code {
+            color: var(--green);
+            background: none;
+            border: none;
+            padding: 0;
+        }
+
+        .instructions {
+            border: 1px solid var(--border);
+            padding: 18px 22px;
+            margin-bottom: 12px;
+            background: rgba(0, 0, 0, 0.3);
+        }
+
+        .instructions h3 {
+            font-size: 1em;
+            color: var(--cyan);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+            padding-bottom: 6px;
+            border-bottom: 1px dashed var(--border);
+        }
+
+        .instructions ol, .instructions ul {
+            margin-left: 22px;
+            font-size: 0.95em;
+            color: var(--white);
+        }
+
+        .instructions ol li, .instructions ul li {
+            margin-bottom: 3px;
+            padding-left: 2px;
+        }
+
+        .instructions p {
+            font-size: 0.95em;
+            color: var(--dim);
+        }
+
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.95em;
+            color: var(--green);
+            background: rgba(0, 0, 0, 0.4);
+            padding: 1px 6px;
+            border: 1px solid var(--border);
+        }
+
+        pre {
+            background: #000000;
+            border: 1px solid var(--border);
+            padding: 16px 20px;
+            overflow-x: auto;
+            margin: 10px 0 16px;
+            line-height: 1.5;
+        }
+
+        pre code {
+            background: none;
+            border: none;
+            padding: 0;
+            color: var(--green);
+        }
+
+        .prompt-char { color: var(--amber); }
+        .output-text { color: var(--dim); }
+
+        .callout {
+            border: 1px solid var(--amber);
+            background: rgba(255, 204, 0, 0.05);
+            padding: 14px 22px;
+            margin: 12px 0;
+            font-size: 0.95em;
+            color: var(--dim);
+        }
+
+        .callout strong { color: var(--amber); }
+
+        .callout-info {
+            border-color: var(--cyan);
+            background: rgba(0, 255, 255, 0.03);
+        }
+
+        .callout-info strong { color: var(--cyan); }
+
+        .callout-warn {
+            border-color: var(--red);
+            background: rgba(255, 68, 68, 0.05);
+        }
+
+        .callout-warn strong { color: var(--red); }
+
+        .callout-tip {
+            border-color: var(--green);
+            background: rgba(51, 255, 51, 0.05);
+        }
+
+        .callout-tip strong { color: var(--green); }
+
+        .menu-block {
+            background: #000000;
+            border: 1px solid var(--green);
+            padding: 20px 28px;
+            margin: 14px 0 18px;
+            line-height: 1.8;
+        }
+
+        .menu-block .sep { color: var(--dim); }
+        .menu-block .title { color: var(--yellow); font-weight: bold; }
+        .menu-block .key { color: var(--cyan); font-weight: bold; }
+        .menu-block .label { color: var(--white); }
+        .menu-block .menu-dim { color: var(--dim); }
+        .menu-block .val { color: var(--amber); }
+
+        ul, ol {
+            margin: 8px 0 14px 28px;
+            font-size: 0.95em;
+        }
+
+        li { margin-bottom: 4px; }
+
+        .body-content a {
+            color: var(--link);
+            text-decoration: none;
+        }
+
+        .body-content a:hover {
+            color: var(--yellow);
+            text-decoration: underline;
+        }
+
+        .site-footer {
+            background: var(--bg-dark);
+            color: var(--dim);
+            text-align: center;
+            padding: 22px 32px;
+            font-size: 0.85em;
+            border-top: 2px dashed var(--border);
+        }
+
+        .site-footer a {
+            color: var(--cyan);
+            text-decoration: none;
+        }
+
+        .site-footer a:hover { color: var(--yellow); }
+
+        @media (max-width: 900px) {
+            body { font-size: 17px; }
+            .site-header { padding: 24px 16px 16px; }
+            .site-header h1 { font-size: 1.6em; letter-spacing: 2px; }
+            .hdr-tagline { letter-spacing: 2px; font-size: 0.85em; }
+            .body-content { padding: 0 16px 28px; }
+            .site-nav a { padding: 8px 10px; font-size: 0.78em; }
+            .section-title { font-size: 1em; letter-spacing: 2px; }
+            .feature-table .desc-col { display: none; }
+            .logo-photo { height: 120px; }
+            .sysop-photo { height: 120px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+
+        <header class="site-header">
+            <div class="header-photos">
+                <img src="ricky.png" alt="Author: Ricky Bryce" class="sysop-photo">
+                <img src="ethernetgatewaylogo.png" alt="Ethernet Gateway" class="logo-photo">
+            </div>
+            <h1>Kermit Reference</h1>
+            <p class="hdr-tagline">Ethernet Gateway &mdash; Protocol Commands</p>
+            <div class="hdr-version">v0.5.1</div>
+            <div class="hdr-badges">
+                <span class="hdr-badge">Server Mode</span>
+                <span class="hdr-badge">Client Mode</span>
+                <span class="hdr-badge">RESEND</span>
+                <span class="hdr-badge">Locking Shifts</span>
+                <span class="hdr-badge">C-Kermit Compatible</span>
+            </div>
+        </header>
+
+        <nav class="site-nav">
+            <a href="index.html">&larr; User Manual</a>
+            <a href="#overview">Overview</a>
+            <a href="#server-mode">Server Mode</a>
+            <a href="#peer-commands">Peer Commands</a>
+            <a href="#g-subcommands">G Subcommands</a>
+            <a href="#capabilities">Capabilities</a>
+            <a href="#config">Config</a>
+            <a href="#examples">Examples</a>
+            <a href="#spec">Spec</a>
+        </nav>
+
+        <div class="body-content">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- OVERVIEW                                      -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="overview">
+                <div class="section-title">Overview</div>
+
+                <p>
+                    Kermit is a robust file-transfer protocol designed in 1981 by
+                    Frank da Cruz at Columbia University. Unlike XMODEM/YMODEM/ZMODEM,
+                    Kermit was built for environments where bytes can be lost, mangled,
+                    or stripped to 7 bits — old serial links, packet-switched networks,
+                    and bridged terminal hardware. Ethernet Gateway implements a
+                    spec-complete Kermit on both directions: as a client connecting to
+                    a remote Kermit server, and as a server idling waiting for commands
+                    from a peer.
+                </p>
+
+                <p>
+                    The implementation follows Frank da Cruz, <em>Kermit, A File Transfer
+                    Protocol</em> (Digital Press, 1987) plus the long-packet, sliding-window,
+                    and streaming extensions used by C-Kermit. Real C-Kermit 10.0 interop
+                    is verified by the test suite for both upload (<code>send</code>) and
+                    download (<code>get</code>) directions.
+                </p>
+
+                <div class="cat">When to use Kermit</div>
+                <table class="feature-table">
+                    <tr>
+                        <td class="key-col">7-bit</td>
+                        <td class="name-col">7-bit links</td>
+                        <td class="desc-col">Old serial connections, telnet bridges that strip the high bit, mainframe links — XMODEM family doesn't survive these without a layer of escaping; Kermit was designed for them.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">flaky</td>
+                        <td class="name-col">Lossy connections</td>
+                        <td class="desc-col">Per-packet ACK + sliding window + selective-repeat retransmit recovers cleanly from drops; resume-partial picks up where a broken link left off.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">cross</td>
+                        <td class="name-col">Cross-platform peers</td>
+                        <td class="desc-col">Kermit is on every retro platform that mattered: VMS, MVS, CP/M, MS-DOS, every UNIX. C-Kermit, G-Kermit, Kermit-95, Kermit-86, MS-Kermit, E-Kermit are all interoperable.</td>
+                    </tr>
+                    <tr>
+                        <td class="key-col">batch</td>
+                        <td class="name-col">Multi-file batches</td>
+                        <td class="desc-col">A single S/B exchange carries many files; the spec is self-describing (filename, mtime, mode all carried in the A-packet metadata).</td>
+                    </tr>
+                </table>
+
+                <div class="callout callout-info">
+                    <strong>Capabilities advertised:</strong>
+                    sliding windows (up to 31), streaming (TCP/SSH only — no per-packet ACKs),
+                    long packets (up to 9024 bytes), attribute packets (file size, mtime, mode,
+                    encoding, record format, creator, account, …), CRC-16 block check, repeat
+                    compression, RESEND, locking shifts.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SERVER MODE                                   -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="server-mode">
+                <div class="section-title">Server Mode</div>
+
+                <p>
+                    Pick <code>K</code> from the File Transfer menu to drop into Kermit
+                    server mode. The server then idles waiting for commands from your
+                    Kermit client. The peer drives the entire session by sending Kermit
+                    protocol commands; the server processes each one and returns to idle
+                    until the peer sends <code>finish</code>, <code>bye</code>, or
+                    disconnects.
+                </p>
+
+                <div class="cat">Entering server mode</div>
+                <div class="menu-block">
+<span class="sep">══════════════════════════════════════</span>
+<span class="title">  KERMIT SERVER MODE</span>
+<span class="sep">══════════════════════════════════════</span>
+
+  <span class="key">Kermit server ready. Send commands or files.</span>
+
+  Drive from your Kermit client, e.g. C-Kermit:
+    <span class="key">send &lt;file&gt;</span>           — upload a file to us
+    <span class="key">get &lt;file&gt;</span>            — download a file from us
+    <span class="key">remote dir</span>              — list files in current dir
+    <span class="key">remote cwd &lt;subdir&gt;</span>     — change our working subdir
+    <span class="key">finish | bye</span>            — end server session
+
+  Inactivity timeout: <span class="val">45</span> s.
+                </div>
+
+                <p class="dim-text">
+                    Files sent to the server are saved into <code>transfer_dir</code>
+                    (or its current sub-directory if the peer changed it via
+                    <code>remote cwd</code>). The server returns a per-file
+                    &check;/&times; summary when the session ends.
+                </p>
+
+                <div class="cat">What the server accepts</div>
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Type</th><th>From peer</th><th>Server response</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>S</code></td><td>Send-Init starting an upload</td><td>Y-ACK with our capabilities, then drives the receive flow (F/A/D…/Z/B).</td></tr>
+                        <tr><td><code>R</code></td><td>Receive-request: peer wants a file from us</td><td>Y-ACK to R, then sends S+F+A+D…+Z+B for the requested file.</td></tr>
+                        <tr><td><code>I</code></td><td>Init: peer asks us to advertise capabilities</td><td>Y-ACK with a fresh Send-Init payload listing our caps.</td></tr>
+                        <tr><td><code>G</code></td><td>Generic command (F/L/B/C/D/$/K/H/?)</td><td>See the <a href="#g-subcommands">G subcommand reference</a>.</td></tr>
+                        <tr><td><code>C</code></td><td>Host command (run a shell command)</td><td><strong style="color: var(--red);">Refused</strong> with E-packet "Host commands disabled". Always.</td></tr>
+                        <tr><td><code>E</code></td><td>Error packet from peer</td><td>Logged; session ends silently (per spec, E is fatal both ways).</td></tr>
+                        <tr><td><code>B</code></td><td>EOT — end of transmission</td><td>ACK; session ends cleanly.</td></tr>
+                    </tbody>
+                </table>
+
+                <div class="callout callout-warn">
+                    <strong>Host commands stay refused:</strong>
+                    <code>C</code> packets are a remote-code-execution primitive by
+                    design. The server emits an E-packet "Host commands disabled" and
+                    keeps idling. There is no configuration switch to enable them —
+                    actually executing peer-supplied shell commands is out of scope
+                    and unsafe regardless of who you trust.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- PEER COMMANDS (CKERMIT-STYLE)                 -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="peer-commands">
+                <div class="section-title">Peer Commands</div>
+
+                <p>
+                    These are the commands you can issue from C-Kermit (or any
+                    spec-compatible Kermit client) once connected to the gateway in
+                    server mode. The corresponding wire-protocol packet type is shown
+                    in parentheses.
+                </p>
+
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Command</th><th>Wire</th><th>What it does</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>send &lt;file&gt;</code></td><td>S</td><td>Upload a file from your local system to <code>transfer_dir</code> on the gateway. Multi-file batches OK.</td></tr>
+                        <tr><td><code>get &lt;file&gt;</code></td><td>R</td><td>Download a file from <code>transfer_dir</code> to your local system. Filename is validated for path-traversal.</td></tr>
+                        <tr><td><code>remote dir</code></td><td>G D</td><td>List files in the current effective directory. Hidden files (leading dot) are filtered out.</td></tr>
+                        <tr><td><code>remote cd &lt;subdir&gt;</code></td><td>G C</td><td>Change the gateway's working sub-directory for subsequent commands. Path-traversal is refused.</td></tr>
+                        <tr><td><code>remote space</code></td><td>G $</td><td>Report free disk space at the current effective directory in bytes.</td></tr>
+                        <tr><td><code>remote kermit</code></td><td>G K</td><td>Identify the server: <code>Ethernet Gateway Kermit 0.5.1</code>.</td></tr>
+                        <tr><td><code>remote help</code></td><td>G H / G ?</td><td>Display the list of supported subcommands.</td></tr>
+                        <tr><td><code>finish</code></td><td>G F</td><td>End the protocol session politely.</td></tr>
+                        <tr><td><code>logout</code></td><td>G L</td><td>End the session (semantically: log out the connection).</td></tr>
+                        <tr><td><code>bye</code></td><td>G B</td><td>End the session and disconnect.</td></tr>
+                    </tbody>
+                </table>
+
+                <div class="callout callout-tip">
+                    <strong>Path safety:</strong>
+                    Both <code>get</code> filenames and <code>remote cd</code> sub-directory
+                    arguments are validated before any disk I/O. Any name containing
+                    <code>..</code>, leading dots, separator characters, or NUL bytes
+                    is refused with an E-packet, and the server keeps idling for the
+                    next command (per spec §6.7).
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- G SUBCOMMANDS                                 -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="g-subcommands">
+                <div class="section-title">G Subcommand Reference</div>
+
+                <p>
+                    Generic-command (<code>G</code>) packets carry a single action byte
+                    followed by an optional argument. The server recognises every
+                    spec-defined subcommand and replies appropriately.
+                </p>
+
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Letter</th><th>Name</th><th>Reply shape</th><th>Notes</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>F</code></td><td>Finish</td><td>ACK, exit</td><td>End the protocol session. Most polite end-of-session signal.</td></tr>
+                        <tr><td><code>L</code></td><td>Logout</td><td>ACK, exit</td><td>Same as F at the protocol level.</td></tr>
+                        <tr><td><code>B</code></td><td>BYE</td><td>ACK, exit</td><td>Same as F. Some clients use BYE to also signal "drop the connection".</td></tr>
+                        <tr><td><code>C</code></td><td>CWD</td><td>ACK</td><td>Argument is a relative subdir. Empty argument resets to <code>transfer_dir</code> root. Validates against path-traversal.</td></tr>
+                        <tr><td><code>D</code></td><td>Directory</td><td>ACK + X+ + Z</td><td>Returns one entry per line: <code>name &lt;TAB&gt; size|&lt;dir&gt;</code>, sorted, hidden files skipped. Paginated across multiple X-packets when needed.</td></tr>
+                        <tr><td><code>$</code></td><td>SPACE</td><td>ACK + X + Z</td><td>Returns free-bytes count as a decimal string, or <code>unknown</code> on platforms without <code>statvfs</code>.</td></tr>
+                        <tr><td><code>K</code></td><td>KERMIT</td><td>ACK + X + Z</td><td>Returns server identity + version (<code>Ethernet Gateway Kermit 0.5.1</code>).</td></tr>
+                        <tr><td><code>H</code> / <code>?</code></td><td>Help</td><td>ACK + X+ + Z</td><td>Returns the list of supported subcommands. Both <code>H</code> and <code>?</code> are accepted for compatibility.</td></tr>
+                        <tr><td>other</td><td>(unknown)</td><td>ACK</td><td>Per spec, unknown G subcommands are silently acknowledged and ignored.</td></tr>
+                    </tbody>
+                </table>
+
+                <p class="dim-text">
+                    Where the reply is <code>ACK + X+ + Z</code>, the body of the
+                    response is delivered in one or more X-packets followed by a
+                    single Z to terminate. Long responses (e.g. a directory with many
+                    files) are paginated to fit within the classic 94-byte MAXL so
+                    the response works against strict-spec peers that haven't
+                    negotiated long packets.
+                </p>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- CAPABILITIES                                  -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="capabilities">
+                <div class="section-title">Capabilities &amp; Negotiation</div>
+
+                <p>
+                    Both peers exchange a <em>Send-Init</em> (<code>S</code>) packet at
+                    the start of a transfer. Each side advertises what it can do; the
+                    intersection is what the actual transfer uses. Below are the
+                    capabilities the gateway advertises and what each one buys you.
+                </p>
+
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Capability</th><th>What it does</th><th>Default</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Long packets</td>
+                            <td>Up to 9024-byte payloads instead of the classic 94-byte cap. Massive throughput win for clean links.</td>
+                            <td>On</td>
+                        </tr>
+                        <tr>
+                            <td>Sliding windows</td>
+                            <td>Up to 31 outstanding packets in flight. Hides round-trip latency; peer NAKs trigger selective-repeat retransmit per spec §5.5.</td>
+                            <td>On (window=4)</td>
+                        </tr>
+                        <tr>
+                            <td>Streaming</td>
+                            <td>Sender skips per-packet ACKs entirely on reliable links (TCP/SSH). Peer only sends NAK on error.</td>
+                            <td>On</td>
+                        </tr>
+                        <tr>
+                            <td>Attribute packets (A)</td>
+                            <td>Carries file size, mtime, mode, encoding, record format, creator ID, and ~10 other typed metadata fields.</td>
+                            <td>On</td>
+                        </tr>
+                        <tr>
+                            <td>Repeat compression</td>
+                            <td>Runs of identical bytes are encoded as <code>~ count byte</code>. Cheap RLE for spaced-out output.</td>
+                            <td>On</td>
+                        </tr>
+                        <tr>
+                            <td>CRC-16 block check</td>
+                            <td>16-bit CRC per packet (polynomial 0x8408, reflected CCITT) instead of the classic 6-bit checksum.</td>
+                            <td>Type 3</td>
+                        </tr>
+                        <tr>
+                            <td>RESEND</td>
+                            <td>Resume a partial upload from where the previous attempt left off — receiver advertises <code>disposition='R'</code> + offset in the A-packet ACK.</td>
+                            <td>Off (opt-in)</td>
+                        </tr>
+                        <tr>
+                            <td>Locking shifts</td>
+                            <td>SO/SI region markers for 8-bit data over 7-bit links instead of QBIN's per-byte prefix. Spec §3.4.5; rarely used by modern peers.</td>
+                            <td>Off (opt-in)</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="callout">
+                    <strong>RESEND opt-in:</strong>
+                    Resume support is off by default because a peer that doesn't honor
+                    <code>disposition='R'</code> would re-send a file from byte 0 while
+                    the receiver pre-loaded partial bytes — corrupting the result.
+                    Enable <code>kermit_resume_partial = true</code> in
+                    <code>egateway.conf</code> only when both ends are known compatible.
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- CONFIG                                        -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="config">
+                <div class="section-title">Configuration Keys</div>
+
+                <p>
+                    Set in <code>egateway.conf</code>; changes take effect on the next
+                    Kermit session.
+                </p>
+
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Key</th><th>Default</th><th>Effect</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>kermit_negotiation_timeout</code></td><td>45</td><td>Seconds for the Send-Init handshake (and per-command idle in server mode).</td></tr>
+                        <tr><td><code>kermit_packet_timeout</code></td><td>10</td><td>Per-packet read deadline after Send-Init.</td></tr>
+                        <tr><td><code>kermit_max_retries</code></td><td>5</td><td>Maximum NAK / timeout retries per packet before giving up.</td></tr>
+                        <tr><td><code>kermit_max_packet_length</code></td><td>4096</td><td>MAXL we advertise (10..=9024). Higher = more throughput, more retransmit cost on a flaky line.</td></tr>
+                        <tr><td><code>kermit_window_size</code></td><td>4</td><td>Sliding-window depth (1..=31). 1 = stop-and-wait.</td></tr>
+                        <tr><td><code>kermit_block_check_type</code></td><td>3</td><td>1 = 6-bit checksum, 2 = 12-bit, 3 = CRC-16/KERMIT.</td></tr>
+                        <tr><td><code>kermit_long_packets</code></td><td>true</td><td>Advertise long-packets capability.</td></tr>
+                        <tr><td><code>kermit_sliding_windows</code></td><td>true</td><td>Advertise sliding-window capability.</td></tr>
+                        <tr><td><code>kermit_streaming</code></td><td>true</td><td>Advertise streaming-Kermit (no per-packet ACKs). Big speed win on TCP/SSH.</td></tr>
+                        <tr><td><code>kermit_attribute_packets</code></td><td>true</td><td>Advertise A-packet (file metadata) support.</td></tr>
+                        <tr><td><code>kermit_repeat_compression</code></td><td>true</td><td>Use REPT compression for runs of identical bytes.</td></tr>
+                        <tr><td><code>kermit_8bit_quote</code></td><td>auto</td><td><code>auto</code> (only when peer asks), <code>on</code>, or <code>off</code>.</td></tr>
+                        <tr><td><code>kermit_iac_escape</code></td><td>false</td><td>Apply telnet IAC escaping during transfers (toggled per-session by terminal).</td></tr>
+                        <tr><td><code>kermit_resume_partial</code></td><td>false</td><td>Resume partial uploads via <code>disposition='R'</code> in the A-packet ACK.</td></tr>
+                        <tr><td><code>kermit_resume_max_age_hours</code></td><td>168</td><td>Ignore on-disk partials older than this. 168 = one week.</td></tr>
+                        <tr><td><code>kermit_locking_shifts</code></td><td>false</td><td>Advertise SO/SI region-shift quoting for 8-bit transit on 7-bit links.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- EXAMPLES                                      -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="examples">
+                <div class="section-title">Examples</div>
+
+                <div class="cat">Pull a file from the gateway with C-Kermit</div>
+                <pre><code><span class="prompt-char">$</span> kermit -B -j 192.168.1.160:2323 -i -q -g report.txt -a /tmp/report.txt</code></pre>
+                <p class="dim-text">
+                    <code>-B</code> batch mode, <code>-j host:port</code> opens a
+                    telnet-protocol TCP connection, <code>-i</code> binary (image)
+                    transfer, <code>-q</code> quiet, <code>-g remote-name</code> get
+                    the named file, <code>-a local-name</code> save it locally as a
+                    different name. The gateway must be in Kermit Server Mode
+                    (File Transfer menu &rarr; <code>K</code>) when ckermit dials in.
+                </p>
+
+                <div class="cat">Upload a file to the gateway</div>
+                <pre><code><span class="prompt-char">$</span> kermit -B -j 192.168.1.160:2323 -i -q -s ./localfile.bin</code></pre>
+
+                <div class="cat">Interactive session with multiple commands</div>
+                <pre><code><span class="prompt-char">$</span> kermit
+<span class="output-text">C-Kermit&gt;</span> set host 192.168.1.160:2323 /telnet
+<span class="output-text">C-Kermit&gt;</span> remote kermit
+<span class="output-text">Ethernet Gateway Kermit 0.5.1</span>
+<span class="output-text">C-Kermit&gt;</span> remote dir
+<span class="output-text">alpha.bin    1024
+beta.bin     2048
+docs         &lt;dir&gt;</span>
+<span class="output-text">C-Kermit&gt;</span> remote cd docs
+<span class="output-text">C-Kermit&gt;</span> get readme.txt
+<span class="output-text">C-Kermit&gt;</span> finish
+<span class="output-text">C-Kermit&gt;</span> exit</code></pre>
+
+                <p class="dim-text">
+                    Interactive C-Kermit needs a controlling tty for some commands —
+                    if you're scripting, keep using <code>-g</code> / <code>-s</code>
+                    action flags or wrap with <code>script -qc</code> to provide a
+                    pseudo-terminal.
+                </p>
+            </div>
+
+            <hr class="divider">
+
+            <!-- ══════════════════════════════════════════════ -->
+            <!-- SPEC                                          -->
+            <!-- ══════════════════════════════════════════════ -->
+            <div class="section" id="spec">
+                <div class="section-title">Spec References</div>
+
+                <ul>
+                    <li>
+                        Frank da Cruz, <em>Kermit, A File Transfer Protocol</em>,
+                        Digital Press, 1987 — the canonical reference. The base
+                        protocol (Send-Init, F/A/D/Z/B), G-packet semantics, and the
+                        attribute-packet sub-attribute table all come from here.
+                    </li>
+                    <li>
+                        Frank da Cruz &amp; Christine Gianone, <em>Using C-Kermit</em>,
+                        Digital Press, 1997 — server-mode operation, the long-packet
+                        and sliding-window extensions, streaming Kermit.
+                    </li>
+                    <li>
+                        <a href="https://kermitproject.org/">kermitproject.org</a> —
+                        ongoing reference site for the modern Kermit family. C-Kermit
+                        source is available there.
+                    </li>
+                </ul>
+
+                <div class="callout callout-info">
+                    <strong>Test coverage:</strong>
+                    The Kermit module ships with 920+ unit tests covering every
+                    spec-defined packet type, capability negotiation, all 7 typed
+                    A-packet sub-attributes, RESEND edge cases, locking-shift
+                    round-trips, server-mode dispatch, client-mode primitives,
+                    proptest fuzzers on adversarial wire bytes, and real C-Kermit 10.0
+                    subprocess interop for both <code>send</code> and <code>get</code>.
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ══════════════════════════════════════════════════ -->
+        <!-- FOOTER                                            -->
+        <!-- ══════════════════════════════════════════════════ -->
+        <footer class="site-footer">
+            Ethernet Gateway v0.5.1 &mdash; &copy; 2026 Ricky Bryce &mdash;
+            Licensed under GPL-3.0-or-later
+            &mdash; <a href="index.html">Back to User Manual</a>
+        </footer>
+
+    </div>
+</body>
+</html>

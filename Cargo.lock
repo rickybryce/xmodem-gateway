@@ -1352,6 +1352,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "ethernet-gateway"
+version = "0.5.1"
+dependencies = [
+ "arboard",
+ "bytes",
+ "eframe",
+ "egui_extras",
+ "html2text",
+ "if-addrs",
+ "libc",
+ "proptest",
+ "rand 0.10.1",
+ "rfd",
+ "russh",
+ "serde_json",
+ "serialport",
+ "signal-hook",
+ "tokio",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4979,29 +5002,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vintage-gateway"
-version = "0.4.0"
-dependencies = [
- "arboard",
- "bytes",
- "eframe",
- "egui_extras",
- "html2text",
- "if-addrs",
- "libc",
- "proptest",
- "rand 0.10.1",
- "rfd",
- "russh",
- "serde_json",
- "serialport",
- "signal-hook",
- "tokio",
- "ureq",
- "url",
-]
 
 [[package]]
 name = "wait-timeout"
