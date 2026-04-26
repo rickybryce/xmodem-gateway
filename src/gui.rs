@@ -1429,12 +1429,21 @@ impl eframe::App for App {
                         egui::Layout::top_down(egui::Align::Max),
                         |ui| {
                             ui.add_space(-32.0);
+                            // Texture-options note: the source PNG is now
+                            // pre-resized to 1024x512 (Lanczos) which is
+                            // a small minification ratio versus our
+                            // ~366x183 display size — so mipmaps add
+                            // little and Linear-mipmap-Linear filtering
+                            // was contributing a faint mauve cast on
+                            // dark-blue gradients via pre-filtered level
+                            // bleeding.  Plain Linear minification with
+                            // mipmaps disabled is sharp and clean here.
                             ui.add(
                                 egui::Image::new(egui::include_image!("../ethernetgatewaylogo.png"))
                                     .texture_options(egui::TextureOptions {
                                         magnification: egui::TextureFilter::Linear,
                                         minification: egui::TextureFilter::Linear,
-                                        mipmap_mode: Some(egui::TextureFilter::Linear),
+                                        mipmap_mode: None,
                                         ..Default::default()
                                     })
                                     .fit_to_exact_size(egui::vec2(logo_w, logo_h)),

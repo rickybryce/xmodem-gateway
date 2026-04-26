@@ -1,12 +1,14 @@
 # Ethernet Gateway
 
-A telnet-based XMODEM/YMODEM/ZMODEM file transfer server, SSH gateway,
-Hayes-compatible modem emulator for serial-attached retro hardware,
-text-mode web browser, and AI chat client written in Rust. Supports PETSCII (Commodore 64), ANSI,
-and ASCII terminals. Designed for local network use with retro and modern
-terminal clients.
+A telnet-based XMODEM/YMODEM/ZMODEM/Kermit file transfer server, SSH
+gateway, Hayes-compatible modem emulator for serial-attached retro
+hardware, text-mode web browser, and AI chat client written in Rust.
+Supports PETSCII (Commodore 64), ANSI, and ASCII terminals. Designed
+for local network use with retro and modern terminal clients.
 
-**[User Manual](http://telnetbible.com/ethernet-gateway/index.html)**
+**[User Manual](http://ethernetgateway.com/index.html)**
+&nbsp;&middot;&nbsp;
+**[Kermit Reference](http://ethernetgateway.com/kermit.html)**
 
 Once you run the server on your PC, you can telnet to that server from
 anywhere on your network (allow firewall port 2323).
@@ -247,7 +249,7 @@ ships with:
 ### Verifying the checksum
 
 ```sh
-sha256sum -c ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 ### Verifying the GPG signature (if present)
@@ -255,8 +257,8 @@ sha256sum -c ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```sh
 gpg --keyserver keys.openpgp.org --recv-keys <KEY_FINGERPRINT>
 gpg --verify \
-    ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.asc \
-    ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.asc \
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 ### Verifying the Sigstore signature
@@ -266,11 +268,11 @@ free):
 
 ```sh
 cosign verify-blob \
-    --certificate ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.pem \
-    --signature   ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sig \
+    --certificate ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.pem \
+    --signature   ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz.sig \
     --certificate-identity-regexp "https://github.com/rickybryce/ethernet-gateway/.*" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    ethernet-gateway-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+    ethernet-gateway-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 This ties the binary to a specific GitHub Actions workflow run on

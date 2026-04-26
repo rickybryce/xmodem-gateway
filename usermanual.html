@@ -226,7 +226,7 @@ hr { border: 0; border-top: 1px solid #bbb; margin: 1em 0; }
 <div class="cover">
     <div class="title">Ethernet Gateway</div>
     <div class="subtitle">User Manual</div>
-    <div class="version">Version 0.4.0</div>
+    <div class="version">Version 0.5.1</div>
     <div class="author">Ricky Bryce</div>
     <div class="tag">
         A telnet/SSH file-transfer gateway, SSH proxy, Hayes-compatible
@@ -265,6 +265,7 @@ hr { border: 0; border-top: 1px solid #bbb; margin: 1em 0; }
             <li><a href="#ch8-download">Downloads — Protocol Prompt</a></li>
             <li><a href="#ch8-zmodem">ZMODEM Autostart Detection</a></li>
             <li><a href="#ch8-tuning">Protocol Timeout Tunables</a></li>
+            <li><a href="#ch8-kermit">Kermit — Server &amp; Client Mode</a></li>
         </ol>
     </li>
     <li><span class="num">9.</span> <a href="#ch9">Serial / Hayes AT Modem Emulation</a>
@@ -389,7 +390,7 @@ distribution without installation. On first run the AppImage creates
 Each release publishes a SHA-256 checksum, an optional GPG signature, and a
 Sigstore keyless signature bound to the publisher's GitHub identity. Verify
 at least the SHA-256 before running any binary from the internet:
-<code>sha256sum -c ethernet-gateway-v0.4.0-…tar.gz.sha256</code>.
+<code>sha256sum -c ethernet-gateway-v0.5.1-…tar.gz.sha256</code>.
 </aside>
 
 <h2 id="ch2-source">2.2 Building from Source</h2>
@@ -1238,6 +1239,109 @@ log identifies each event with its protocol prefix (<code>XMODEM recv:</code>,
 traceable.
 </aside>
 
+<h2 id="ch8-kermit">8.8 Kermit &mdash; Server &amp; Client Mode</h2>
+
+<p>
+Beyond XMODEM/YMODEM/ZMODEM, the gateway implements a spec-complete Kermit
+file-transfer protocol following Frank da Cruz's <em>Kermit, A File Transfer
+Protocol</em> (Digital Press, 1987) plus the long-packet, sliding-window,
+and streaming extensions used by C-Kermit. Both directions are supported:
+the gateway can act as a Kermit <em>server</em> (idle waiting for commands
+from a connecting client) and as a Kermit <em>client</em> (connect to a
+remote server and pull/push files programmatically).
+</p>
+
+<h3>Why Kermit alongside XMODEM/ZMODEM?</h3>
+
+<p>
+Kermit was designed in 1981 for environments where bytes can be lost,
+mangled, or stripped to 7 bits &mdash; old serial links, packet-switched
+networks, and bridged terminal hardware. It survives conditions that
+XMODEM/YMODEM/ZMODEM cannot: 7-bit-only links (mainframe gateways, some
+telnet bridges), lossy connections that need selective retransmit, and
+multi-platform interop (every retro platform that mattered has a Kermit).
+ZMODEM is faster on clean modern links; Kermit is the right choice for
+the gnarly ones.
+</p>
+
+<h3>Entering server mode</h3>
+
+<p>
+From the File Transfer menu, press <span class="kbd">K</span> to drop the
+session into Kermit Server Mode. The terminal displays a banner listing
+the supported peer commands (<code>send</code>, <code>get</code>,
+<code>remote dir</code>, <code>remote cwd</code>, <code>remote kermit</code>,
+<code>remote help</code>, <code>finish</code>, <code>bye</code>). The
+gateway then idles waiting for protocol packets; when the peer sends
+<code>finish</code>, <code>bye</code>, or disconnects, control returns to
+the File Transfer menu with a per-file &check;/&times; summary of received
+files.
+</p>
+
+<h3>What the peer can do</h3>
+
+<table>
+    <thead><tr><th>Peer command</th><th>Wire packet</th><th>Effect</th></tr></thead>
+    <tbody>
+        <tr><td><code>send &lt;file&gt;</code></td><td>S + F + A + D&hellip; + Z + B</td><td>Upload a file from the peer to the gateway's <code>transfer_dir</code> (or current sub-directory).</td></tr>
+        <tr><td><code>get &lt;file&gt;</code></td><td>R, then we send</td><td>Download a file from the gateway to the peer.</td></tr>
+        <tr><td><code>remote dir</code></td><td>G D</td><td>List files in the current effective directory.</td></tr>
+        <tr><td><code>remote cd &lt;subdir&gt;</code></td><td>G C</td><td>Change the gateway's working sub-directory for subsequent commands.</td></tr>
+        <tr><td><code>remote space</code></td><td>G $</td><td>Report free disk bytes at the current effective directory.</td></tr>
+        <tr><td><code>remote kermit</code></td><td>G K</td><td>Identify the server (<code>Ethernet Gateway Kermit 0.5.1</code>).</td></tr>
+        <tr><td><code>remote help</code></td><td>G H / G ?</td><td>List supported subcommands.</td></tr>
+        <tr><td><code>finish</code> / <code>logout</code> / <code>bye</code></td><td>G F / G L / G B</td><td>End the protocol session politely.</td></tr>
+    </tbody>
+</table>
+
+<h3>Capabilities advertised</h3>
+
+<p>
+The gateway negotiates the full set of modern Kermit extensions: long
+packets (up to 9024 bytes per packet), sliding windows (up to 31
+outstanding packets with selective-repeat retransmit), streaming
+(no per-packet ACKs on reliable links), CRC-16 block check, attribute
+packets carrying file size + mtime + mode + record format + creator ID +
+~10 other typed metadata fields, repeat-count compression, RESEND
+(resume partial uploads), and locking shifts (SO/SI region quoting for
+8-bit transit on 7-bit links).
+</p>
+
+<p>
+Two of these are off by default and gated behind config keys:
+<code>kermit_resume_partial</code> for RESEND (off because a peer that
+doesn't honor <code>disposition='R'</code> would corrupt the result), and
+<code>kermit_locking_shifts</code> for SO/SI quoting (off because no
+modern peer uses it &mdash; QBIN per-byte 8th-bit prefixing covers the
+same use case).
+</p>
+
+<h3>C-Kermit interop</h3>
+
+<p>
+Real C-Kermit 10.0 interop is verified by the test suite for both
+directions. Example invocations:
+</p>
+
+<pre>
+<span class="prompt">$</span> kermit -B -j 192.168.1.160:2323 -i -q -s ./localfile.bin
+<span class="comment"># Upload localfile.bin to the gateway. -B batch, -j telnet-protocol TCP,
+# -i image (binary), -q quiet, -s send action.</span>
+
+<span class="prompt">$</span> kermit -B -j 192.168.1.160:2323 -i -q -g report.txt -a /tmp/report.txt
+<span class="comment"># Pull report.txt from the gateway and save locally as /tmp/report.txt.
+# -g get action, -a alternate local name. The gateway must be in
+# Kermit Server Mode (File Transfer menu &rarr; K) when ckermit dials in.</span>
+</pre>
+
+<aside class="tip">
+<span class="label">Full Kermit reference</span>
+A standalone reference page <code>kermit.html</code> documents every
+G subcommand, the full capability table, all 16 <code>kermit_*</code>
+configuration keys with defaults, additional examples, and spec
+citations. See it on the project website alongside this manual.
+</aside>
+
 <!-- ═══════════════════ 9. Hayes AT modem ═══════════════════ -->
 <h1 id="ch9">9. Serial / Hayes AT Modem Emulation</h1>
 
@@ -1382,7 +1486,7 @@ hit the same entry.
 <table>
     <thead><tr><th>Command</th><th>Response</th></tr></thead>
     <tbody>
-        <tr><td><code>ATI</code> / <code>ATI0</code></td><td>Product ID and version: <code>Ethernet Gateway Modem Emulator v0.4.0</code></td></tr>
+        <tr><td><code>ATI</code> / <code>ATI0</code></td><td>Product ID and version: <code>Ethernet Gateway Modem Emulator v0.5.1</code></td></tr>
         <tr><td><code>ATI1</code></td><td>ROM checksum: <code>000</code> (virtual)</td></tr>
         <tr><td><code>ATI2</code></td><td>ROM self-test: <code>OK</code></td></tr>
         <tr><td><code>ATI3</code></td><td>Firmware identifier: <code>Ethernet Gateway 0.3.3</code></td></tr>
@@ -2222,7 +2326,7 @@ run to completion rather than halt mid-setup with <code>ERROR</code>.
 <hr>
 
 <p class="small" style="margin-top: 1.5em; text-align: center;">
-Ethernet Gateway v0.4.0 &mdash; Copyright &copy; 2026 Ricky Bryce &mdash;
+Ethernet Gateway v0.5.1 &mdash; Copyright &copy; 2026 Ricky Bryce &mdash;
 Licensed under GPL-3.0-or-later.
 </p>
 

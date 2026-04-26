@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ethernet Gateway v0.4.0 &mdash; User Manual</title>
+    <title>Ethernet Gateway v0.5.1 &mdash; User Manual</title>
     <meta name="description" content="Complete user manual for Ethernet Gateway — a telnet/SSH gateway server with XMODEM file transfer, AI chat, web browser, weather, and serial modem emulation.">
     <style>
         :root {
@@ -519,7 +519,7 @@
             </div>
             <h1>Ethernet Gateway</h1>
             <p class="hdr-tagline">User Manual</p>
-            <div class="hdr-version">v0.4.0</div>
+            <div class="hdr-version">v0.5.1</div>
             <div class="hdr-badges">
                 <span class="hdr-badge">Telnet</span>
                 <span class="hdr-badge">SSH</span>
@@ -539,6 +539,7 @@
             <a href="#terminals">Terminals</a>
             <a href="#main-menu">Menus</a>
             <a href="#file-transfer">XMODEM</a>
+            <a href="kermit.html">Kermit</a>
             <a href="#gateways">Gateways</a>
             <a href="#ai-chat">AI Chat</a>
             <a href="#web-browser">Browser</a>
@@ -654,7 +655,7 @@
                     automatically.
                 </p>
                 <pre><code><span class="prompt-char">$</span> ./ethernet-gateway
-<span class="output-text">Ethernet Gateway v0.4.0
+<span class="output-text">Ethernet Gateway v0.5.1
 Author: Ricky Bryce
 
 Created default configuration: egateway.conf
@@ -775,7 +776,7 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
             <!-- ══════════════════════════════════════════════ -->
             <div class="section" id="file-transfer">
                 <div class="section-title">File Transfer</div>
-                <p class="intro">Upload, download, and manage files on the server using XMODEM, XMODEM-1K, YMODEM, or ZMODEM. The gateway supports the full Forsberg ZMODEM spec including batch sends, batch receives, and ZSKIP.</p>
+                <p class="intro">Upload, download, and manage files on the server using XMODEM, XMODEM-1K, YMODEM, ZMODEM, or Kermit. The gateway supports the full Forsberg ZMODEM spec including batch sends/receives + ZSKIP, plus a spec-complete Kermit implementation with both client and server modes.</p>
 
                 <div class="menu-block">
                     <div class="sep">========================================</div>
@@ -788,9 +789,18 @@ Config: telnet=true, port=2323, security=false, transfer_dir=transfer</span></co
                     <div>&nbsp;&nbsp;<span class="key">D</span>&nbsp;&nbsp;<span class="label">Download a file</span></div>
                     <div>&nbsp;&nbsp;<span class="key">X</span>&nbsp;&nbsp;<span class="label">Delete a file</span></div>
                     <div>&nbsp;&nbsp;<span class="key">C</span>&nbsp;&nbsp;<span class="label">Change directory</span></div>
+                    <div>&nbsp;&nbsp;<span class="key">K</span>&nbsp;&nbsp;<span class="label">Kermit server mode</span></div>
                     <div>&nbsp;&nbsp;<span class="key">I</span>&nbsp;&nbsp;<span class="label">IAC escaping [<span style="color:var(--green)">ON</span>]</span></div>
                     <br>
                     <div>&nbsp;&nbsp;<span class="menu-dim">[R] Refresh &nbsp; [Q] Back &nbsp; [H] Help</span></div>
+                </div>
+
+                <div class="callout callout-info">
+                    <strong>Kermit reference:</strong>
+                    Kermit's command surface is documented separately on the
+                    <a href="kermit.html"><strong>Kermit Reference page</strong></a> &mdash;
+                    server-mode operation, the full G-subcommand table, capability
+                    negotiation, RESEND, locking shifts, and configuration keys.
                 </div>
 
                 <div class="cat">Uploading a File</div>
@@ -1609,7 +1619,7 @@ zmodem_negotiation_retry_interval = 5</span></code></pre>
         <!-- FOOTER                                            -->
         <!-- ══════════════════════════════════════════════════ -->
         <footer class="site-footer">
-            Ethernet Gateway v0.4.0 &mdash; &copy; 2025 Ricky Bryce &mdash;
+            Ethernet Gateway v0.5.1 &mdash; &copy; 2026 Ricky Bryce &mdash;
             Licensed under GPL-3.0-or-later
         </footer>
 

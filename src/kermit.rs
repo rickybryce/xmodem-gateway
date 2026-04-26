@@ -3943,11 +3943,68 @@ fn fs_free_bytes(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
-/// Send an X+Z response pair after a G command that produces text
-/// output (DIR/SPACE/KERMIT).  X carries the encoded text body, Z
-/// signals end-of-response.  Both wait for the client's ACK.
-/// Sequence numbering follows the client's G: G@N → ACK@N → X@N+1
-/// → ACK@N+1 → Z@N+2 → ACK@N+2.
+/// Maximum X-packet payload size for dispatch-level G responses.
+/// Dispatch packets run at protocol defaults (no Send-Init negotiation
+/// for the G itself), so the peer may not accept extended-length
+/// packets.  Targeting a payload that fits in classic 94-byte MAXL
+/// after `build_packet` overhead (mark + len + seq + type + check +
+/// eol = 6 bytes) keeps us safe with strict-spec peers.  Conservative
+/// margin allows for ctl-quote / qbin / repeat-prefix expansion in
+/// the encoded form.
+const G_RESPONSE_MAX_PAYLOAD: usize = 80;
+
+/// Split a UTF-8 text body into one or more encoded X-packet
+/// payloads, each fitting within `G_RESPONSE_MAX_PAYLOAD`.  Walks the
+/// source byte-at-a-time and starts a new chunk whenever encoding
+/// the next byte would push the current chunk over the cap.
+/// Per-chunk locking-shift state is reset (encoder closes the open
+/// shift before chunk boundary) so each X-packet is self-contained.
+fn paginate_g_text_response(text: &str, q: Quoting) -> Vec<Vec<u8>> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut mode = ShiftMode::Normal;
+    for &b in text.as_bytes() {
+        // Tentative encode of the next byte to see if it still fits.
+        let mut tentative = current.clone();
+        let mut tent_mode = mode;
+        encode_one_byte(&mut tentative, b, q, &mut tent_mode);
+        if tentative.len() > G_RESPONSE_MAX_PAYLOAD {
+            // Doesn't fit — close the current chunk (emit closing SI
+            // if locking shifts left us in shifted state), push it,
+            // and start a fresh chunk for this byte.
+            if q.locking_shifts && mode != ShiftMode::Normal {
+                current.push(q.qctl);
+                current.push(ctl(SI));
+            }
+            chunks.push(std::mem::take(&mut current));
+            mode = ShiftMode::Normal;
+            encode_one_byte(&mut current, b, q, &mut mode);
+        } else {
+            current = tentative;
+            mode = tent_mode;
+        }
+    }
+    if q.locking_shifts && mode != ShiftMode::Normal {
+        current.push(q.qctl);
+        current.push(ctl(SI));
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        // Empty input — emit a single empty X so the receiver still
+        // sees a well-formed X→Z response shape.
+        chunks.push(Vec::new());
+    }
+    chunks
+}
+
+/// Send an X+...+Z response after a G command that produces text
+/// output (DIR/SPACE/KERMIT/HELP).  Per Frank da Cruz §6 the spec
+/// allows multiple X-packets to deliver a long body, terminated by
+/// a single Z signalling end-of-response.  Each packet seq follows
+/// from the client's G: G@N → ACK@N → X@N+1 → ACK@N+1 → ...
+/// → X@N+k → ACK@N+k → Z@N+k+1 → ACK@N+k+1.
 #[allow(clippy::too_many_arguments)]
 async fn send_g_text_response(
     reader: &mut (impl AsyncRead + Unpin),
@@ -3967,33 +4024,41 @@ async fn send_g_text_response(
         rept: Some(DEFAULT_REPT),
         locking_shifts: false,
     };
-    let payload = encode_data(text.as_bytes(), q);
-    let x_seq = (after_g_seq + 1) & 0x3F;
-    let z_seq = (after_g_seq + 2) & 0x3F;
-    let _ = send_and_await_ack(
-        reader,
-        writer,
-        TYPE_TEXT,
-        x_seq,
-        &payload,
-        b'1',
-        0,
-        0,
-        CR,
-        is_tcp,
-        is_petscii,
-        verbose,
-        state,
-        Some(tokio::time::Instant::now() + pkt_timeout),
-        max_retries,
-        false,
-    )
-    .await?;
+    let chunks = paginate_g_text_response(text, q);
+    let mut seq = (after_g_seq + 1) & 0x3F;
+    if verbose && chunks.len() > 1 {
+        glog!(
+            "Kermit server: paginating G text response across {} X-packets",
+            chunks.len()
+        );
+    }
+    for chunk in &chunks {
+        let _ = send_and_await_ack(
+            reader,
+            writer,
+            TYPE_TEXT,
+            seq,
+            chunk,
+            b'1',
+            0,
+            0,
+            CR,
+            is_tcp,
+            is_petscii,
+            verbose,
+            state,
+            Some(tokio::time::Instant::now() + pkt_timeout),
+            max_retries,
+            false,
+        )
+        .await?;
+        seq = (seq + 1) & 0x3F;
+    }
     let _ = send_and_await_ack(
         reader,
         writer,
         TYPE_EOF,
-        z_seq,
+        seq,
         &[],
         b'1',
         0,
@@ -4009,6 +4074,25 @@ async fn send_g_text_response(
     )
     .await?;
     Ok(())
+}
+
+/// Multi-line help text sent in response to `G H` (or `G ?`).  Lists
+/// every G subcommand we recognise so a peer doing `remote help`
+/// gets a useful answer instead of a no-op ACK.  Kept ASCII-only and
+/// short enough to span just a couple paginated X-packets at the
+/// 80-byte classic-MAXL ceiling.
+fn kermit_g_help_text() -> &'static str {
+    "Ethernet Gateway Kermit server.\n\
+     Supported generic commands (G):\n\
+       F  Finish     - end protocol session\n\
+       L  Logout     - end protocol session\n\
+       B  BYE        - end protocol session\n\
+       C  CWD <dir>  - change working subdir\n\
+       D  DIRectory  - list current dir\n\
+       $  SPACE      - free disk bytes\n\
+       K  KERMIT     - server identity\n\
+       H  HELP / ?   - this text\n\
+     Other commands: I (re-init), R (get file), S (send file).\n"
 }
 
 /// Server-mode dispatch: idle waiting for an incoming command from a
@@ -4269,6 +4353,27 @@ pub(crate) async fn kermit_server(
                             reader,
                             writer,
                             &body,
+                            pkt.seq,
+                            is_tcp,
+                            is_petscii,
+                            verbose,
+                            &mut state,
+                            cfg.kermit_max_retries,
+                            pkt_timeout,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    b'H' | b'?' => {
+                        // HELP — reply with the list of supported G
+                        // subcommands.  C-Kermit's `remote help`
+                        // sends G ?; some implementations use G H.
+                        // We accept both.
+                        send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                        send_g_text_response(
+                            reader,
+                            writer,
+                            kermit_g_help_text(),
                             pkt.seq,
                             is_tcp,
                             is_petscii,
@@ -4699,74 +4804,70 @@ async fn kermit_client_send_g_text(
         false,
     )
     .await?;
-    // 2. Read X-packet (text body).
-    let x = read_packet(
-        reader,
-        is_tcp,
-        is_petscii,
-        b'1',
-        CR,
-        verbose,
-        &mut state,
-        Some(
-            tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
-        ),
-    )
-    .await
-    .map_err(|e| format!("Kermit client: G '{}' read X failed: {}", action as char, e))?;
-    if x.kind == TYPE_ERROR {
-        let q = Quoting {
-            qctl: DEFAULT_QCTL,
-            qbin: None,
-            rept: None,
-            locking_shifts: false,
-        };
-        let msg = decode_error_message(&x.payload, q);
-        return Err(format!(
-            "Kermit client: server E on G '{}': {}",
-            action as char, msg
-        ));
-    }
-    if x.kind != TYPE_TEXT {
-        return Err(format!(
-            "Kermit client: G '{}' expected X, got '{}'",
-            action as char, x.kind as char
-        ));
-    }
-    send_ack(writer, x.seq, b'1', 0, 0, CR, is_tcp).await?;
-    // 3. Read Z-packet (EOF).
-    let z = read_packet(
-        reader,
-        is_tcp,
-        is_petscii,
-        b'1',
-        CR,
-        verbose,
-        &mut state,
-        Some(
-            tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
-        ),
-    )
-    .await
-    .map_err(|e| format!("Kermit client: G '{}' read Z failed: {}", action as char, e))?;
-    if z.kind != TYPE_EOF {
-        return Err(format!(
-            "Kermit client: G '{}' expected Z, got '{}'",
-            action as char, z.kind as char
-        ));
-    }
-    send_ack(writer, z.seq, b'1', 0, 0, CR, is_tcp).await?;
-    // 4. Decode the text body and return.
+    // 2. Read X-packets until we see a Z.  Per Frank da Cruz §6 the
+    //    server may paginate a long response across multiple X
+    //    packets, terminated by a single Z.  We accumulate the
+    //    decoded bodies in order.
     let q = Quoting {
         qctl: DEFAULT_QCTL,
         qbin: None,
         rept: Some(DEFAULT_REPT),
         locking_shifts: false,
     };
-    let decoded = decode_data(&x.payload, q)?;
-    String::from_utf8(decoded).map_err(|e| {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let pkt = read_packet(
+            reader,
+            is_tcp,
+            is_petscii,
+            b'1',
+            CR,
+            verbose,
+            &mut state,
+            Some(
+                tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(cfg.kermit_negotiation_timeout),
+            ),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Kermit client: G '{}' read X/Z failed: {}",
+                action as char, e
+            )
+        })?;
+        match pkt.kind {
+            TYPE_TEXT => {
+                let decoded = decode_data(&pkt.payload, q)?;
+                body.extend(decoded);
+                send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+            }
+            TYPE_EOF => {
+                send_ack(writer, pkt.seq, b'1', 0, 0, CR, is_tcp).await?;
+                break;
+            }
+            TYPE_ERROR => {
+                let qe = Quoting {
+                    qctl: DEFAULT_QCTL,
+                    qbin: None,
+                    rept: None,
+                    locking_shifts: false,
+                };
+                let msg = decode_error_message(&pkt.payload, qe);
+                return Err(format!(
+                    "Kermit client: server E on G '{}': {}",
+                    action as char, msg
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "Kermit client: G '{}' expected X/Z, got '{}'",
+                    action as char, other as char
+                ));
+            }
+        }
+    }
+    String::from_utf8(body).map_err(|e| {
         format!(
             "Kermit client: G '{}' response not UTF-8: {}",
             action as char, e
@@ -4867,6 +4968,20 @@ pub(crate) async fn kermit_client_space(
     verbose: bool,
 ) -> Result<String, String> {
     kermit_client_send_g_text(reader, writer, b'$', &[], is_tcp, is_petscii, verbose).await
+}
+
+/// Ask a remote Kermit server for its help text (`G H`, with `G ?`
+/// as a common alias).  Returns the help body the peer sent — a
+/// list of supported subcommands or a free-form description.
+#[allow(dead_code)]
+pub(crate) async fn kermit_client_help(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    is_tcp: bool,
+    is_petscii: bool,
+    verbose: bool,
+) -> Result<String, String> {
+    kermit_client_send_g_text(reader, writer, b'H', &[], is_tcp, is_petscii, verbose).await
 }
 
 /// Ask a remote Kermit server to identify itself (`G K`).  Returns
@@ -6303,15 +6418,25 @@ mod tests {
             .unwrap();
         let g_ack = read_server_packet(r).await;
         assert_eq!(g_ack.kind, TYPE_ACK, "expected ACK to G, got '{}'", g_ack.kind as char);
-        let x = read_server_packet(r).await;
-        assert_eq!(x.kind, TYPE_TEXT, "expected X (text), got '{}'", x.kind as char);
-        w.write_all(&wire_packet(TYPE_ACK, x.seq, &[])).await.unwrap();
-        let z = read_server_packet(r).await;
-        assert_eq!(z.kind, TYPE_EOF, "expected Z (EOF), got '{}'", z.kind as char);
-        w.write_all(&wire_packet(TYPE_ACK, z.seq, &[])).await.unwrap();
+        // Server may paginate the X body across multiple packets;
+        // accumulate decoded chunks until we see the terminating Z.
         let q = Quoting::default();
-        let decoded = decode_data(&x.payload, q).unwrap();
-        String::from_utf8(decoded).unwrap()
+        let mut body = Vec::new();
+        loop {
+            let pkt = read_server_packet(r).await;
+            match pkt.kind {
+                TYPE_TEXT => {
+                    body.extend(decode_data(&pkt.payload, q).unwrap());
+                    w.write_all(&wire_packet(TYPE_ACK, pkt.seq, &[])).await.unwrap();
+                }
+                TYPE_EOF => {
+                    w.write_all(&wire_packet(TYPE_ACK, pkt.seq, &[])).await.unwrap();
+                    break;
+                }
+                other => panic!("expected X/Z, got '{}'", other as char),
+            }
+        }
+        String::from_utf8(body).unwrap()
     }
 
     /// Helper: close a server-mode session cleanly with G F.
@@ -6416,6 +6541,136 @@ mod tests {
             assert_eq!(resp.kind, TYPE_ACK);
         })
         .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_help_returns_command_list() {
+        // G H replies with our supported-command list via X+Z.  The
+        // body must mention each subcommand letter so a peer's
+        // `remote help` user sees what works.
+        let ((), result) = run_server_with_client(async |w, r| {
+            let body = run_g_text_command(w, r, b'H', &[]).await;
+            for letter in &["F", "L", "B", "C", "D", "$", "K", "H"] {
+                assert!(
+                    body.contains(letter),
+                    "help text missing subcommand '{}'; got: {:?}",
+                    letter,
+                    body
+                );
+            }
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_g_help_question_mark_alias() {
+        // C-Kermit's `remote help` sends G ? rather than G H.  The
+        // server must accept both as the help command.
+        let ((), result) = run_server_with_client(async |w, r| {
+            let body = run_g_text_command(w, r, b'?', &[]).await;
+            assert!(body.to_ascii_lowercase().contains("kermit"));
+            close_server_session(w, r).await;
+        })
+        .await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_paginate_g_text_response_single_chunk_under_cap() {
+        // Short text fits in one X-packet.  Sanity check.
+        let q = Quoting::default();
+        let chunks = paginate_g_text_response("Hello world", q);
+        assert_eq!(chunks.len(), 1);
+        let decoded = decode_data(&chunks[0], q).unwrap();
+        assert_eq!(&decoded[..], b"Hello world");
+    }
+
+    #[tokio::test]
+    async fn test_paginate_g_text_response_multi_chunk_round_trip() {
+        // Long text: must split across multiple chunks AND each
+        // chunk's encoded payload must round-trip back to the source.
+        let q = Quoting::default();
+        let mut text = String::new();
+        for i in 0..50 {
+            text.push_str(&format!("file_{:02}.bin\t{}\n", i, i * 100));
+        }
+        let chunks = paginate_g_text_response(&text, q);
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks for 50-line listing, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.len() <= G_RESPONSE_MAX_PAYLOAD,
+                "chunk exceeded MAXL cap: {} > {}",
+                chunk.len(),
+                G_RESPONSE_MAX_PAYLOAD
+            );
+        }
+        // Reassemble: decode each chunk and concatenate.  Result must
+        // equal the original source byte-for-byte.
+        let mut reassembled = Vec::new();
+        for chunk in &chunks {
+            reassembled.extend(decode_data(chunk, q).unwrap());
+        }
+        assert_eq!(String::from_utf8(reassembled).unwrap(), text);
+    }
+
+    #[tokio::test]
+    async fn test_server_g_dir_paginates_large_listing() {
+        // DIR with 30 files produces a listing too long for a single
+        // classic-MAXL X.  Server must paginate; client must
+        // reassemble correctly.
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("xmodem_g_dir_paginate_{}", pid));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("file_{:03}.bin", i)), b"x").unwrap();
+        }
+        let dir_str = dir.to_str().unwrap().to_string();
+        let dir_for_cleanup = dir.clone();
+
+        let ((), result) = run_server_with_client(async move |w, r| {
+            config::update_config_value("transfer_dir", &dir_str);
+            // Hand-roll the multi-X read since `run_g_text_command`
+            // assumes a single X.  Drives G@0 → ACK → loop X+ACK →
+            // Z → ACK.
+            w.write_all(&wire_packet(TYPE_GENERIC, 0, b"D")).await.unwrap();
+            let g_ack = read_server_packet(r).await;
+            assert_eq!(g_ack.kind, TYPE_ACK);
+            let mut body = Vec::new();
+            let q = Quoting::default();
+            let mut x_count = 0;
+            loop {
+                let pkt = read_server_packet(r).await;
+                match pkt.kind {
+                    TYPE_TEXT => {
+                        body.extend(decode_data(&pkt.payload, q).unwrap());
+                        w.write_all(&wire_packet(TYPE_ACK, pkt.seq, &[])).await.unwrap();
+                        x_count += 1;
+                    }
+                    TYPE_EOF => {
+                        w.write_all(&wire_packet(TYPE_ACK, pkt.seq, &[])).await.unwrap();
+                        break;
+                    }
+                    other => panic!("unexpected packet '{}' during DIR pagination", other as char),
+                }
+            }
+            assert!(x_count > 1, "expected multiple X-packets, got {}", x_count);
+            let body_text = String::from_utf8(body).unwrap();
+            assert!(body_text.contains("file_000.bin"));
+            assert!(body_text.contains("file_029.bin"));
+            close_server_session(w, r).await;
+        })
+        .await;
+
+        config::update_config_value("transfer_dir", "transfer");
+        let _ = std::fs::remove_dir_all(&dir_for_cleanup);
         result.unwrap();
     }
 
@@ -7011,6 +7266,24 @@ mod tests {
         })
         .await;
         client_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_help_returns_subcommand_list() {
+        // GET help → server replies with multi-X paginated body
+        // listing all supported G subcommands.  Locks in the client's
+        // ability to drive a paginated text response.
+        let (client_result, _) = run_client_against_server(async |r, w| {
+            let v = kermit_client_help(r, w, false, false, false).await;
+            let _ = kermit_client_finish(r, w, false, false, false).await;
+            v
+        })
+        .await;
+        let body = client_result.unwrap();
+        assert!(body.to_ascii_lowercase().contains("kermit"));
+        for letter in &["F", "L", "B", "C", "D", "K", "H"] {
+            assert!(body.contains(letter), "help body missing '{}': {:?}", letter, body);
+        }
     }
 
     #[tokio::test]
