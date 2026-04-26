@@ -1294,7 +1294,7 @@ impl eframe::App for App {
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("File Transfer (XMODEM)").strong().color(AMBER));
                                     ui.label(
-                                        egui::RichText::new("(More for YMODEM / ZMODEM)")
+                                        egui::RichText::new("(More for others)")
                                             .italics()
                                             .color(AMBER_DIM),
                                     );
