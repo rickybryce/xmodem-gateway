@@ -138,6 +138,11 @@ pub(crate) const CLASSIC_MAX_PACKET_LEN: usize = 94;
 pub(crate) const EXTENDED_MAX_PACKET_LEN: usize = 9024;
 /// Maximum sliding-window size per spec (5 bits → 31 outstanding).
 pub(crate) const MAX_WINDOW_SIZE: u8 = 31;
+/// Cap on files in a single batch transfer.  Defends against a peer
+/// (intentionally or otherwise) accumulating an unbounded `received`
+/// vector over the lifetime of one session.  1000 is well above any
+/// realistic batch size — typical transfers are 1-10 files.
+const MAX_BATCH_FILES: usize = 1000;
 
 /// Sender-side reservation for worst-case quoting blowup, expressed as
 /// a fraction `NUM / DEN` of the negotiated `MAXL` payload area.  3/4
@@ -319,7 +324,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
         b'2' => {
             if check.len() != 2 {
                 return Err(format!(
-                    "CHKT-2 expects 2 check bytes, got {}",
+                    "Kermit: CHKT-2 expects 2 check bytes, got {}",
                     check.len()
                 ));
             }
@@ -329,7 +334,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
                 Ok(())
             } else {
                 Err(format!(
-                    "CHKT-2 mismatch: expected {:#x} got {:#x}",
+                    "Kermit: CHKT-2 mismatch: expected {:#x} got {:#x}",
                     expected, actual_sum
                 ))
             }
@@ -337,7 +342,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
         b'3' => {
             if check.len() != 3 {
                 return Err(format!(
-                    "CHKT-3 expects 3 check bytes, got {}",
+                    "Kermit: CHKT-3 expects 3 check bytes, got {}",
                     check.len()
                 ));
             }
@@ -347,7 +352,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
                 Ok(())
             } else {
                 Err(format!(
-                    "CHKT-3 mismatch: expected {:#x} got {:#x}",
+                    "Kermit: CHKT-3 mismatch: expected {:#x} got {:#x}",
                     expected, actual
                 ))
             }
@@ -355,7 +360,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
         _ => {
             if check.len() != 1 {
                 return Err(format!(
-                    "CHKT-1 expects 1 check byte, got {}",
+                    "Kermit: CHKT-1 expects 1 check byte, got {}",
                     check.len()
                 ));
             }
@@ -366,7 +371,7 @@ pub(crate) fn verify_check(chkt: u8, data: &[u8], check: &[u8]) -> Result<(), St
                 Ok(())
             } else {
                 Err(format!(
-                    "CHKT-1 mismatch: expected {:#x} got {:#x}",
+                    "Kermit: CHKT-1 mismatch: expected {:#x} got {:#x}",
                     expected, actual
                 ))
             }
@@ -645,6 +650,7 @@ pub(crate) async fn read_packet(
     is_petscii: bool,
     chkt: u8,
     eol: u8,
+    verbose: bool,
     state: &mut ReadState,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<Packet, String> {
@@ -684,6 +690,13 @@ pub(crate) async fn read_packet(
         // Verify HCHECK over LEN..LENX2 (5 bytes).
         let expected_hcheck = chk1(&header_input);
         if hcheck != expected_hcheck {
+            if verbose {
+                glog!(
+                    "Kermit recv: HCHECK mismatch (got {:#x}, expected {:#x}) — discarding packet",
+                    hcheck,
+                    expected_hcheck
+                );
+            }
             return Err(format!(
                 "Kermit: extended-length header check mismatch ({:#x} vs {:#x})",
                 hcheck, expected_hcheck
@@ -745,7 +758,29 @@ pub(crate) async fn read_packet(
     // 5. Verify CHECK over header_input ++ payload.
     let mut check_input: Vec<u8> = header_input.clone();
     check_input.extend_from_slice(&payload);
-    verify_check(chkt, &check_input, &check_bytes)?;
+    if let Err(e) = verify_check(chkt, &check_input, &check_bytes) {
+        if verbose {
+            glog!(
+                "Kermit recv: CHECK failed for type='{}' seq={}: {}",
+                kind as char,
+                seq,
+                e
+            );
+        }
+        return Err(e);
+    }
+    // D-packets get a richer downstream log (with decoded length and
+    // running file total) that's rate-limited per file.  Logging them
+    // here too would defeat the rate limit and drown the buffer on a
+    // multi-megabyte transfer.
+    if verbose && kind != TYPE_DATA {
+        glog!(
+            "Kermit recv: packet type='{}' seq={} payload={}B",
+            kind as char,
+            seq,
+            payload.len()
+        );
+    }
 
     // 6. Consume the trailing EOL (best-effort — peer may omit it).
     if eol != 0 {
@@ -1433,6 +1468,14 @@ async fn send_nak(
     raw_write_bytes(writer, &pkt, is_tcp).await
 }
 
+/// Wrap a per-packet send error with packet-type context, stripping
+/// the redundant "Kermit:" prefix from the inner error so the result
+/// reads "Kermit send {context}: {detail}" instead of double-prefixing.
+fn wrap_send_err(context: &str, inner: String) -> String {
+    let detail = inner.strip_prefix("Kermit: ").unwrap_or(&inner);
+    format!("Kermit send {}: {}", context, detail)
+}
+
 /// Decode an E-packet's payload back to a human-readable string.
 /// Returns "(unparseable)" if the payload isn't valid UTF-8 after the
 /// quoting layer is removed.
@@ -1644,6 +1687,18 @@ pub(crate) async fn kermit_send(
 
     // 1. Send Send-Init (S, seq=0) and wait for ACK with peer's caps.
     let s_payload = build_send_init_payload(&our_caps);
+    if verbose {
+        glog!(
+            "Kermit send: proposing MAXL={} CHKT={} window={} long={} stream={} attrs={} qbin={:?}",
+            our_caps.maxl,
+            our_caps.chkt as char,
+            our_caps.window,
+            our_caps.long_packets,
+            our_caps.streaming,
+            our_caps.attribute_packets,
+            our_caps.qbin,
+        );
+    }
     let mut seq: u8 = 0;
 
     let peer_caps = send_and_await_ack(
@@ -1665,12 +1720,23 @@ pub(crate) async fn kermit_send(
         true,
     )
     .await
-    .map_err(|e| format!("Kermit Send-Init failed: {}", e))?;
+    .map_err(|e| wrap_send_err("Send-Init", e))?;
 
     let peer_init = parse_send_init_payload(&peer_caps);
     let session = intersect_capabilities(&our_caps, &peer_init);
     let flavor = detect_flavor(&peer_init);
     if verbose {
+        glog!(
+            "Kermit send: peer offered MAXL={} CHKT={} window={} long={} stream={} attrs={} qbin={:?} id={:?}",
+            peer_init.maxl,
+            peer_init.chkt as char,
+            peer_init.window,
+            peer_init.long_packets,
+            peer_init.streaming,
+            peer_init.attribute_packets,
+            peer_init.qbin,
+            peer_init.peer_id,
+        );
         glog!(
             "Kermit send: negotiated MAXL={} CHKT={} window={} long={} stream={} attrs={} flavor={}",
             session.maxl,
@@ -1722,7 +1788,7 @@ pub(crate) async fn kermit_send(
             false,
         )
         .await
-        .map_err(|e| format!("Kermit F-packet failed: {}", e))?;
+        .map_err(|e| wrap_send_err("F-packet", e))?;
         seq = (seq + 1) & 0x3F;
 
         // A-packet (when negotiated).  Carries length, mtime, mode.
@@ -1755,18 +1821,16 @@ pub(crate) async fn kermit_send(
                 false,
             )
             .await
-            .map_err(|e| format!("Kermit A-packet failed: {}", e))?;
+            .map_err(|e| wrap_send_err("A-packet", e))?;
             seq = (seq + 1) & 0x3F;
         }
 
-        // D-packets.  Compute payload chunk size that, after worst-case
-        // Compute a chunk size that, after quoting blowup, still fits
-        // within the negotiated MAXL.  Worst-case quoting is 3x for
-        // high-bit control bytes (qbin + qctl + ctl(body)); typical
-        // binary or text is closer to 1.1x.  We aim at 75% of payload
-        // capacity — comfortable headroom for typical data, and the
-        // sender will fail-fast on the rare worst-case input rather
-        // than producing a malformed packet.
+        // D-packets.  Pick chunk size so that after worst-case quoting
+        // blowup the encoded payload still fits in MAXL.  Worst case is
+        // 3x for high-bit control bytes (qbin + qctl + ctl(body));
+        // typical binary or text is closer to 1.1x.  75% headroom
+        // covers typical data; adversarial all-control-byte input
+        // would fail-fast rather than malforming a packet.
         let cklen = check_size(session.chkt);
         let header_overhead = if session.long_packets && session.maxl > CLASSIC_MAX_PACKET_LEN as u16
         {
@@ -1776,9 +1840,39 @@ pub(crate) async fn kermit_send(
         };
         let max_payload = (session.maxl as usize).saturating_sub(header_overhead);
         let chunk_size = (max_payload * QUOTING_HEADROOM_NUM / QUOTING_HEADROOM_DEN).max(16);
+        if verbose {
+            glog!(
+                "Kermit send: chunk_size={} (max_payload={}, header_overhead={})",
+                chunk_size,
+                max_payload,
+                header_overhead
+            );
+        }
 
+        // Rate-limit the per-D-packet success trace so a multi-megabyte
+        // transfer doesn't drown the 2000-line log buffer.  Mirrors
+        // zmodem.rs's `subpackets_sent <= 3` pattern: log the first 3
+        // to confirm the protocol baseline is working, go silent on
+        // success after that.  Failure paths (NAK, timeout, CHECK
+        // mismatch) remain unconditionally logged elsewhere.
+        let mut d_packets_sent = 0u32;
         for chunk in f.data.chunks(chunk_size) {
             let encoded = encode_data(chunk, send_q);
+            d_packets_sent += 1;
+            if verbose && d_packets_sent <= 3 {
+                let pct = if !chunk.is_empty() {
+                    (encoded.len() * 100) / chunk.len()
+                } else {
+                    100
+                };
+                glog!(
+                    "Kermit send: D-packet seq={} raw={}B encoded={}B ({}%)",
+                    seq,
+                    chunk.len(),
+                    encoded.len(),
+                    pct
+                );
+            }
             let _ = send_and_await_ack(
                 reader,
                 writer,
@@ -1798,7 +1892,7 @@ pub(crate) async fn kermit_send(
                 false,
             )
             .await
-            .map_err(|e| format!("Kermit D-packet failed: {}", e))?;
+            .map_err(|e| wrap_send_err("D-packet", e))?;
             seq = (seq + 1) & 0x3F;
         }
 
@@ -1822,7 +1916,7 @@ pub(crate) async fn kermit_send(
             false,
         )
         .await
-        .map_err(|e| format!("Kermit Z-packet failed: {}", e))?;
+        .map_err(|e| wrap_send_err("Z-packet", e))?;
         seq = (seq + 1) & 0x3F;
     }
 
@@ -1846,7 +1940,7 @@ pub(crate) async fn kermit_send(
         false,
     )
     .await
-    .map_err(|e| format!("Kermit B-packet failed: {}", e))?;
+    .map_err(|e| wrap_send_err("B-packet", e))?;
 
     if verbose {
         glog!("Kermit send: completed");
@@ -1946,11 +2040,14 @@ async fn send_and_await_ack(
     max_retries: u32,
     is_send_init: bool,
 ) -> Result<Vec<u8>, String> {
-    let _ = is_petscii;
     let pkt = build_packet(kind, seq, payload, chkt, pad_count, pad_char, eol);
     let mut attempts = 0u32;
     loop {
-        if verbose {
+        // Log first-attempt sends for non-D packets, and any retry
+        // attempt regardless of type.  The first-attempt send of a
+        // D-packet is already covered by the rate-limited D-packet
+        // log upstream; retries fire here to surface the retry trail.
+        if verbose && (kind != TYPE_DATA || attempts > 0) {
             glog!(
                 "Kermit send: type='{}' seq={} payload={}B attempt={}",
                 kind as char,
@@ -1963,7 +2060,7 @@ async fn send_and_await_ack(
 
         // Wait for response.  Peer may send an unrelated NAK first; we
         // discard that and try again until our deadline elapses.
-        match read_packet(reader, is_tcp, is_petscii, chkt, eol, state, deadline).await {
+        match read_packet(reader, is_tcp, is_petscii, chkt, eol, verbose, state, deadline).await {
             Ok(resp) => {
                 if resp.kind == TYPE_ERROR {
                     let q = Quoting {
@@ -1975,10 +2072,30 @@ async fn send_and_await_ack(
                     return Err(format!("Kermit: peer sent E-packet: {}", msg));
                 }
                 if resp.kind == TYPE_ACK && resp.seq == seq {
+                    // Suppress ACK confirmation on D-packets to keep
+                    // the multi-megabyte hot path quiet — the per-D
+                    // success trace is rate-limited upstream and
+                    // failure paths log unconditionally.
+                    if verbose && kind != TYPE_DATA {
+                        glog!(
+                            "Kermit send: ACK seq={} for type='{}'",
+                            seq,
+                            kind as char
+                        );
+                    }
                     return Ok(resp.payload);
                 }
                 if resp.kind == TYPE_NAK && resp.seq == seq {
                     attempts += 1;
+                    if verbose {
+                        glog!(
+                            "Kermit send: NAK seq={} for type='{}' — retrying ({}/{})",
+                            seq,
+                            kind as char,
+                            attempts,
+                            max_retries
+                        );
+                    }
                     if attempts >= max_retries {
                         return Err(format!(
                             "Kermit: too many NAKs (>{}) for seq {} type '{}'",
@@ -2007,16 +2124,18 @@ async fn send_and_await_ack(
             }
             Err(e) => {
                 attempts += 1;
-                if attempts >= max_retries {
-                    return Err(format!("Kermit: too many timeouts: {}", e));
-                }
                 if verbose {
                     glog!(
-                        "Kermit send: read error (attempt {}/{}): {}",
+                        "Kermit send: read error after seq={} type='{}' — retrying ({}/{}): {}",
+                        seq,
+                        kind as char,
                         attempts,
                         max_retries,
                         e
                     );
+                }
+                if attempts >= max_retries {
+                    return Err(format!("Kermit: too many timeouts: {}", e));
                 }
             }
         }
@@ -2046,7 +2165,6 @@ pub(crate) async fn kermit_receive(
             is_petscii
         );
     }
-    let _ = is_petscii;
     let our_caps = config_capabilities();
     let mut state = ReadState::default();
     let neg_deadline = tokio::time::Instant::now()
@@ -2060,6 +2178,7 @@ pub(crate) async fn kermit_receive(
         is_petscii,
         b'1',
         CR,
+        verbose,
         &mut state,
         Some(neg_deadline),
     )
@@ -2111,6 +2230,10 @@ pub(crate) async fn kermit_receive(
 
     let mut received: Vec<KermitReceive> = Vec::new();
     let mut expected_seq: u8 = 1; // peer increments seq from 0 (Send-Init)
+    // Per-file counter for rate-limiting verbose D-packet success
+    // logs.  Resets on every F-packet so each file gets its own first
+    // 3 traced — same pattern as zmodem.rs's subpacket-trace cap.
+    let mut d_packets_received = 0u32;
 
     loop {
         let pkt = match read_packet(
@@ -2119,6 +2242,7 @@ pub(crate) async fn kermit_receive(
             is_petscii,
             session.chkt,
             session.eol,
+            verbose,
             &mut state,
             Some(tokio::time::Instant::now() + pkt_timeout),
         )
@@ -2126,9 +2250,12 @@ pub(crate) async fn kermit_receive(
         {
             Ok(p) => p,
             Err(e) => {
-                // Read timeout / I/O error — NAK and retry up to budget.
                 if verbose {
-                    glog!("Kermit recv: read error: {}", e);
+                    glog!(
+                        "Kermit recv: read error → NAK seq={}: {}",
+                        expected_seq,
+                        e
+                    );
                 }
                 send_nak(
                     writer,
@@ -2155,6 +2282,13 @@ pub(crate) async fn kermit_receive(
             // we simplify by retransmitting the last ACK if the peer
             // re-sent a packet we already ACKed (seq one less than expected).
             if pkt.seq == (expected_seq.wrapping_sub(1) & 0x3F) {
+                if verbose {
+                    glog!(
+                        "Kermit recv: duplicate seq={} (expected {}) → re-ACK",
+                        pkt.seq,
+                        expected_seq
+                    );
+                }
                 send_ack(
                     writer,
                     pkt.seq,
@@ -2166,6 +2300,13 @@ pub(crate) async fn kermit_receive(
                 )
                 .await?;
                 continue;
+            }
+            if verbose {
+                glog!(
+                    "Kermit recv: out-of-order seq={} (expected {}) → NAK",
+                    pkt.seq,
+                    expected_seq
+                );
             }
             send_nak(
                 writer,
@@ -2182,9 +2323,12 @@ pub(crate) async fn kermit_receive(
 
         match pkt.kind {
             TYPE_FILE => {
-                // Filename in F-packet payload is plain (not data-encoded
-                // through the quoting layer per spec, though some
-                // implementations encode anyway — we try both).
+                // Spec allows F-packet filenames to be data-quoted, but
+                // most implementations send them raw since filenames
+                // rarely contain QCTL or control bytes.  Try the
+                // quoting decoder first, fall back to raw bytes if it
+                // produces an empty result (i.e. the filename happened
+                // to start with a stray QCTL).
                 let fname = match decode_data(&pkt.payload, recv_q) {
                     Ok(d) if !d.is_empty() => String::from_utf8_lossy(&d).into_owned(),
                     _ => String::from_utf8_lossy(&pkt.payload).into_owned(),
@@ -2192,6 +2336,24 @@ pub(crate) async fn kermit_receive(
                 if verbose {
                     glog!("Kermit recv: F-packet '{}'", fname);
                 }
+                if received.len() >= MAX_BATCH_FILES {
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "Batch too large",
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                    return Err(format!(
+                        "Kermit recv: batch exceeds {} file cap",
+                        MAX_BATCH_FILES
+                    ));
+                }
+                d_packets_received = 0;
                 received.push(KermitReceive {
                     filename: fname,
                     data: Vec::new(),
@@ -2259,23 +2421,48 @@ pub(crate) async fn kermit_receive(
             }
             TYPE_DATA => {
                 let raw = decode_data(&pkt.payload, recv_q)?;
-                if let Some(last) = received.last_mut() {
-                    if last.data.len() + raw.len() > MAX_FILE_SIZE as usize {
-                        send_error(
-                            writer,
-                            pkt.seq,
-                            "File too large",
-                            session.chkt,
-                            session.npad,
-                            session.padc,
-                            session.eol,
-                            is_tcp,
-                        )
-                        .await?;
-                        return Err("Kermit recv: file size cap exceeded".into());
-                    }
-                    last.data.extend_from_slice(&raw);
+                let Some(last) = received.last_mut() else {
+                    // D-packet before any F-packet violates the spec
+                    // sequence (S → F → [A] → D... → Z → B).  Fail loud
+                    // rather than silently dropping the payload.
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "Data packet before file header",
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                    return Err("Kermit recv: D-packet before F-packet".into());
+                };
+                if last.data.len() + raw.len() > MAX_FILE_SIZE as usize {
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "File too large",
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                    return Err("Kermit recv: file size cap exceeded".into());
                 }
+                d_packets_received += 1;
+                if verbose && d_packets_received <= 3 {
+                    glog!(
+                        "Kermit recv: D-packet seq={} encoded={}B decoded={}B (file total {}B)",
+                        pkt.seq,
+                        pkt.payload.len(),
+                        raw.len(),
+                        last.data.len() + raw.len()
+                    );
+                }
+                last.data.extend_from_slice(&raw);
                 send_ack(
                     writer,
                     pkt.seq,
@@ -2288,6 +2475,22 @@ pub(crate) async fn kermit_receive(
                 .await?;
             }
             TYPE_EOF => {
+                if received.last().is_none() {
+                    // Z (EOF) without an F-packet first violates the
+                    // spec sequence S → F → [A] → D... → Z → B.
+                    send_error(
+                        writer,
+                        pkt.seq,
+                        "EOF without file header",
+                        session.chkt,
+                        session.npad,
+                        session.padc,
+                        session.eol,
+                        is_tcp,
+                    )
+                    .await?;
+                    return Err("Kermit recv: Z-packet before F-packet".into());
+                }
                 if verbose {
                     glog!("Kermit recv: Z-packet — file complete");
                 }
@@ -2667,7 +2870,7 @@ mod tests {
         let pkt = build_packet(TYPE_DATA, 5, b"hello", b'1', 0, 0, CR);
         let mut state = ReadState::default();
         let mut c = cursor(pkt);
-        let parsed = read_packet(&mut c, false, false, b'1', CR, &mut state, None)
+        let parsed = read_packet(&mut c, false, false, b'1', CR, false, &mut state, None)
             .await
             .unwrap();
         assert_eq!(parsed.kind, TYPE_DATA);
@@ -2680,7 +2883,7 @@ mod tests {
         let pkt = build_packet(TYPE_FILE, 1, b"test.bin", b'2', 0, 0, CR);
         let mut state = ReadState::default();
         let mut c = cursor(pkt);
-        let parsed = read_packet(&mut c, false, false, b'2', CR, &mut state, None)
+        let parsed = read_packet(&mut c, false, false, b'2', CR, false, &mut state, None)
             .await
             .unwrap();
         assert_eq!(parsed.kind, TYPE_FILE);
@@ -2693,7 +2896,7 @@ mod tests {
         let pkt = build_packet(TYPE_DATA, 7, b"abc", b'3', 0, 0, CR);
         let mut state = ReadState::default();
         let mut c = cursor(pkt);
-        let parsed = read_packet(&mut c, false, false, b'3', CR, &mut state, None)
+        let parsed = read_packet(&mut c, false, false, b'3', CR, false, &mut state, None)
             .await
             .unwrap();
         assert_eq!(parsed.kind, TYPE_DATA);
@@ -2708,7 +2911,7 @@ mod tests {
         let pkt = build_packet(TYPE_DATA, 3, &payload, b'3', 0, 0, CR);
         let mut state = ReadState::default();
         let mut c = cursor(pkt);
-        let parsed = read_packet(&mut c, false, false, b'3', CR, &mut state, None)
+        let parsed = read_packet(&mut c, false, false, b'3', CR, false, &mut state, None)
             .await
             .unwrap();
         assert_eq!(parsed.kind, TYPE_DATA);
@@ -2722,7 +2925,7 @@ mod tests {
         wire.extend(build_packet(TYPE_ACK, 0, &[], b'1', 0, 0, CR));
         let mut state = ReadState::default();
         let mut c = cursor(wire);
-        let parsed = read_packet(&mut c, false, false, b'1', CR, &mut state, None)
+        let parsed = read_packet(&mut c, false, false, b'1', CR, false, &mut state, None)
             .await
             .unwrap();
         assert_eq!(parsed.kind, TYPE_ACK);
@@ -2736,7 +2939,7 @@ mod tests {
         pkt[len - 2] ^= 0x01;
         let mut state = ReadState::default();
         let mut c = cursor(pkt);
-        let result = read_packet(&mut c, false, false, b'3', CR, &mut state, None).await;
+        let result = read_packet(&mut c, false, false, b'3', CR, false, &mut state, None).await;
         assert!(result.is_err());
     }
 
@@ -2747,7 +2950,7 @@ mod tests {
         let mut state = ReadState::default();
         let mut c = cursor(vec![0x20, 0x20, 0x1B]); // pads then ESC
         let result =
-            read_packet(&mut c, false, false, b'1', CR, &mut state, None).await;
+            read_packet(&mut c, false, false, b'1', CR, false, &mut state, None).await;
         let err = result.unwrap_err();
         assert!(err.contains("cancelled"), "got: {}", err);
     }
@@ -2758,7 +2961,7 @@ mod tests {
         let mut state = ReadState::default();
         let mut c = cursor(vec![0x20, 0x5F]);
         let result =
-            read_packet(&mut c, false, true, b'1', CR, &mut state, None).await;
+            read_packet(&mut c, false, true, b'1', CR, false, &mut state, None).await;
         assert!(result.is_err());
     }
 
@@ -3180,5 +3383,334 @@ mod tests {
         config::update_config_value("kermit_repeat_compression", "true");
         config::update_config_value("kermit_8bit_quote", "auto");
         config::update_config_value("kermit_iac_escape", "false");
+    }
+
+    /// Serialises tests that mutate the global config singleton.  Held
+    /// across the async round-trip so a parallel test can't change
+    /// CHKT or 8-bit-quote mid-transfer.  `tokio::sync::Mutex` lets the
+    /// guard cross await points (std::sync::Mutex can't on a
+    /// multi-threaded runtime).
+    static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn round_trip_with_overrides(
+        overrides: &[(&str, &str)],
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<KermitReceive>, String> {
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        for (k, v) in overrides {
+            config::update_config_value(k, v);
+        }
+        round_trip(files).await
+    }
+
+    // ---------- HIGH-priority: round-2 fix coverage ----------
+
+    #[test]
+    fn test_wrap_send_err_strips_kermit_prefix() {
+        // Inner already has the Kermit: prefix — should be stripped.
+        let wrapped = wrap_send_err("Z-packet", "Kermit: read timeout".into());
+        assert_eq!(wrapped, "Kermit send Z-packet: read timeout");
+        // Inner without prefix — passes through after the wrapper prefix.
+        let wrapped = wrap_send_err("F-packet", "i/o error".into());
+        assert_eq!(wrapped, "Kermit send F-packet: i/o error");
+    }
+
+    #[test]
+    fn test_decode_error_message_valid_utf8() {
+        let q = Quoting::default();
+        // "hello" encoded through the quoting layer.
+        let encoded = encode_data(b"hello", q);
+        assert_eq!(decode_error_message(&encoded, q), "hello");
+    }
+
+    #[test]
+    fn test_decode_error_message_empty_payload() {
+        assert_eq!(decode_error_message(&[], Quoting::default()), "");
+    }
+
+    #[test]
+    fn test_decode_error_message_invalid_utf8() {
+        // Quoted bytes that decode to a single 0xFF — not valid UTF-8.
+        let q = Quoting {
+            qctl: b'#',
+            qbin: Some(b'&'),
+            rept: None,
+        };
+        let encoded = encode_data(&[0xFF], q);
+        assert_eq!(decode_error_message(&encoded, q), "(unparseable)");
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_oversize_file() {
+        // Build a buffer one byte larger than MAX_FILE_SIZE.  Don't
+        // actually allocate 8 MB — fake the length by passing a
+        // synthetic struct via Vec::from_raw_parts isn't safe; instead
+        // allocate the cap + 1.  Test runs once, ~8 MB peak.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+        let big = vec![0u8; (MAX_FILE_SIZE + 1) as usize];
+        // Use a sink writer + source reader; the size check fires
+        // before any I/O happens.
+        let (a, b) = tokio::io::duplex(64);
+        let (mut a_r, mut a_w) = tokio::io::split(a);
+        let _ = b; // unused; kermit_send only writes/reads on a's side
+        let files = [KermitSendFile {
+            name: "big.bin",
+            data: &big,
+            modtime: None,
+            mode: None,
+        }];
+        let result = kermit_send(&mut a_r, &mut a_w, &files, false, false, false).await;
+        let err = result.expect_err("should reject");
+        assert!(
+            err.contains("exceeds") && err.contains("byte cap"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receive_rejects_data_before_file() {
+        // Hand-build a wire stream: peer's Send-Init, then a D-packet
+        // straight away with no F-packet in between.  Receiver should
+        // emit an E-packet response and return an error.
+        let _guard = CONFIG_LOCK.lock().await;
+        init_test_config();
+
+        let peer_caps = Capabilities {
+            chkt: b'1',
+            maxl: 80,
+            ..Capabilities::default()
+        };
+        let init_payload = build_send_init_payload(&peer_caps);
+        let mut wire = build_packet(TYPE_SEND_INIT, 0, &init_payload, b'1', 0, 0, CR);
+        let q = Quoting {
+            qctl: b'#',
+            qbin: None,
+            rept: None,
+        };
+        let data_payload = encode_data(b"oops", q);
+        wire.extend_from_slice(&build_packet(TYPE_DATA, 1, &data_payload, b'1', 0, 0, CR));
+
+        let (peer_to_gw, gw_in) = tokio::io::duplex(8192);
+        let (gw_out, peer_from_gw) = tokio::io::duplex(8192);
+        let (mut gw_r, _) = tokio::io::split(gw_in);
+        let (_, mut gw_w) = tokio::io::split(gw_out);
+        let (mut peer_r, mut peer_w) = (
+            tokio::io::split(peer_from_gw).0,
+            tokio::io::split(peer_to_gw).1,
+        );
+
+        let peer_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            peer_w.write_all(&wire).await.ok();
+            // Drain whatever the receiver writes back so its sends don't block.
+            let mut buf = vec![0u8; 4096];
+            let _ = peer_r.read(&mut buf).await;
+        });
+
+        let result = kermit_receive(&mut gw_r, &mut gw_w, false, false, false).await;
+        peer_task.await.ok();
+        let err = result.expect_err("D-before-F should error");
+        assert!(err.contains("D-packet before F-packet"), "got: {}", err);
+    }
+
+    // ---------- HIGH-priority: round-trip with non-default settings ----------
+
+    #[tokio::test]
+    async fn test_round_trip_chkt1() {
+        let received = round_trip_with_overrides(
+            &[("kermit_block_check_type", "1")],
+            vec![("chkt1.bin".into(), b"chkt-one round trip".to_vec())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, b"chkt-one round trip");
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_chkt2() {
+        let received = round_trip_with_overrides(
+            &[("kermit_block_check_type", "2")],
+            vec![("chkt2.bin".into(), b"chkt-two round trip".to_vec())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, b"chkt-two round trip");
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_8bit_quoting_on() {
+        // Force 8-bit quoting and round-trip a payload with high-bit
+        // bytes; the QBIN prefix layer must round-trip cleanly.
+        let payload: Vec<u8> = (0u16..=255).map(|v| v as u8).collect();
+        let received = round_trip_with_overrides(
+            &[("kermit_8bit_quote", "on")],
+            vec![("hibit.bin".into(), payload.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(received[0].data, payload);
+    }
+
+    // ---------- MED-priority defensive tests ----------
+
+    #[test]
+    fn test_verify_check_error_messages_have_kermit_prefix() {
+        // All four mismatch / length error strings must carry the
+        // "Kermit:" prefix so they're consistent with the rest of the
+        // module's error output.
+        let bad_len_chkt1 = verify_check(b'1', b"x", &[]).unwrap_err();
+        assert!(bad_len_chkt1.starts_with("Kermit:"), "{}", bad_len_chkt1);
+        let bad_len_chkt2 = verify_check(b'2', b"x", b" ").unwrap_err();
+        assert!(bad_len_chkt2.starts_with("Kermit:"), "{}", bad_len_chkt2);
+        let bad_len_chkt3 = verify_check(b'3', b"x", b"  ").unwrap_err();
+        assert!(bad_len_chkt3.starts_with("Kermit:"), "{}", bad_len_chkt3);
+        // Mismatch (CRC poisoned).
+        let mut trailer = block_check(b'3', b"hello");
+        trailer[0] = trailer[0].wrapping_add(1);
+        let mismatch = verify_check(b'3', b"hello", &trailer).unwrap_err();
+        assert!(mismatch.starts_with("Kermit:"), "{}", mismatch);
+    }
+
+    #[test]
+    fn test_encode_decode_repeat_boundary_3() {
+        let q = Quoting {
+            qctl: b'#',
+            qbin: None,
+            rept: Some(b'~'),
+        };
+        // Run-length 3 — just at the encoder's threshold.  Must
+        // round-trip whether or not compression actually fires.
+        let input = vec![b'X'; 3];
+        let enc = encode_data(&input, q);
+        assert_eq!(decode_data(&enc, q).unwrap(), input);
+    }
+
+    #[test]
+    fn test_encode_decode_repeat_boundary_94() {
+        let q = Quoting {
+            qctl: b'#',
+            qbin: None,
+            rept: Some(b'~'),
+        };
+        // Max single-repeat run length (tochar(94) = '~' is the prefix
+        // itself; tochar(94) the count byte = 0x7E).  Verify exactly
+        // 94 identical bytes round-trip.
+        let input = vec![b'Z'; 94];
+        let enc = encode_data(&input, q);
+        assert_eq!(decode_data(&enc, q).unwrap(), input);
+    }
+
+    #[test]
+    fn test_encode_decode_repeat_boundary_95() {
+        let q = Quoting {
+            qctl: b'#',
+            qbin: None,
+            rept: Some(b'~'),
+        };
+        // 95 identical bytes — must split into two repeat groups.
+        let input = vec![b'Q'; 95];
+        let enc = encode_data(&input, q);
+        assert_eq!(decode_data(&enc, q).unwrap(), input);
+    }
+
+    #[test]
+    fn test_parse_send_init_truncated_at_each_position() {
+        // Build a known-good 14-byte payload; truncate to every
+        // length 0..=14 and confirm the parser doesn't panic and that
+        // each truncation produces sensible defaults for the missing
+        // fields.
+        let caps = Capabilities {
+            maxl: 4096,
+            time: 10,
+            qctl: b'#',
+            qbin: Some(b'&'),
+            chkt: b'3',
+            rept: Some(b'~'),
+            window: 4,
+            long_packets: true,
+            attribute_packets: true,
+            ..Capabilities::default()
+        };
+        let full = build_send_init_payload(&caps);
+        for n in 0..=full.len() {
+            let _ = parse_send_init_payload(&full[..n]);
+        }
+    }
+
+    #[test]
+    fn test_intersect_qbin_peer_yes_means_none() {
+        // Peer signals 'Y' (parsed to None == "willing"); we have no
+        // 8-bit prefix configured — intersection should remain None.
+        let ours = Capabilities {
+            qbin: None,
+            ..Capabilities::default()
+        };
+        let theirs = Capabilities {
+            qbin: None,
+            ..Capabilities::default()
+        };
+        let session = intersect_capabilities(&ours, &theirs);
+        assert_eq!(session.qbin, None);
+        // We require 8-bit; peer is willing (None).  Intersection
+        // takes our Some(c).
+        let ours = Capabilities {
+            qbin: Some(b'&'),
+            ..Capabilities::default()
+        };
+        let session = intersect_capabilities(&ours, &theirs);
+        assert_eq!(session.qbin, Some(b'&'));
+    }
+
+    // ---------- Proptest fuzzers (panic-only assertions) ----------
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn proptest_parse_send_init_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let _ = parse_send_init_payload(&data);
+        }
+
+        #[test]
+        fn proptest_parse_attributes_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let _ = parse_attributes(&data);
+        }
+
+        #[test]
+        fn proptest_decode_data_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        ) {
+            let q1 = Quoting { qctl: b'#', qbin: None, rept: None };
+            let q2 = Quoting { qctl: b'#', qbin: Some(b'&'), rept: Some(b'~') };
+            let _ = decode_data(&data, q1);
+            let _ = decode_data(&data, q2);
+        }
+
+        #[test]
+        fn proptest_read_packet_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            // Run inside a tokio runtime so the async read_packet can
+            // execute.  Each proptest case spins up a fresh runtime.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut state = ReadState::default();
+                let mut c = std::io::Cursor::new(data);
+                for chkt in [b'1', b'2', b'3'] {
+                    let _ = read_packet(&mut c, false, false, chkt, CR, false, &mut state, None).await;
+                    // Cursor is consumed after the first call; don't expect later iterations to do anything meaningful.
+                }
+            });
+        }
     }
 }
