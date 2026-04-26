@@ -1231,14 +1231,28 @@ pub(crate) fn parse_send_init_payload(data: &[u8]) -> Capabilities {
         }
         idx += 2;
     }
-    // Optional version/identification block (free-form text).  We pull
-    // it raw without applying the data-field quoting layer because
-    // Send-Init itself isn't quoted (per spec — its data is all
-    // printable per the slot definitions above).
+    // Optional trailing bytes.  Per spec these may carry vendor-
+    // defined CAPAS-extension fields (CHECKPOINT, WHATAMI, etc., as
+    // C-Kermit emits) OR a free-form ASCII identification string.
+    // Real C-Kermit fills this slot with binary extension bytes that
+    // happen to be in the printable range but don't form a readable
+    // identifier — accepting them as peer_id produces garbage like
+    // `0___^"U1A` and breaks downstream flavor detection.
+    //
+    // Heuristic: only treat trailing bytes as peer_id when they
+    // contain a 4-character run of ASCII letters (the smallest
+    // identifier likely to be meaningful — "Kermit" alone clears
+    // this; binary extension fields rarely do).
     if data.len() > idx {
-        let trailing = String::from_utf8_lossy(&data[idx..]).trim().to_string();
-        if !trailing.is_empty() {
-            c.peer_id = Some(trailing);
+        let trailing = &data[idx..];
+        let has_letter_run = trailing
+            .windows(4)
+            .any(|w| w.iter().all(|b| b.is_ascii_alphabetic()));
+        if has_letter_run {
+            let s = String::from_utf8_lossy(trailing).trim().to_string();
+            if !s.is_empty() {
+                c.peer_id = Some(s);
+            }
         }
     }
     c
@@ -2383,27 +2397,33 @@ async fn send_d_packets_windowed(
                     }
                 } else if resp.kind == TYPE_NAK {
                     // Selective retransmit of the NAKed seq.
-                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
-                        p.retries += 1;
-                        if p.retries >= max_retries {
-                            return Err(format!(
-                                "Kermit: too many NAKs (>{}) for seq {} (window)",
-                                max_retries, p.seq
-                            ));
-                        }
-                        if verbose {
-                            glog!(
-                                "Kermit send: NAK seq={} (window) — retransmitting ({}/{})",
-                                p.seq,
-                                p.retries,
-                                max_retries
-                            );
-                        }
-                        let bytes = p.bytes.clone();
+                    if let Some(idx) =
+                        outstanding.iter().position(|p| p.seq == resp.seq)
+                    {
+                        let bytes = {
+                            let p = &mut outstanding[idx];
+                            p.retries += 1;
+                            if p.retries >= max_retries {
+                                return Err(format!(
+                                    "Kermit: too many NAKs (>{}) for seq {} (window)",
+                                    max_retries, p.seq
+                                ));
+                            }
+                            if verbose {
+                                glog!(
+                                    "Kermit send: NAK seq={} (window) — retransmitting ({}/{})",
+                                    p.seq,
+                                    p.retries,
+                                    max_retries
+                                );
+                            }
+                            p.bytes.clone()
+                        };
                         raw_write_bytes(writer, &bytes, is_tcp).await?;
-                        if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
-                            p.sent_at = tokio::time::Instant::now();
-                        }
+                        // Index `idx` is still valid (single-threaded
+                        // async fn, no push/pop between collection
+                        // and use).
+                        outstanding[idx].sent_at = tokio::time::Instant::now();
                     } else if verbose {
                         glog!(
                             "Kermit send: stray NAK seq={} (window) — ignoring",
@@ -2429,7 +2449,7 @@ async fn send_d_packets_windowed(
                     }
                 }
                 for i in to_retx {
-                    let (seq, bytes) = {
+                    let bytes = {
                         let p = &mut outstanding[i];
                         p.retries += 1;
                         if p.retries >= max_retries {
@@ -2446,12 +2466,13 @@ async fn send_d_packets_windowed(
                                 max_retries
                             );
                         }
-                        (p.seq, p.bytes.clone())
+                        p.bytes.clone()
                     };
                     raw_write_bytes(writer, &bytes, is_tcp).await?;
-                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == seq) {
-                        p.sent_at = tokio::time::Instant::now();
-                    }
+                    // Index `i` is still valid: outstanding is mutated
+                    // only by us in this single-threaded async fn, and
+                    // we don't push/pop between collection and use.
+                    outstanding[i].sent_at = tokio::time::Instant::now();
                 }
             }
         }
@@ -2651,18 +2672,15 @@ async fn send_d_and_z_streaming(
                     raw_write_bytes(writer, &z_pkt, is_tcp).await?;
                     z_sent_at = tokio::time::Instant::now();
                 }
-                let mut to_retx: Vec<u8> = Vec::new();
-                for p in outstanding.iter() {
+                let mut to_retx: Vec<usize> = Vec::new();
+                for (i, p) in outstanding.iter().enumerate() {
                     if now >= p.sent_at + pkt_timeout {
-                        to_retx.push(p.seq);
+                        to_retx.push(i);
                     }
                 }
-                for seq in to_retx {
+                for i in to_retx {
                     let bytes_clone = {
-                        let p = outstanding
-                            .iter_mut()
-                            .find(|p| p.seq == seq)
-                            .expect("seq present");
+                        let p = &mut outstanding[i];
                         p.retries += 1;
                         if p.retries >= max_retries {
                             return Err(format!(
@@ -2681,9 +2699,11 @@ async fn send_d_and_z_streaming(
                         p.bytes.clone()
                     };
                     raw_write_bytes(writer, &bytes_clone, is_tcp).await?;
-                    if let Some(p) = outstanding.iter_mut().find(|p| p.seq == seq) {
-                        p.sent_at = tokio::time::Instant::now();
-                    }
+                    // Index `i` is still valid here — outstanding is
+                    // mutated only by us in this single-threaded async
+                    // fn, and we don't push/pop between collection and
+                    // use.
+                    outstanding[i].sent_at = tokio::time::Instant::now();
                 }
             }
         }
@@ -2725,27 +2745,30 @@ async fn handle_streaming_response(
         return Ok(());
     }
     if resp.kind == TYPE_NAK {
-        if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
-            p.retries += 1;
-            if p.retries >= max_retries {
-                return Err(format!(
-                    "Kermit: too many NAKs (>{}) for seq {} (stream)",
-                    max_retries, p.seq
-                ));
-            }
-            if verbose {
-                glog!(
-                    "Kermit send: NAK seq={} (stream) — retransmitting ({}/{})",
-                    p.seq,
-                    p.retries,
-                    max_retries
-                );
-            }
-            let bytes = p.bytes.clone();
+        if let Some(idx) = outstanding.iter().position(|p| p.seq == resp.seq) {
+            let bytes = {
+                let p = &mut outstanding[idx];
+                p.retries += 1;
+                if p.retries >= max_retries {
+                    return Err(format!(
+                        "Kermit: too many NAKs (>{}) for seq {} (stream)",
+                        max_retries, p.seq
+                    ));
+                }
+                if verbose {
+                    glog!(
+                        "Kermit send: NAK seq={} (stream) — retransmitting ({}/{})",
+                        p.seq,
+                        p.retries,
+                        max_retries
+                    );
+                }
+                p.bytes.clone()
+            };
             raw_write_bytes(writer, &bytes, is_tcp).await?;
-            if let Some(p) = outstanding.iter_mut().find(|p| p.seq == resp.seq) {
-                p.sent_at = tokio::time::Instant::now();
-            }
+            // Index `idx` is still valid (single-threaded async fn,
+            // no push/pop between collection and use).
+            outstanding[idx].sent_at = tokio::time::Instant::now();
         } else if verbose {
             glog!(
                 "Kermit send: stray NAK seq={} (stream) — ignoring",
@@ -4521,11 +4544,20 @@ mod tests {
         files: Vec<(String, Vec<u8>)>,
         drop_seq: u8,
     ) -> Result<Vec<KermitReceive>, String> {
+        round_trip_lossy_with_overrides(&[], files, drop_seq).await
+    }
+
+    async fn round_trip_lossy_with_overrides(
+        extra_overrides: &[(&str, &str)],
+        files: Vec<(String, Vec<u8>)>,
+        drop_seq: u8,
+    ) -> Result<Vec<KermitReceive>, String> {
         use tokio::io::{duplex, split};
         let _guard = CONFIG_LOCK.lock().await;
         init_test_config();
-        // Force window>1, classic packets, CHKT=3 — the lossy bridge
-        // assumes these.
+        // Force classic packets, CHKT=3 — the lossy bridge assumes
+        // these.  Sliding windows on by default; callers can layer
+        // streaming on via extra_overrides.
         config::update_config_value("kermit_sliding_windows", "true");
         config::update_config_value("kermit_window_size", "4");
         config::update_config_value("kermit_long_packets", "false");
@@ -4536,6 +4568,9 @@ mod tests {
         // packet.
         config::update_config_value("kermit_packet_timeout", "1");
         config::update_config_value("kermit_max_retries", "10");
+        for (k, v) in extra_overrides {
+            config::update_config_value(k, v);
+        }
 
         // sx pipe (sender → bridge): sender writes one end, bridge
         // reads the other.  split() returns (ReadHalf, WriteHalf) so
@@ -4617,6 +4652,26 @@ mod tests {
 
         send_result?;
         recv_result
+    }
+
+    #[tokio::test]
+    async fn test_round_trip_streaming_lossy_drop_one_d_packet() {
+        // Streaming mode: sender pushes D-packets back-to-back without
+        // waiting for ACKs, then sends Z and waits for Z-ACK.  When a
+        // D-packet is dropped mid-stream, the receiver NAKs the
+        // missing seq during the Z-drain phase and the sender must
+        // selectively retransmit it.  Verifies the streaming sender's
+        // NAK-handling path against real packet loss.
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 200 + 30) as u8).collect();
+        let received = round_trip_lossy_with_overrides(
+            &[("kermit_streaming", "true")],
+            vec![("stream_lossy.bin".into(), payload.clone())],
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].data, payload);
     }
 
     #[tokio::test]
@@ -4866,6 +4921,65 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_send_init_rejects_ckermit_capas_extension_as_peer_id() {
+        // Captured C-Kermit Send-Init payload — the trailing bytes
+        // [30 5F 5F 5F 5E 22 55 31 41] are vendor CAPAS extension
+        // fields (CHECKPOINT, WHATAMI, ATCAPB, ...), not text.  Older
+        // versions of our parser interpreted them as a peer_id string
+        // and broke downstream flavor detection.
+        let raw = [
+            0x7E, 0x2F, 0x20, 0x40, 0x2D, 0x23, 0x59, 0x33, 0x7E, 0x5E, 0x3E, 0x4A, 0x29, 0x30,
+            0x5F, 0x5F, 0x5F, 0x5E, 0x22, 0x55, 0x31, 0x41,
+        ];
+        let parsed = parse_send_init_payload(&raw);
+        assert_eq!(parsed.maxl, 3999);
+        assert_eq!(parsed.time, 15);
+        assert_eq!(parsed.chkt, b'3');
+        assert_eq!(parsed.window, 30);
+        assert!(parsed.long_packets);
+        assert!(parsed.attribute_packets);
+        assert!(
+            parsed.peer_id.is_none(),
+            "trailing CAPAS extension bytes should NOT be treated as peer_id, got: {:?}",
+            parsed.peer_id
+        );
+    }
+
+    #[test]
+    fn test_parse_send_init_accepts_real_text_peer_id() {
+        // A genuine ASCII identification string with a 4-letter run
+        // (e.g., "Kermit") should be captured as peer_id.
+        let mut payload = build_send_init_payload(&Capabilities {
+            maxl: 4096,
+            window: 4,
+            long_packets: true,
+            ..Capabilities::default()
+        });
+        payload.extend_from_slice(b"C-Kermit 9.0.302");
+        let parsed = parse_send_init_payload(&payload);
+        assert_eq!(parsed.peer_id.as_deref(), Some("C-Kermit 9.0.302"));
+    }
+
+    #[test]
+    fn test_detect_flavor_ckermit_from_capas_alone() {
+        // C-Kermit's Send-Init buries identification in binary CAPAS
+        // extension fields rather than a readable peer_id, so the
+        // capability-based heuristic must classify it correctly when
+        // peer_id is None.
+        let c = Capabilities {
+            maxl: 3999,
+            time: 15,
+            chkt: b'3',
+            window: 30,
+            long_packets: true,
+            attribute_packets: true,
+            peer_id: None,
+            ..Capabilities::default()
+        };
+        assert_eq!(detect_flavor(&c), KermitFlavor::CKermit);
+    }
+
+    #[test]
     fn test_intersect_qbin_peer_yes_means_none() {
         // Peer signals 'Y' (parsed to None == "willing"); we have no
         // 8-bit prefix configured — intersection should remain None.
@@ -5051,6 +5165,12 @@ mod tests {
             &mut r, true, false, b'1', CR, false, &mut state,
             Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(10)),
         ).await.unwrap();
+        let raw_payload: Vec<String> = s_pkt.payload.iter().map(|b| format!("{:02X}", b)).collect();
+        eprintln!(
+            "S-packet raw payload ({} bytes): [{}]",
+            s_pkt.payload.len(),
+            raw_payload.join(" ")
+        );
         let peer_init = parse_send_init_payload(&s_pkt.payload);
         eprintln!(
             "peer Send-Init: maxl={} time={} qctl=0x{:02X}('{}') qbin={:?} chkt='{}' rept={:?} window={} long={} stream={} attrs={} peer_id={:?}",
@@ -5117,14 +5237,11 @@ mod tests {
         .expect("ckermit stop-and-wait interop failed");
         assert_eq!(received.len(), 1, "expected 1 file");
         assert_eq!(received[0].data, payload, "file content mismatch");
-        // Flavor detection should classify ckermit as C-Kermit.
-        // Flavor detection is heuristic; assert it's at least classified
-        // as something more specific than Unknown when peer_id parses.
-        // Known C-Kermit S-packets sometimes have a malformed trailing
-        // peer_id field — that's a parser issue tracked separately;
-        // here we just confirm the protocol-level data round-tripped.
-        let f = received[0].flavor.display();
-        eprintln!("kermit interop flavor: {}", f);
+        // C-Kermit's Send-Init has no readable peer_id slot (it's
+        // filled with binary CAPAS extension bytes), so detect_flavor
+        // classifies via capability bits — long_packets +
+        // attribute_packets + window>1 → CKermit.
+        assert_eq!(received[0].flavor, KermitFlavor::CKermit);
     }
 
     #[cfg(unix)]
