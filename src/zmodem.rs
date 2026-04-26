@@ -2211,7 +2211,12 @@ mod tests {
     // nothing beyond the checked-in bytes.
     //
     // To refresh the fixtures (requires lrzsz on PATH, Unix-only):
-    //     cargo test record_lrzsz_fixtures -- --ignored --exact --nocapture
+    //     ZMODEM_RECORD_FIXTURES=1 \
+    //         cargo test record_lrzsz_fixtures -- --ignored --exact --nocapture
+    //
+    // The env-var gate keeps `cargo test -- --ignored` (a natural
+    // way to run all interop tests at once) from quietly rewriting
+    // the committed fixtures with timestamp-bearing equivalents.
     //
     // The replay catches any future divergence between our decoder
     // and the wire format real senders actually emit — e.g. if sz
@@ -2330,6 +2335,19 @@ mod tests {
     async fn record_lrzsz_fixtures() {
         use std::process::Stdio;
         use tokio::process::Command;
+
+        // Two-step opt-in: `#[ignore]` keeps this off the default
+        // test pass, and the env-var check keeps it off accidental
+        // bulk runs of `cargo test -- --ignored` (where it would
+        // silently rewrite the committed fixtures with timestamp-
+        // bearing equivalents).  The deliberate refresh path sets
+        // the var and uses `--exact`.
+        if std::env::var("ZMODEM_RECORD_FIXTURES").is_err() {
+            eprintln!(
+                "record_lrzsz_fixtures: skipped (set ZMODEM_RECORD_FIXTURES=1 to refresh)"
+            );
+            return;
+        }
 
         // Bail clearly if lrzsz isn't installed — this is a manual
         // fixture-refresh test, the user ran it on purpose.
