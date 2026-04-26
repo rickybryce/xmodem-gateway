@@ -1433,11 +1433,12 @@ async fn send_error(
 // ATTRIBUTE PACKET CODEC
 // =============================================================================
 
-/// Subset of A-packet sub-attributes we emit / parse.  Each sub-attr is
-/// a single-character tag, followed by tochar(length), followed by
-/// `length` bytes of value.  We support enough to convey size, date,
-/// mode, system ID, and disposition.  Unknown tags are silently passed
-/// through on receive (logged when verbose).
+/// Subset of A-packet sub-attributes we emit / parse, per Frank da
+/// Cruz spec §5.1 ("File Attributes").  Each sub-attr is a single-
+/// character tag, followed by `tochar(length)`, followed by `length`
+/// bytes of value.  Unknown tags are silently skipped on receive
+/// (length-byte respected); a malformed length terminates parsing
+/// without error so adversarial input can't panic the receiver.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct Attributes {
     /// File length in bytes ('!' tag, decimal-string value).
@@ -1446,15 +1447,34 @@ pub(crate) struct Attributes {
     pub date: Option<String>,
     /// UNIX permission bits ('+' tag in some Kermits, vendor extension).
     pub mode: Option<u32>,
-    /// Sender's system ID ('"' tag).  Surfaces in flavor classification
+    /// Sender's system ID ('.' tag).  Surfaces in flavor classification
     /// when the Send-Init didn't carry an obvious peer_id.
     pub system_id: Option<String>,
-    /// File type ('"' tag is system-id, '"' actually depends on Kermit
-    /// vintage; we prefer 'A' for "ASCII" vs 'B' for binary, encoded
-    /// as a single character value).
+    /// File type ('"' tag) — single character, typically `A`=ASCII /
+    /// `B`=binary.
     pub file_type: Option<u8>,
-    /// Disposition: 'N' = new, 'S' = supersede, etc.  Single char.
+    /// Disposition ('@' tag): 'N' = new, 'S' = supersede, etc.
     pub disposition: Option<u8>,
+    /// Long-form file length in bytes ('&' tag, decimal-string value).
+    /// Provided by senders with files larger than the '!' field can
+    /// represent; we cap inbound at MAX_FILE_SIZE so this is mostly
+    /// informational, but we accept it as a fallback when '!' is
+    /// absent.  We don't emit '&' ourselves since '!' covers our cap.
+    pub long_length: Option<u64>,
+    /// Character set ('1' tag) — single character, typically 'A' for
+    /// ASCII, 'B' for some 8-bit table, etc.  Recorded but not
+    /// interpreted; downstream code can surface it if it cares.
+    pub charset: Option<u8>,
+    /// Encoding ('*' tag) — single character, typically 'A'/'B' =
+    /// binary / image, 'C' = compressed, etc.  Recorded only.
+    pub encoding: Option<u8>,
+    /// Record format (',' tag) — single character, typically 'S' =
+    /// stream (the only one we ever produce), 'F' = fixed-length,
+    /// 'V' = variable-length.  Recorded only.
+    pub record_format: Option<u8>,
+    /// Record length ('-' tag, decimal-string value).  Only meaningful
+    /// alongside `record_format` = 'F' or 'V'; otherwise informational.
+    pub record_length: Option<u32>,
 }
 
 /// Encode an Attributes struct into the A-packet's data field (already
@@ -1499,6 +1519,32 @@ pub(crate) fn encode_attributes(a: &Attributes) -> Vec<u8> {
         out.push(tochar(1));
         out.push(d);
     }
+    if let Some(c) = a.charset {
+        out.push(b'1');
+        out.push(tochar(1));
+        out.push(c);
+    }
+    if let Some(e) = a.encoding {
+        out.push(b'*');
+        out.push(tochar(1));
+        out.push(e);
+    }
+    if let Some(f) = a.record_format {
+        out.push(b',');
+        out.push(tochar(1));
+        out.push(f);
+    }
+    if let Some(rl) = a.record_length {
+        let s = rl.to_string();
+        if s.len() <= 94 {
+            out.push(b'-');
+            out.push(tochar(s.len() as u8));
+            out.extend_from_slice(s.as_bytes());
+        }
+    }
+    // We don't emit '&' (long_length) ourselves: '!' fits MAX_FILE_SIZE
+    // (8 MB) trivially, and emitting both would just bloat the
+    // packet.  We do parse it on receive though.
     out
 }
 
@@ -1548,6 +1594,37 @@ pub(crate) fn parse_attributes(data: &[u8]) -> Attributes {
             b'@' => {
                 if !val.is_empty() {
                     a.disposition = Some(val[0]);
+                }
+            }
+            b'&' => {
+                // Long-form length, decimal string.  Same parser as
+                // '!' but a wider receiver type.
+                if let Ok(s) = std::str::from_utf8(val)
+                    && let Ok(v) = s.trim().parse::<u64>()
+                {
+                    a.long_length = Some(v);
+                }
+            }
+            b'1' => {
+                if !val.is_empty() {
+                    a.charset = Some(val[0]);
+                }
+            }
+            b'*' => {
+                if !val.is_empty() {
+                    a.encoding = Some(val[0]);
+                }
+            }
+            b',' => {
+                if !val.is_empty() {
+                    a.record_format = Some(val[0]);
+                }
+            }
+            b'-' => {
+                if let Ok(s) = std::str::from_utf8(val)
+                    && let Ok(v) = s.trim().parse::<u32>()
+                {
+                    a.record_length = Some(v);
                 }
             }
             _ => {}
@@ -1724,6 +1801,7 @@ pub(crate) async fn kermit_send(
                 system_id: Some("UNIX".into()),
                 file_type: Some(b'B'), // binary
                 disposition: Some(b'N'),
+                ..Attributes::default()
             };
             let a_payload = encode_data(&encode_attributes(&attrs), send_q);
             let _ = send_and_await_ack(
@@ -2979,19 +3057,26 @@ pub(crate) async fn kermit_receive(
             TYPE_ATTRIBUTE => {
                 let raw = decode_data(&pkt.payload, recv_q)?;
                 let a = parse_attributes(&raw);
+                // Fall back to '&' (long_length) when '!' isn't sent —
+                // rare but spec-allowed for senders with files larger
+                // than the '!' field can encode in a single tochar
+                // length byte (max 94 chars of decimal).
+                let declared = a.length.or(a.long_length);
                 if verbose {
                     glog!(
-                        "Kermit recv: A-packet len={:?} date={:?} mode={:?}",
-                        a.length,
+                        "Kermit recv: A-packet len={:?} date={:?} mode={:?} encoding={:?} record_format={:?}",
+                        declared,
                         a.date,
-                        a.mode
+                        a.mode,
+                        a.encoding.map(|c| c as char),
+                        a.record_format.map(|c| c as char),
                     );
                 }
                 if let Some(last) = received.last_mut() {
-                    last.declared_size = a.length;
+                    last.declared_size = declared;
                     last.mode = a.mode;
                     last.modtime = a.date.as_deref().and_then(parse_kermit_date);
-                    if let Some(sz) = a.length
+                    if let Some(sz) = declared
                         && sz > MAX_FILE_SIZE
                     {
                         send_error(
@@ -3794,6 +3879,11 @@ mod tests {
             system_id: Some("UNIX".into()),
             file_type: Some(b'B'),
             disposition: Some(b'N'),
+            charset: Some(b'A'),
+            encoding: Some(b'B'),
+            record_format: Some(b'S'),
+            record_length: Some(80),
+            ..Attributes::default()
         };
         let bytes = encode_attributes(&a);
         let parsed = parse_attributes(&bytes);
@@ -3803,6 +3893,85 @@ mod tests {
         assert_eq!(parsed.system_id.as_deref(), Some("UNIX"));
         assert_eq!(parsed.file_type, Some(b'B'));
         assert_eq!(parsed.disposition, Some(b'N'));
+        assert_eq!(parsed.charset, Some(b'A'));
+        assert_eq!(parsed.encoding, Some(b'B'));
+        assert_eq!(parsed.record_format, Some(b'S'));
+        assert_eq!(parsed.record_length, Some(80));
+    }
+
+    #[test]
+    fn test_attributes_long_length_parsed_when_only_amp() {
+        // Hand-craft an A-packet payload with only '&' (long length),
+        // no '!' — simulates a peer with files larger than '!' can
+        // express.  Verify long_length is captured and the receiver
+        // logic uses it as a fallback for declared_size.
+        let mut data = Vec::new();
+        data.push(b'&');
+        let s = "5000000000"; // 5 GB
+        data.push(tochar(s.len() as u8));
+        data.extend_from_slice(s.as_bytes());
+        let parsed = parse_attributes(&data);
+        assert_eq!(parsed.length, None, "no '!' was sent");
+        assert_eq!(parsed.long_length, Some(5_000_000_000));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_charset() {
+        let a = Attributes {
+            charset: Some(b'A'),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(!bytes.is_empty());
+        assert_eq!(parse_attributes(&bytes).charset, Some(b'A'));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_encoding() {
+        let a = Attributes {
+            encoding: Some(b'C'),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(!bytes.is_empty());
+        assert_eq!(parse_attributes(&bytes).encoding, Some(b'C'));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_record_format() {
+        let a = Attributes {
+            record_format: Some(b'F'),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(!bytes.is_empty());
+        assert_eq!(parse_attributes(&bytes).record_format, Some(b'F'));
+    }
+
+    #[test]
+    fn test_attributes_per_tag_roundtrip_record_length() {
+        let a = Attributes {
+            record_length: Some(132),
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(!bytes.is_empty());
+        assert_eq!(parse_attributes(&bytes).record_length, Some(132));
+    }
+
+    #[test]
+    fn test_attributes_long_length_not_emitted_when_short() {
+        // We never emit '&' from our encoder — '!' covers MAX_FILE_SIZE
+        // and adding '&' would just bloat the packet.  Encoded form
+        // must contain the '!' tag but not the '&' tag.
+        let a = Attributes {
+            length: Some(100),
+            long_length: Some(100), // even if the caller sets it
+            ..Attributes::default()
+        };
+        let bytes = encode_attributes(&a);
+        assert!(bytes.contains(&b'!'), "should emit '!' for length");
+        assert!(!bytes.contains(&b'&'), "should NOT emit '&' (we don't produce it)");
     }
 
     #[test]
