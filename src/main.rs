@@ -9,6 +9,7 @@
 mod aichat;
 mod config;
 mod gui;
+mod kermit;
 mod logger;
 mod serial;
 mod ssh;

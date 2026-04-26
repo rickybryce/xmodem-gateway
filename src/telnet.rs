@@ -125,6 +125,10 @@ enum UploadProtocol {
     XmodemYmodem,
     /// ZMODEM — receiver initiates the session with ZRINIT.
     Zmodem,
+    /// Kermit — receiver waits for the peer's Send-Init; flavor
+    /// (C-Kermit, G-Kermit, etc.) is auto-detected from the peer's
+    /// CAPAS bits and surfaced in the post-transfer summary.
+    Kermit,
 }
 
 /// Transfer protocol selected at download time by the user.  Picked
@@ -143,6 +147,10 @@ enum DownloadProtocol {
     /// ZMODEM — Forsberg ZMODEM with ZDLE escaping, hex + binary
     /// headers, stop-and-wait 1K subpackets.
     Zmodem,
+    /// Kermit — full-spec Kermit with negotiated long packets,
+    /// sliding window, streaming, and attribute packets per the
+    /// peer's CAPAS bits.
+    Kermit,
 }
 
 // ─── Input mode ────────────────────────────────────────────
@@ -3528,6 +3536,11 @@ impl TelnetSession {
             self.cyan("Z")
         ))
         .await?;
+        self.send_line(&format!(
+            "  {}  KERMIT         (any flavor — auto-detects C/G/95/86/...)",
+            self.cyan("K")
+        ))
+        .await?;
         self.send_line("").await?;
         self.send(&format!(
             "  Pick one, or {} to cancel: ",
@@ -3556,6 +3569,7 @@ impl TelnetSession {
             let chosen = match ch {
                 'x' | 'y' => Some(UploadProtocol::XmodemYmodem),
                 'z' => Some(UploadProtocol::Zmodem),
+                'k' => Some(UploadProtocol::Kermit),
                 _ => None,
             };
             if let Some(p) = chosen {
@@ -3667,6 +3681,8 @@ impl TelnetSession {
                     "Start XMODEM/YMODEM send from your terminal now.",
                 UploadProtocol::Zmodem =>
                     "Start ZMODEM send from your terminal now.",
+                UploadProtocol::Kermit =>
+                    "Start KERMIT send from your terminal now.",
             })
         ))
         .await?;
@@ -3732,6 +3748,8 @@ impl TelnetSession {
             }
             !transfer_path.join(sender_name).exists()
         };
+        let kermit_iac = config::get_config().kermit_iac_escape;
+        let is_petscii = self.terminal_type == TerminalType::Petscii;
         let result: Result<Received, String> = match protocol {
             UploadProtocol::Zmodem => crate::zmodem::zmodem_receive(
                 &mut self.reader,
@@ -3755,6 +3773,32 @@ impl TelnetSession {
             )
             .await
             .map(|(data, meta)| vec![(None, data, meta)]),
+            UploadProtocol::Kermit => crate::kermit::kermit_receive(
+                &mut self.reader,
+                &mut *writer_guard,
+                kermit_iac,
+                is_petscii,
+                verbose,
+            )
+            .await
+            .map(|rxs| {
+                // Map KermitReceive list to (Option<filename>, data, None).
+                // First file gets None for filename so user-entered name
+                // wins (matches XMODEM/YMODEM behavior); subsequent files
+                // in the batch use the sender's name like ZMODEM does.
+                rxs.into_iter()
+                    .enumerate()
+                    .map(|(i, rx)| {
+                        let name = if i == 0 { None } else { Some(rx.filename) };
+                        let meta = crate::xmodem::YmodemReceiveMeta {
+                            size: rx.declared_size,
+                            modtime: rx.modtime,
+                            mode: rx.mode,
+                        };
+                        (name, rx.data, Some(meta))
+                    })
+                    .collect()
+            }),
         };
         drop(writer_guard);
         let elapsed = start.elapsed();
@@ -4082,6 +4126,11 @@ impl TelnetSession {
             self.cyan("Z")
         ))
         .await?;
+        self.send_line(&format!(
+            "  {}  KERMIT       (any flavor, auto-detected)",
+            self.cyan("K")
+        ))
+        .await?;
         self.send_line("").await?;
         self.send(&format!(
             "  Pick one, or {} to cancel: ",
@@ -4109,6 +4158,7 @@ impl TelnetSession {
                 '1' => Some(DownloadProtocol::Xmodem1k),
                 'y' => Some(DownloadProtocol::Ymodem),
                 'z' => Some(DownloadProtocol::Zmodem),
+                'k' => Some(DownloadProtocol::Kermit),
                 _ => None,
             };
             if let Some(p) = chosen {
@@ -4192,6 +4242,7 @@ impl TelnetSession {
                 DownloadProtocol::Xmodem1k => "Start XMODEM-1K receive now.",
                 DownloadProtocol::Ymodem => "Start YMODEM receive now.",
                 DownloadProtocol::Zmodem => "Start ZMODEM receive now.",
+                DownloadProtocol::Kermit => "Start KERMIT receive now.",
             })
         ))
         .await?;
@@ -4225,6 +4276,24 @@ impl TelnetSession {
                 &mut *writer_guard,
                 &batch,
                 self.xmodem_iac,
+                verbose,
+            )
+            .await
+        } else if matches!(protocol, DownloadProtocol::Kermit) {
+            let kermit_iac = config::get_config().kermit_iac_escape;
+            let is_petscii = self.terminal_type == TerminalType::Petscii;
+            let files = vec![crate::kermit::KermitSendFile {
+                name: filename,
+                data: &data,
+                modtime: file_modtime,
+                mode: file_mode,
+            }];
+            crate::kermit::kermit_send(
+                &mut self.reader,
+                &mut *writer_guard,
+                &files,
+                kermit_iac,
+                is_petscii,
                 verbose,
             )
             .await
@@ -8445,6 +8514,11 @@ impl TelnetSession {
             ))
             .await?;
             self.send_line(&format!(
+                "  {}  KERMIT settings",
+                self.cyan("K")
+            ))
+            .await?;
+            self.send_line(&format!(
                 "  {}  Restart server",
                 self.cyan("R")
             ))
@@ -8479,6 +8553,9 @@ impl TelnetSession {
                 "z" => {
                     self.zmodem_settings().await?;
                 }
+                "k" => {
+                    self.kermit_settings().await?;
+                }
                 "r" => {
                     self.config_restart_server().await?;
                 }
@@ -8487,7 +8564,7 @@ impl TelnetSession {
                 }
                 "q" => return Ok(()),
                 _ => {
-                    self.show_error("Press D, X, Y, Z, R, H, or Q.").await?;
+                    self.show_error("Press D, X, Y, Z, K, R, H, or Q.").await?;
                 }
             }
         }
@@ -8504,11 +8581,13 @@ impl TelnetSession {
                 "  X  XMODEM settings",
                 "  Y  YMODEM settings",
                 "  Z  ZMODEM settings",
+                "  K  KERMIT settings",
                 "  R  Restart the server",
                 "",
                 "  XMODEM, XMODEM-1K, and YMODEM",
                 "  share the same timeouts.",
-                "  ZMODEM has its own.",
+                "  ZMODEM and Kermit each have",
+                "  their own.",
             ]
         } else {
             &[
@@ -8519,12 +8598,14 @@ impl TelnetSession {
                 "  X  XMODEM settings (XMODEM + XMODEM-1K)",
                 "  Y  YMODEM settings (shared with XMODEM)",
                 "  Z  ZMODEM settings",
+                "  K  KERMIT settings",
                 "  R  Restart the server",
                 "",
                 "  XMODEM, XMODEM-1K, and YMODEM share",
                 "  the same timeouts because they share",
                 "  the same protocol code path. ZMODEM",
-                "  has its own independent tunables.",
+                "  and Kermit each have their own independent",
+                "  tunables.",
             ]
         };
         self.show_help_page("FILE TRANSFER HELP", lines).await
@@ -8876,6 +8957,354 @@ impl TelnetSession {
             ]
         };
         self.show_help_page("ZMODEM SETTINGS HELP", lines).await
+    }
+
+    // ─── KERMIT SETTINGS ────────────────────────────────────
+    //
+    // Kermit has the largest configuration surface of any of the
+    // file-transfer protocols.  We split it across three pages of
+    // status (timeouts/retries, packet/window/check, capability bits)
+    // since not all of it fits in PETSCII's 22 rows.
+
+    async fn kermit_settings(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            let cfg = config::get_config();
+
+            self.clear_screen().await?;
+            let sep = self.separator();
+            self.send_line(&sep).await?;
+            self.send_line(&format!("  {}", self.yellow("KERMIT SETTINGS")))
+                .await?;
+            self.send_line(&sep).await?;
+            self.send_line("").await?;
+
+            // Compact status block — one line per field.
+            self.send_line(&format!(
+                "  Negotiate:  {} s    Packet: {} s    Retries: {}",
+                self.amber(&cfg.kermit_negotiation_timeout.to_string()),
+                self.amber(&cfg.kermit_packet_timeout.to_string()),
+                self.amber(&cfg.kermit_max_retries.to_string()),
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Max packet: {}    Window: {}    Check: {}",
+                self.amber(&cfg.kermit_max_packet_length.to_string()),
+                self.amber(&cfg.kermit_window_size.to_string()),
+                self.amber(&cfg.kermit_block_check_type.to_string()),
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Long: {}  Sliding: {}  Stream: {}",
+                self.amber(if cfg.kermit_long_packets { "on" } else { "off" }),
+                self.amber(if cfg.kermit_sliding_windows { "on" } else { "off" }),
+                self.amber(if cfg.kermit_streaming { "on" } else { "off" }),
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  Attrs: {}  Repeat: {}  IAC: {}",
+                self.amber(if cfg.kermit_attribute_packets { "on" } else { "off" }),
+                self.amber(if cfg.kermit_repeat_compression { "on" } else { "off" }),
+                self.amber(if cfg.kermit_iac_escape { "on" } else { "off" }),
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  8-bit quote: {}",
+                self.amber(&cfg.kermit_8bit_quote)
+            ))
+            .await?;
+            self.send_line("").await?;
+
+            self.send_line(&format!(
+                "  {}  Negotiate timeout    {}  Packet timeout",
+                self.cyan("N"),
+                self.cyan("P")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Max retries         {}  Max packet length",
+                self.cyan("X"),
+                self.cyan("M")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Window size         {}  Block check type",
+                self.cyan("W"),
+                self.cyan("C")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle long pkts    {}  Toggle sliding win",
+                self.cyan("L"),
+                self.cyan("S")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle streaming    {}  Toggle attributes",
+                self.cyan("T"),
+                self.cyan("A")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Toggle repeat       {}  Toggle IAC escape",
+                self.cyan("E"),
+                self.cyan("I")
+            ))
+            .await?;
+            self.send_line(&format!(
+                "  {}  Cycle 8-bit quote   {}  Restart server",
+                self.cyan("8"),
+                self.cyan("R")
+            ))
+            .await?;
+            self.send_line("").await?;
+            self.send_line(&format!(
+                "  {}  {}",
+                self.action_prompt("Q", "Back"),
+                self.action_prompt("H", "Help")
+            ))
+            .await?;
+
+            let prompt = format!("{}> ", self.cyan("ethernet/config/xfer/kermit"));
+            self.send(&prompt).await?;
+            self.flush().await?;
+
+            let input = match self.get_menu_input(false).await? {
+                Some(s) if !s.is_empty() => s,
+                _ => return Ok(()),
+            };
+
+            match input.as_str() {
+                "n" => {
+                    self.xmodem_set_numeric(
+                        "Negotiation timeout",
+                        "kermit_negotiation_timeout",
+                        cfg.kermit_negotiation_timeout,
+                        1,
+                        300,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "p" => {
+                    self.xmodem_set_numeric(
+                        "Packet timeout",
+                        "kermit_packet_timeout",
+                        cfg.kermit_packet_timeout,
+                        1,
+                        120,
+                        "seconds",
+                    )
+                    .await?;
+                }
+                "x" => {
+                    self.xmodem_set_numeric(
+                        "Max retries",
+                        "kermit_max_retries",
+                        cfg.kermit_max_retries as u64,
+                        1,
+                        20,
+                        "retries",
+                    )
+                    .await?;
+                }
+                "m" => {
+                    self.xmodem_set_numeric(
+                        "Max packet length",
+                        "kermit_max_packet_length",
+                        cfg.kermit_max_packet_length as u64,
+                        10,
+                        9024,
+                        "bytes",
+                    )
+                    .await?;
+                }
+                "w" => {
+                    self.xmodem_set_numeric(
+                        "Window size",
+                        "kermit_window_size",
+                        cfg.kermit_window_size as u64,
+                        1,
+                        31,
+                        "packets",
+                    )
+                    .await?;
+                }
+                "c" => {
+                    self.xmodem_set_numeric(
+                        "Block check type",
+                        "kermit_block_check_type",
+                        cfg.kermit_block_check_type as u64,
+                        1,
+                        3,
+                        "(1/2/3)",
+                    )
+                    .await?;
+                }
+                "l" => {
+                    self.kermit_toggle_bool(
+                        "Long packets",
+                        "kermit_long_packets",
+                        cfg.kermit_long_packets,
+                    )
+                    .await?;
+                }
+                "s" => {
+                    self.kermit_toggle_bool(
+                        "Sliding windows",
+                        "kermit_sliding_windows",
+                        cfg.kermit_sliding_windows,
+                    )
+                    .await?;
+                }
+                "t" => {
+                    self.kermit_toggle_bool(
+                        "Streaming",
+                        "kermit_streaming",
+                        cfg.kermit_streaming,
+                    )
+                    .await?;
+                }
+                "a" => {
+                    self.kermit_toggle_bool(
+                        "Attribute packets",
+                        "kermit_attribute_packets",
+                        cfg.kermit_attribute_packets,
+                    )
+                    .await?;
+                }
+                "e" => {
+                    self.kermit_toggle_bool(
+                        "Repeat compression",
+                        "kermit_repeat_compression",
+                        cfg.kermit_repeat_compression,
+                    )
+                    .await?;
+                }
+                "i" => {
+                    self.kermit_toggle_bool(
+                        "IAC escape",
+                        "kermit_iac_escape",
+                        cfg.kermit_iac_escape,
+                    )
+                    .await?;
+                }
+                "8" => {
+                    let next = match cfg.kermit_8bit_quote.as_str() {
+                        "auto" => "on",
+                        "on" => "off",
+                        _ => "auto",
+                    };
+                    let key = "kermit_8bit_quote".to_string();
+                    let v = next.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        config::update_config_value(&key, &v);
+                    })
+                    .await
+                    .ok();
+                    self.send_line("").await?;
+                    self.send_line(&format!(
+                        "  {}",
+                        self.green(&format!("8-bit quote set to {}.", next))
+                    ))
+                    .await?;
+                    self.send_line("").await?;
+                    self.send("  Press any key to continue.").await?;
+                    self.flush().await?;
+                    self.wait_for_key().await?;
+                }
+                "r" => {
+                    self.config_restart_server().await?;
+                }
+                "h" => {
+                    self.kermit_show_help().await?;
+                }
+                "q" => return Ok(()),
+                _ => {
+                    self.show_error("Press a listed key, R, H, or Q.")
+                        .await?;
+                }
+            }
+        }
+    }
+
+    /// Helper: flip a Kermit boolean config key, persist, and confirm.
+    async fn kermit_toggle_bool(
+        &mut self,
+        label: &str,
+        key: &str,
+        current: bool,
+    ) -> Result<(), std::io::Error> {
+        let next = !current;
+        let k = key.to_string();
+        let v = next.to_string();
+        tokio::task::spawn_blocking(move || {
+            config::update_config_value(&k, &v);
+        })
+        .await
+        .ok();
+        self.send_line("").await?;
+        self.send_line(&format!(
+            "  {}",
+            self.green(&format!(
+                "{} {}.",
+                label,
+                if next { "enabled" } else { "disabled" }
+            ))
+        ))
+        .await?;
+        self.send_line("").await?;
+        self.send("  Press any key to continue.").await?;
+        self.flush().await?;
+        self.wait_for_key().await?;
+        Ok(())
+    }
+
+    async fn kermit_show_help(&mut self) -> Result<(), std::io::Error> {
+        let lines: &[&str] = if self.terminal_type == TerminalType::Petscii {
+            &[
+                "  Configure Kermit transfer",
+                "  parameters.  Negotiated with",
+                "  the peer at session start.",
+                "",
+                "  N  Negotiate timeout (45 s)",
+                "  P  Per-packet timeout",
+                "  X  Max retries per packet",
+                "  M  Max packet length",
+                "  W  Sliding window size",
+                "  C  Block check type 1/2/3",
+                "  L/S/T/A/E/I  toggles",
+                "  8  cycle 8-bit quote mode",
+                "",
+                "  Streaming auto-degrades to",
+                "  sliding/stop-and-wait when",
+                "  the peer can't do it.",
+            ]
+        } else {
+            &[
+                "  Configure Kermit transfer parameters.",
+                "  These are advertised in our Send-Init;",
+                "  the peer's response narrows the session",
+                "  to the intersection of capabilities.",
+                "",
+                "  N  Negotiate timeout (Send-Init handshake)",
+                "  P  Per-packet read timeout",
+                "  X  Max retries per packet (NAK / timeout)",
+                "  M  Max packet length we'll advertise",
+                "  W  Sliding-window size (1=stop-and-wait)",
+                "  C  Block check type: 1=6-bit, 2=12-bit, 3=CRC-16",
+                "  L  Long-packet capability",
+                "  S  Sliding-window capability",
+                "  T  Streaming capability",
+                "  A  Attribute-packet capability",
+                "  E  Repeat-count compression",
+                "  I  Telnet IAC escape during transfer",
+                "  8  8-bit quote: auto / on / off",
+                "",
+                "  Streaming requires a reliable transport.",
+                "  Disable when bridging to flaky serial.",
+            ]
+        };
+        self.show_help_page("KERMIT SETTINGS HELP", lines).await
     }
 
     async fn xmodem_set_dir(&mut self, current: &str) -> Result<(), std::io::Error> {

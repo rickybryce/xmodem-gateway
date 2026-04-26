@@ -4,5 +4,6 @@ egateway.conf
 *.swo
 *~
 CLAUDE.md
+todo.md
 *.AppImage
 *.AppImage.sha256
