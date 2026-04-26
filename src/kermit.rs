@@ -2430,14 +2430,13 @@ async fn send_d_packets_windowed(
 /// da Cruz, "Kermit Protocol Manual" §6).  Streaming behavior:
 ///
 /// - Sender pushes data packets back-to-back without waiting for any
-///   per-D ACK.
-/// - Between pushes we do a non-blocking poll for incoming NAK or
-///   E-packet — NAK triggers a selective retransmit, E aborts.
+///   per-D ACK.  No mid-stream poll: the spec says the Z-ACK
+///   implicitly confirms every preceding D-packet, so any errors
+///   (NAK, E-packet) are handled in the post-Z drain below.
 /// - After all D-packets are queued we send the Z-packet and then
-///   block-read responses until the Z-ACK arrives.  The Z-ACK
-///   implicitly confirms every preceding D-packet (per spec).
-/// - On receipt of any D-packet NAK during the Z wait, we still
-///   retransmit selectively, then resume waiting for Z-ACK.
+///   block-read responses until the Z-ACK arrives.
+/// - During the Z drain, any D-packet NAK triggers a selective
+///   retransmit before we resume waiting for Z-ACK.
 ///
 /// Returns the seq number to use for the next packet *after* Z (i.e.
 /// the caller's running seq, advanced by `chunks + 1` mod 64).
