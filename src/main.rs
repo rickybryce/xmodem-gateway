@@ -14,6 +14,7 @@ mod logger;
 mod serial;
 mod ssh;
 mod telnet;
+mod tnio;
 mod webbrowser;
 mod xmodem;
 mod zmodem;

@@ -29,11 +29,12 @@
 //! informational only since CAPAS-intersection negotiation does the right
 //! thing for each peer automatically.
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config;
 use crate::logger::glog;
 use crate::telnet::is_esc_key;
+use crate::tnio::{is_can_abort, nvt_read_byte, raw_write_bytes, ReadState};
 
 // ─── Wire constants ──────────────────────────────────────────
 
@@ -108,20 +109,10 @@ pub(crate) const CAPAS_LOCKING_SHIFT: u8 = 0x20;
 /// placement.
 pub(crate) const CAPAS_STREAMING_BYTE3_BIT: u8 = 0x04;
 
-// Telnet protocol bytes (duplicated from xmodem.rs / zmodem.rs to keep
-// the module decoupled — same justification as zmodem.rs:67-75).
-const IAC: u8 = 0xFF;
-const SB: u8 = 250;
-const SE: u8 = 240;
-const WILL: u8 = 251;
-const WONT: u8 = 252;
-const DO_CMD: u8 = 253;
-const DONT: u8 = 254;
-/// CAN byte (0x18) — accepted as an additional abort signal alongside
-/// the canonical Kermit E-packet.  Two consecutive CANs are required
-/// to abort, matching the Forsberg convention used elsewhere in the
-/// codebase (see xmodem.rs::is_can_abort).
-const CAN: u8 = 0x18;
+// Telnet IAC + CAN handling now lives in `crate::tnio` (shared with
+// xmodem.rs and zmodem.rs).  Kermit's CAN×2 abort uses
+// `tnio::is_can_abort`; raw I/O uses `tnio::raw_read_byte`,
+// `tnio::raw_write_bytes`, and `tnio::nvt_read_byte`.
 
 // Limits
 /// Maximum file size for a single Kermit transfer.  Matches the cap used
@@ -830,35 +821,8 @@ pub(crate) async fn read_packet(
 }
 
 // =============================================================================
-// RAW I/O LAYER (telnet IAC + CR-NUL stuffing)
+// READ HELPERS (deadline-aware byte reader on top of `tnio::nvt_read_byte`)
 // =============================================================================
-
-/// Per-stream state threaded through reads.  Mirrors `xmodem.rs::ReadState`
-/// (with pushback for CR-NUL lookahead and CAN×2 abort tracking).  Public
-/// to the module's tests.
-#[derive(Default)]
-pub(crate) struct ReadState {
-    pushback: Option<u8>,
-    pending_can: bool,
-}
-
-/// CAN×2 abort detector — Forsberg's rule, the same as in xmodem.rs.
-/// Two consecutive CAN bytes signal abort; a single CAN is considered
-/// line noise.  Kermit's canonical abort is the E-packet, but we accept
-/// CAN×2 too because terminal users sometimes mash Ctrl-X to bail.
-fn is_can_abort(byte: u8, state: &mut ReadState) -> bool {
-    if byte == CAN {
-        if state.pending_can {
-            state.pending_can = false;
-            return true;
-        }
-        state.pending_can = true;
-        false
-    } else {
-        state.pending_can = false;
-        false
-    }
-}
 
 /// Read a single NVT-aware byte, applying an optional deadline.  When
 /// the deadline elapses we surface `"Kermit: read timeout"` so the
@@ -881,125 +845,6 @@ async fn read_byte_with_deadline(
     } else {
         nvt_read_byte(reader, is_tcp, state).await
     }
-}
-
-/// NVT-aware byte reader: applies CR-NUL stripping after a CR on telnet
-/// streams (peer sends `CR NUL` per RFC 854, we collapse it).  Pushback
-/// is used when a CR's lookahead byte turns out not to be NUL.
-async fn nvt_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-    state: &mut ReadState,
-) -> Result<u8, String> {
-    if let Some(b) = state.pushback.take() {
-        return Ok(b);
-    }
-    let byte = raw_read_byte(reader, is_tcp).await?;
-    if is_tcp && byte == CR {
-        let next = raw_read_byte(reader, is_tcp).await?;
-        if next != 0x00 {
-            state.pushback = Some(next);
-        }
-    }
-    Ok(byte)
-}
-
-/// Lowest-level byte reader: handles telnet IAC unescaping (`IAC IAC`
-/// → `0xFF`) and consumes telnet command sequences (WILL/WONT/DO/DONT
-/// + their option byte; SB ... SE blocks).
-async fn raw_read_byte(
-    reader: &mut (impl AsyncRead + Unpin),
-    is_tcp: bool,
-) -> Result<u8, String> {
-    let mut buf = [0u8; 1];
-    loop {
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| e.to_string())?;
-        if is_tcp && buf[0] == IAC {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-            if buf[0] == IAC {
-                return Ok(IAC);
-            }
-            consume_telnet_command(reader, buf[0]).await?;
-        } else {
-            return Ok(buf[0]);
-        }
-    }
-}
-
-async fn consume_telnet_command(
-    reader: &mut (impl AsyncRead + Unpin),
-    command: u8,
-) -> Result<(), String> {
-    let mut buf = [0u8; 1];
-    match command {
-        SB => {
-            let sb_result = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-                loop {
-                    reader
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if buf[0] == IAC {
-                        reader
-                            .read_exact(&mut buf)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        if buf[0] == SE {
-                            break;
-                        }
-                    }
-                }
-                Ok::<(), String>(())
-            })
-            .await;
-            match sb_result {
-                Err(_) => return Err("Kermit: telnet subnegotiation timed out".into()),
-                Ok(r) => r?,
-            }
-        }
-        WILL | WONT | DO_CMD | DONT => {
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Write a buffer of bytes through telnet IAC escaping and CR-NUL
-/// stuffing, then flush.  Mirror of `xmodem.rs::raw_write_bytes`.
-async fn raw_write_bytes(
-    writer: &mut (impl AsyncWrite + Unpin),
-    data: &[u8],
-    is_tcp: bool,
-) -> Result<(), String> {
-    if is_tcp {
-        let mut buf = Vec::with_capacity(data.len() + 8);
-        for &byte in data {
-            if byte == IAC {
-                buf.push(IAC);
-                buf.push(IAC);
-            } else if byte == CR {
-                buf.push(CR);
-                buf.push(0x00);
-            } else {
-                buf.push(byte);
-            }
-        }
-        writer.write_all(&buf).await.map_err(|e| e.to_string())?;
-    } else {
-        writer.write_all(data).await.map_err(|e| e.to_string())?;
-    }
-    writer.flush().await.map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 // =============================================================================
@@ -4001,19 +3846,8 @@ mod tests {
         assert!(parse_kermit_date("").is_none());
     }
 
-    // ---------- CAN×2 abort ----------
-
-    #[test]
-    fn test_can_abort_state() {
-        let mut s = ReadState::default();
-        assert!(!is_can_abort(CAN, &mut s));
-        assert!(is_can_abort(CAN, &mut s));
-        // Reset on non-CAN
-        assert!(!is_can_abort(b'A', &mut s));
-        assert!(!is_can_abort(CAN, &mut s));
-        assert!(!is_can_abort(b'B', &mut s)); // resets again
-        assert!(!is_can_abort(CAN, &mut s));
-    }
+    // CAN×2 abort state machine moved to tnio.rs (shared across
+    // xmodem and kermit).  See `tnio::tests::test_can_abort_state_machine`.
 
     // ---------- End-to-end round trips ----------
 
